@@ -11,7 +11,6 @@ from opendde_harness.context_engine.segments import render
 class BootstrapSegmentBuilder:
     name = "bootstrap"
     order = 2
-    needs_prefix = False
 
     def __init__(self, workspace: Path, bootstrap_files: list[str] | None = None) -> None:
         self._workspace = workspace

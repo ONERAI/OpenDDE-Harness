@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any
 
-from opendde_harness.utils.helpers import ContentPart
+from opendde_harness.providers.messages import ContentPart
 
 
 @dataclass
@@ -21,15 +21,14 @@ class ToolResult:
     ``abort_action=True`` tells the agent loop not to execute sibling calls or
     ask the model for another approach.
 
-    ``blocks`` carries multimodal content parts (OpenAI-shaped ``text`` /
-    ``image_url`` dicts) for tools whose result is not expressible as text — a
-    read of a PNG, say. It is strictly *additive*: ``model_text`` must stand on
-    its own, because only providers that can carry an image in a tool result
-    ever look at ``blocks`` (see ``supports_image_tool_result``). Everything
-    else — subagents, the curator, session export, a provider talking
-    Chat Completions — keeps using the text and must still make sense.
-    So a tool setting ``blocks`` puts the metadata *and* the file path in
-    ``model_text``, never "see the image above".
+    ``blocks`` carries pi content blocks (``text`` / ``image``) for tools whose
+    result is not expressible as text — a read of a PNG, say. It is strictly
+    *additive*: ``model_text`` must stand on its own, because a model that
+    cannot see a picture is handed the text instead (``AgentLoop.
+    _route_result_images``), and so is every other reader — subagents, session
+    export, the extraction outbox. So a tool setting ``blocks`` puts the
+    metadata *and* the file path in ``model_text``, never "see the image
+    above".
     """
 
     model_text: str
@@ -85,7 +84,7 @@ class Tool(ABC):
 
     # Hard ceiling (seconds) the registry enforces via asyncio.wait_for, so a
     # tool that lacks its own timeout can't wedge the whole agent loop. None ->
-    # the registry default. Tools with a longer legitimate runtime (exec,
+    # the registry default. Tools with a longer legitimate runtime (bash,
     # video generation, spawn) raise this; see ToolRegistry.execute.
     timeout_seconds: float | None = None
 
@@ -94,6 +93,14 @@ class Tool(ABC):
     # registry does NOT wrap them in a timeout — they manage their own
     # auto-resolution instead of being killed mid-wait.
     blocking_interaction: bool = False
+
+    # Whether a call to this tool can change something outside this process: a
+    # file, a remote job, another agent. The turn journal writes a
+    # ``tool.started`` record before invoking one, so a turn cancelled or lost
+    # mid-call leaves evidence that it ran — the job id it was told once cannot
+    # be recovered from the filesystem. Read-only tools (a search, a fetch, a
+    # catalogue lookup) leave nothing to reconstruct and are not journaled.
+    external_effects: bool = False
 
     _TYPE_MAP = {
         "string": str,
@@ -153,7 +160,7 @@ class Tool(ABC):
         The generic truncation message can only say "send less", which leaves a
         model to guess at what smaller looks like -- and dropping the largest
         field is one of the guesses. What it needs is the next action, and only
-        the tool knows what that is: write_file can be appended to, a shell
+        the tool knows what that is: a file can be built up in pieces, a shell
         command can be split into several runs, and some tools have no smaller
         form at all.
 

@@ -5,6 +5,7 @@ import json
 import time
 import uuid
 from collections import deque
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -15,11 +16,12 @@ from opendde_harness.agent.tools.registry import ToolRegistry
 from opendde_harness.agent.tools.shell import ExecTool
 from opendde_harness.agent.tools.web import WebFetchTool, WebSearchTool
 from opendde_harness.config.schema import ExecToolConfig
+from opendde_harness.providers import messages as msg
 from opendde_harness.providers.base import LLMProvider
+from opendde_harness.providers.binding import ModelBinding, resolve
 from opendde_harness.sandbox import DirectExecutor
 from opendde_harness.security.trust import wrap_untrusted
 from opendde_harness.tracing import semconv, trace
-from opendde_harness.utils.helpers import build_assistant_message
 
 # One hour: a runaway re-injection loop fires fast and trips the limit quickly,
 # while legitimate spawns spread over time and age out before it bites.
@@ -38,17 +40,16 @@ class SubagentManager:
         provider: LLMProvider,
         workspace: Path,
         model: str | None = None,
-        brave_api_key: str | None = None,
         web_proxy: str | None = None,
         exec_config: "ExecToolConfig | None" = None,
         restrict_to_workspace: bool = False,
         jina_api_key: str | None = None,
+        brave_api_key: str | None = None,
         max_concurrent: int = 4,
         max_spawns_per_hour: int = 30,
     ):
         from opendde_harness.config.schema import ExecToolConfig
 
-        self.provider = provider
         self.workspace = workspace
         # Spine submit, late-bound (the scheduler pins its home loop at
         # construction and is built inside each entry point's run loop; this
@@ -56,9 +57,9 @@ class SubagentManager:
         # set_submit before any announce; the result re-injection submits a
         # SUBAGENT-origin turn.
         self._submit = None
-        self.model = model or provider.get_default_model()
-        self.brave_api_key = brave_api_key
+        self._fallback = ModelBinding(provider, model or provider.get_default_model())
         self.jina_api_key = jina_api_key
+        self.brave_api_key = brave_api_key
         self.web_proxy = web_proxy
         self.exec_config = exec_config or ExecToolConfig()
         self.restrict_to_workspace = restrict_to_workspace
@@ -72,17 +73,21 @@ class SubagentManager:
         self._session_spawn_times: dict[str, deque[float]] = {}
 
     def set_provider(self, provider: LLMProvider, model: str) -> None:
-        """Adopt the provider a live ``/model`` switch just built.
+        """Move the out-of-turn fallback.
 
-        Subagents run on the parent's provider, so a switch that is not
-        propagated here leaves every spawn calling the credential the loop
-        has already abandoned. Only spawns requested after this call are
-        affected: a subagent is a detached task that outlives the turn that
-        spawned it, so the loop's park cannot cover it and ``spawn``
-        snapshots the pair it was asked for.
+        A spawn requested during a turn takes that turn's binding, so a
+        subagent follows the conversation that asked for it rather than
+        whatever this manager was built with.
         """
-        self.provider = provider
-        self.model = model
+        self._fallback = ModelBinding(provider, model)
+
+    @property
+    def provider(self) -> LLMProvider:
+        return resolve(None, self._fallback).provider
+
+    @property
+    def model(self) -> str:
+        return resolve(None, self._fallback).model
 
     async def spawn(
         self,
@@ -116,12 +121,14 @@ class SubagentManager:
         display_label = label or task[:30] + ("..." if len(task) > 30 else "")
         origin = {"channel": origin_channel, "chat_id": origin_chat_id, "session_key": quota_key}
 
-        # Snapshot here rather than where the task starts running: it queues
-        # behind the concurrency gate and a sandbox boot first, and a switch
-        # landing in that window would hand this task an endpoint the user
-        # chose after asking for it.
+        # The binding of the turn that asked for this spawn, snapshotted here
+        # rather than where the task starts running: it queues behind the
+        # concurrency gate and a sandbox boot first, and a switch landing in
+        # that window would hand it an endpoint chosen after it was asked for.
+        # A subagent has no model of its own, so it follows its conversation.
+        binding = resolve(None, self._fallback)
         bg_task = asyncio.create_task(
-            self._run_subagent(task_id, task, display_label, origin, self.provider, self.model)
+            self._run_subagent(task_id, task, display_label, origin, binding.provider, binding.model)
         )
         self._running_tasks[task_id] = bg_task
         if session_key:
@@ -196,8 +203,8 @@ class SubagentManager:
 
             system_prompt = self._build_subagent_prompt()
             messages: list[dict[str, Any]] = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": task},
+                msg.system_message(system_prompt),
+                msg.user_message(task),
             ]
 
             # Run agent loop (limited iterations)
@@ -226,11 +233,12 @@ class SubagentManager:
                     break
 
                 if response.has_tool_calls:
-                    tool_call_dicts = [tc.to_openai_tool_call() for tc in response.tool_calls]
                     messages.append(
-                        build_assistant_message(
+                        dict(response.pi_message)
+                        if response.pi_message is not None
+                        else msg.assistant_message(
                             response.content or "",
-                            tool_calls=tool_call_dicts,
+                            tool_calls=[tc.to_pi_tool_call() for tc in response.tool_calls],
                             reasoning_content=response.reasoning_content,
                             thinking_blocks=response.thinking_blocks,
                         )
@@ -246,12 +254,11 @@ class SubagentManager:
                         # The subagent's loop is an untrusted-data path too — fence its
                         # tool output like the main loop does in add_tool_result.
                         messages.append(
-                            {
-                                "role": "tool",
-                                "tool_call_id": tool_call.id,
-                                "name": tool_call.name,
-                                "content": wrap_untrusted(result, source=tool_call.name),
-                            }
+                            msg.tool_result_message(
+                                tool_call.id,
+                                tool_call.name,
+                                wrap_untrusted(result, source=tool_call.name),
+                            )
                         )
                         if getattr(result, "abort_action", False):
                             # Subagents must enforce the same terminal safety
@@ -338,12 +345,13 @@ Summarize this naturally for the user. Keep it brief (1-2 sentences). Do not men
 
     def _build_subagent_prompt(self) -> str:
         """Build a focused system prompt for the subagent."""
-        from opendde_harness.agent.context import ContextBuilder
+        from opendde_harness.context_engine.segments import render
         from opendde_harness.memory_engine.skill_forge import LocalSkillCatalog
 
-        # Use a transient ContextBuilder to access the runtime-context
-        # builder; SubagentManager doesn't have its own ContextBuilder.
-        time_ctx = ContextBuilder(self.workspace, start_watcher=False)._build_runtime_context(None, None)
+        # The one runtime-context renderer. It used to be reached through a
+        # transient ContextBuilder, which scanned the skill directory to
+        # produce a timestamp.
+        time_ctx = render.build_runtime_context(datetime.now, None, None)
         parts = [
             f"""# Subagent
 
@@ -361,7 +369,7 @@ Stay focused on the assigned task. Your final response will be reported back to 
             start_watcher=False,
         ).build_skills_summary()
         if skills_summary:
-            parts.append(f"## Skills\n\nRead SKILL.md with read_file to use a skill.\n\n{skills_summary}")
+            parts.append(f"## Skills\n\nRead SKILL.md with the read tool to use a skill.\n\n{skills_summary}")
 
         return "\n\n".join(parts)
 

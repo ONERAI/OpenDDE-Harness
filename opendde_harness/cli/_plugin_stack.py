@@ -29,6 +29,7 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from opendde_harness.memory_engine.backend import BACKEND_OFF
 from opendde_harness.plugin import (
     PluginConflictError,
     PluginFactoryImportError,
@@ -114,7 +115,11 @@ def maybe_build_memory_backend(
     those awaits sit in the right async context.
     """
     name = config.memory.backend
-    if name is None:
+    if name is None or name == BACKEND_OFF:
+        # Unset is the host's own writer, which the loop factory builds because it
+        # is not a plugin; ``"off"`` is no owner at all. Neither is a contribution
+        # to look up, and warning that no plugin provides them would be a boot-time
+        # complaint about a config that is exactly right.
         return None
     if registry is None:
         registry = build_plugin_registry(config)

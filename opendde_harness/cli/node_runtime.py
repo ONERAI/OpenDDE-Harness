@@ -32,7 +32,7 @@ _PLATFORMS = {
     ("windows", "x86_64"): "win-x64",
 }
 _MANUAL_OPTIONS = (
-    "Install Node.js >= 22 yourself (https://nodejs.org/, nvm install 22, brew install node@22) and set "
+    "Install Node.js >= 22.19 yourself (https://nodejs.org/, nvm install 22, brew install node@22) and set "
     f"OPENDDE_HARNESS_NODE to its executable, or set {DISABLE_ENV}=1 to skip automatic installation."
 )
 
@@ -107,8 +107,8 @@ def install_node(
     binary = node_binary(destination)
     console.print(
         t(
-            "Node.js >= 22 was not found; installing the Node.js 22.x runtime for the terminal UI into ~/.opendde_harness/runtime.",
-            "未找到 Node.js ≥ 22，正在为终端界面安装 Node.js 22.x 运行时到 ~/.opendde_harness/runtime 。",
+            "Node.js >= 22.19 was not found; installing the Node.js 22.x runtime for the terminal UI into ~/.opendde_harness/runtime.",
+            "未找到 Node.js ≥ 22.19，正在为终端界面安装 Node.js 22.x 运行时到 ~/.opendde_harness/runtime 。",
         )
     )
     root.mkdir(parents=True, exist_ok=True)

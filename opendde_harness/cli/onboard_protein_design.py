@@ -3,12 +3,15 @@
 import os
 import secrets
 from collections import Counter
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable
 from urllib.parse import urlsplit
 
 import typer
 
+from opendde_harness.cli import _choice
+from opendde_harness.cli import _chrome as chrome
 from opendde_harness.cli.compute_assets import opendde_root, weights_root
 from opendde_harness.plugin.protein_design.core.asset_paths import DEFAULT_CHECKPOINT
 from opendde_harness.plugin.protein_design.core.constants import DEFAULT_COMPUTE_URL, DEFAULT_OPENDDE_API_URL
@@ -79,17 +82,39 @@ def configure_protein_design() -> None:
             raise typer.Exit(1)
         return value
 
+    @contextmanager
+    def wizard_commentary():
+        """What the compute layers say, said at the wizard's gutter.
+
+        They are libraries that also run from a script and a container, so they
+        write lines; here those lines sit beside everything else the step has
+        drawn rather than flush against the edge of the terminal.
+        """
+        from opendde_harness.cli import _download
+
+        previous = _download.report
+        _download.report = lambda text: chrome.caption(wizard.console, escape(text))
+        try:
+            yield
+        finally:
+            _download.report = previous
+
+    def ask_row(message, options, *, default=None):
+        """A choice between a few things, on one line. Cancelling stops the run,
+        as it does for every other prompt here."""
+        value = _choice.row(message, options, default=default)
+        if value is None:
+            raise typer.Exit(1)
+        return value
+
     local = (
-        ask(
-            q.select(
-                t("Where should Protein Design run?", "蛋白设计在哪里执行？"),
-                choices=[
-                    q.Choice(t("Local Linux Docker environment", "本机 Linux Docker 环境"), value="local"),
-                    q.Choice(t("Existing Linux compute service", "已有的 Linux 计算服务"), value="remote"),
-                ],
-                default="local" if current.get("compute_docker") or not current.get("compute_url") else "remote",
-                style=OPENDDE_HARNESS_STYLE,
-            )
+        ask_row(
+            t("Where should Protein Design run?", "蛋白设计在哪里执行？"),
+            [
+                (t("Local Linux Docker environment", "本机 Linux Docker 环境"), "local"),
+                (t("Existing Linux compute service", "已有的 Linux 计算服务"), "remote"),
+            ],
+            default="local" if current.get("compute_docker") or not current.get("compute_url") else "remote",
         )
         == "local"
     )
@@ -99,34 +124,38 @@ def configure_protein_design() -> None:
     assets = prepared_defaults()
     try:
         if local:
-            wizard.console.print(
-                t(
-                    "Compute service: bioinformatics tools running in a Docker container (SolubleMPNN/ProteinMPNN sequence design, "
-                    "ESM2 scoring, OpenDDE folding, PLIP contact analysis, FoldMason structure alignment).",
-                    "计算服务：运行在 Docker 容器中的生信工具服务（SolubleMPNN/ProteinMPNN 序列设计、ESM2 打分、OpenDDE 折叠、PLIP 接触分析、FoldMason 结构比对）。",
-                )
-            )
             idle_seconds = int(saved.get("idle_seconds") or local_service.DEFAULT_IDLE_SECONDS)
             minutes = max(1, idle_seconds // 60)
-            wizard.console.print(
+            chrome.heading(wizard.console, t("Compute service", "计算服务"))
+            chrome.caption(
+                wizard.console,
                 t(
-                    f"Compute container: starts on demand when a task needs it and is removed after {minutes} minutes idle; "
-                    "ddeharness compute stop stops it now.",
-                    f"计算容器：任务需要时按需启动，空闲 {minutes} 分钟后自动销毁；ddeharness compute stop 可立即停止。",
-                )
+                    "Sequence design, scoring, folding, contact analysis and structure alignment, in a Docker container.",
+                    "序列设计、打分、折叠、接触分析与结构比对，运行在一个 Docker 容器里。",
+                ),
             )
-            info = compute.check_local_docker()
-            # One published image for everyone; OPENDDE_HARNESS_COMPUTE_IMAGE is the
-            # only override, and it is read inside default_image().
-            image = compute.default_image()
-            wizard.console.print(f"{t('Compute image:', '计算镜像：')} {escape(image)}")
-            gpus = str(saved.get("gpus") or ("all" if compute.docker_gpu_available(info) else "none"))
-            names = compute.gpu_inventory() if gpus != "none" else []
-            wizard.console.print(f"{t('Compute device:', '计算设备：')} {escape(device_summary(gpus, names, t))}")
+            chrome.caption(
+                wizard.console,
+                t(
+                    f"Started when a task needs it and removed after {minutes} idle minutes; ddeharness compute stop stops it now.",
+                    f"任务需要时启动，空闲 {minutes} 分钟后销毁；ddeharness compute stop 可立即停止。",
+                ),
+            )
+            with chrome.working(wizard.console, t("Reading the Docker environment…", "正在读取 Docker 环境…")):
+                info = compute.check_local_docker()
+                # One published image for everyone; OPENDDE_HARNESS_COMPUTE_IMAGE
+                # is the only override, and it is read inside default_image().
+                image = compute.default_image()
+                gpus = str(saved.get("gpus") or ("all" if compute.docker_gpu_available(info) else "none"))
+                names = compute.gpu_inventory() if gpus != "none" else []
+            wizard.console.print()
+            facts = [
+                (t("Image", "镜像"), escape(image)),
+                (t("Device", "计算设备"), escape(device_summary(gpus, names, t))),
+            ]
             if saved.get("port"):
-                wizard.console.print(
-                    f"{t('Compute service API port (compute_docker.port):', '计算服务 API 端口（compute_docker.port）：')} {saved['port']}"
-                )
+                facts.append((t("API port", "API 端口"), str(saved["port"])))
+            chrome.fields(wizard.console, facts)
         else:
             compute_url = (
                 ask(
@@ -150,16 +179,21 @@ def configure_protein_design() -> None:
                 or token
             )
     except compute.ComputeSetupError as exc:
-        wizard.console.print(f"[red]{escape(str(exc))}[/red]")
+        wizard.console.print(f"[error]{escape(str(exc))}[/error]")
         raise typer.Exit(1) from exc
     defaults = current.get("fold_defaults") or {}
-    mode = ask(
-        q.select(
-            t("OpenDDE fold/refold mode:", "OpenDDE fold/refold 模式："),
-            choices=["local", "api"],
-            default=defaults.get("execution_mode", "api"),
-            style=OPENDDE_HARNESS_STYLE,
-        )
+    chrome.heading(wizard.console, t("Folding", "折叠"))
+    wizard.console.print()
+    mode = ask_row(
+        t("OpenDDE fold/refold mode:", "OpenDDE fold/refold 模式："),
+        [
+            (t("local — in the compute container", "local — 在计算容器里"), "local"),
+            (t("api — through the OpenDDE service", "api — 走 OpenDDE 服务"), "api"),
+        ],
+        # Local is the mode this runs in: the compute container carries the
+        # folding weights, so nothing leaves the machine and no service has to
+        # answer. A config that already names one keeps it.
+        default=defaults.get("execution_mode", "local"),
     )
     fold = {"execution_mode": mode}
     if mode == "api":
@@ -172,7 +206,8 @@ def configure_protein_design() -> None:
             if fold["api_url"] == DEFAULT_OPENDDE_API_URL
             else t("configured in config.json fold_defaults.api_url", "来自 config.json 的 fold_defaults.api_url")
         )
-        wizard.console.print(f"{t('OpenDDE folding API:', 'OpenDDE 折叠 API：')} {escape(fold['api_url'])} ({note})")
+        chrome.fields(wizard.console, [(t("Folding API", "折叠 API"), escape(fold["api_url"]))])
+        chrome.caption(wizard.console, note)
     try:
         if local:
             root, assets = deployment_paths(saved, assets)
@@ -189,17 +224,15 @@ def configure_protein_design() -> None:
                 if value and (key not in legacy or Path(value).expanduser().absolute() != legacy[key]):
                     assets[key] = str(Path(value).expanduser().absolute())
             data = Path(assets["opendde_data"]).expanduser().resolve()
-            wizard.console.print(
-                escape(
-                    weights_layout(
-                        root,
-                        data,
-                        with_opendde=mode == "local",
-                        checkpoint=Path(assets["opendde_checkpoint"]).name,
-                        translate=t,
-                    )
-                )
-            )
+            chrome.heading(wizard.console, t("Weights and code", "权重与代码"))
+            for line in weights_layout(
+                root,
+                data,
+                with_opendde=mode == "local",
+                checkpoint=Path(assets["opendde_checkpoint"]).name,
+                translate=t,
+            ).splitlines():
+                chrome.caption(wizard.console, escape(line))
             output_dir = (
                 Path(
                     os.environ.get(
@@ -229,31 +262,42 @@ def configure_protein_design() -> None:
                     checkpoint if checkpoint.is_relative_to(data) else data / "checkpoint" / DEFAULT_CHECKPOINT
                 )
             compute.validate_settings(settings, info, require_image=False, require_assets=False)
-            wizard.console.print(
+            chrome.caption(
+                wizard.console,
                 t(
-                    "The installed release prepares versioned tool code automatically. Code and models are mounted read-only; compatible environment images are reused.",
-                    "已安装的发行包会自动准备带版本的工具代码。代码和模型只读挂载，兼容的环境镜像直接复用。",
-                )
-            )
-            for label, value in settings.saved().items():
-                if value:
-                    wizard.console.print(f"  {label}: {escape(str(value))}")
-        wizard.console.print(
-            t(
-                "New tasks inherit these defaults; explicit YAML settings take precedence. No design will be started.",
-                "新任务继承这些默认值，YAML 显式设置优先。此步骤不会启动设计。",
-            )
-        )
-        replace_pool = bool(current.get("compute_workers"))
-        if replace_pool and not ask(
-            q.confirm(
-                t(
-                    "Replace the existing worker pool for new tasks with this service?",
-                    "将新任务的已有 worker pool 替换为此计算服务？",
+                    "Versioned tool code is prepared for you; code and models are mounted read-only and a compatible image is reused.",
+                    "工具代码按版本自动准备；代码与模型只读挂载，兼容的环境镜像直接复用。",
                 ),
-                default=False,
-                style=OPENDDE_HARNESS_STYLE,
             )
+            wizard.console.print()
+            # The operator's own facts, named. The rest of `settings.saved()` is
+            # this program's bookkeeping -- a dump of its keys read as a config
+            # file that had leaked onto the screen.
+            chrome.fields(
+                wizard.console,
+                [
+                    (t("Weights", "权重目录"), escape(settings.weights_dir)),
+                    (t("Output", "输出目录"), escape(settings.output_dir)),
+                    (t("Idle timeout", "空闲销毁"), t(f"{minutes} min", f"{minutes} 分钟")),
+                ],
+            )
+        wizard.console.print()
+        chrome.caption(
+            wizard.console,
+            t(
+                "New tasks inherit these defaults and explicit YAML settings win. No design is started here.",
+                "新任务继承这些默认值，YAML 显式设置优先；此步不会启动设计。",
+            ),
+        )
+        wizard.console.print()
+        replace_pool = bool(current.get("compute_workers"))
+        if replace_pool and not ask_row(
+            t(
+                "Replace the existing worker pool for new tasks with this service?",
+                "将新任务的已有 worker pool 替换为此计算服务？",
+            ),
+            [(t("keep it", "保留"), False), (t("replace it", "替换"), True)],
+            default=False,
         ):
             wizard.console.print(
                 t(
@@ -267,17 +311,18 @@ def configure_protein_design() -> None:
             if local
             else t("Save Protein Design settings?", "保存 Protein Design 配置？")
         )
-        if not ask(q.confirm(confirmation, default=True, style=OPENDDE_HARNESS_STYLE)):
+        if not ask_row(confirmation, [(t("yes", "好"), True), (t("no", "不用"), False)], default=True):
             return
-        wizard.console.print(
-            t(
-                "Preparing the selected environment, code and required weights; then checking service readiness and authentication…",
-                "正在准备所选环境、代码和必要权重，随后检查计算服务就绪状态和认证…",
-            )
-        )
         if local:
             token = token or secrets.token_urlsafe(32)
-            compute.prepare_assets(settings)
+            # No status line around this one: a transfer draws its own progress,
+            # and two live regions on one console cannot both draw.
+            chrome.caption(
+                wizard.console,
+                t("Preparing the environment, code and weights…", "正在准备环境、代码与权重…"),
+            )
+            with wizard_commentary():
+                compute.prepare_assets(settings)
             pending = {
                 **current,
                 "compute_docker": settings.saved(),
@@ -286,15 +331,28 @@ def configure_protein_design() -> None:
                 "compute_workers": [],
             }
             if not local_service.stop_if_idle(token):
-                wizard.console.print(
+                chrome.caption(
+                    wizard.console,
                     t(
-                        "The running compute container is busy and keeps its current settings; the new settings apply at its next start.",
-                        "运行中的计算容器正忙，保留其当前设置；新设置将在下次启动时生效。",
-                    )
+                        "The running container is busy and keeps its settings; the new ones apply at its next start.",
+                        "运行中的容器正忙，保留其当前设置；新设置将在下次启动时生效。",
+                    ),
                 )
-            compute_url = local_service.ensure_compute_service(pending).url
+            with (
+                wizard_commentary(),
+                chrome.working(
+                    wizard.console,
+                    t("Starting the compute service…", "正在启动计算服务…"),
+                    note=t(
+                        "the container loads the image and answers a readiness check; up to 90s",
+                        "容器载入镜像并通过就绪检查，最多 90 秒",
+                    ),
+                ),
+            ):
+                compute_url = local_service.ensure_compute_service(pending).url
         else:
-            compute.wait_for_service(compute_url, token, mode, fold.get("api_url", ""))
+            with chrome.working(wizard.console, t("Checking the compute service…", "正在检查计算服务…")):
+                compute.wait_for_service(compute_url, token, mode, fold.get("api_url", ""))
         fields = {
             "compute_url": compute_url,
             "compute_token": token,
@@ -304,14 +362,14 @@ def configure_protein_design() -> None:
         if replace_pool:
             fields["compute_workers"] = []
         set_plugin_config_fields("protein-design", fields)
-        wizard.console.print(
-            t(
-                "Compute service connected. Protein Design settings saved.",
-                "已连接计算服务，Protein Design 配置已保存。",
-            )
+        chrome.done(
+            wizard.console,
+            t("Compute service connected, settings saved.", "已连接计算服务，配置已保存。"),
         )
-        for service in compute.probe_external_services(compute_url, token):
-            wizard.console.print(escape(compute.external_service_line(service)))
+        with chrome.working(wizard.console, t("Checking the tool services…", "正在检查工具服务…")):
+            external = list(compute.probe_external_services(compute_url, token))
+        for service in external:
+            chrome.caption(wizard.console, escape(compute.external_service_line(service)))
     except compute.ComputeSetupError as exc:
-        wizard.console.print(f"[red]{escape(str(exc))}[/red]")
+        wizard.console.print(f"[error]{escape(str(exc))}[/error]")
         raise typer.Exit(1) from exc

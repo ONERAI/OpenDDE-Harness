@@ -233,6 +233,25 @@ class DetachedDesignTaskController:
     def config_from_path(self, config_path: str) -> WorkflowConfig:
         return WorkflowConfigLoader.config_from_path(config_path, self._plugin_config)
 
+    def worker_argv(self, task_id: str) -> list[str]:
+        """The command that runs one task's worker.
+
+        ``-P`` keeps the launcher's working directory off the worker's
+        ``sys.path``: a TUI started inside another checkout once made the
+        worker import that checkout's older package and refuse the workflow
+        the current CLI had just written.
+        """
+        return [
+            self._python,
+            "-P",
+            "-m",
+            self._worker_module,
+            "--task-id",
+            task_id,
+            "--task-root",
+            str(self._store.root),
+        ]
+
     async def start(self, workflow: WorkflowConfig) -> TaskSnapshot:
         selection = await self._pool.select(workflow)
         bound = workflow.model_copy(
@@ -254,15 +273,7 @@ class DetachedDesignTaskController:
         log_handle = (directory / "worker.log").open("ab", buffering=0)
         try:
             process = subprocess.Popen(
-                [
-                    self._python,
-                    "-m",
-                    self._worker_module,
-                    "--task-id",
-                    task_id,
-                    "--task-root",
-                    str(self._store.root),
-                ],
+                self.worker_argv(task_id),
                 stdin=subprocess.DEVNULL,
                 stdout=log_handle,
                 stderr=subprocess.STDOUT,

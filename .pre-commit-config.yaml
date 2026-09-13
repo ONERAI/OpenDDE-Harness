@@ -1,7 +1,7 @@
 default_language_version:
   python: python3.12
 
-exclude: '^ui-tui/src/rpc/generated\.ts$'
+exclude: '^(ui-tui(-next)?/src/rpc/generated\.ts$|opendde_harness/tracing/viewer/ui/vendor/)'
 
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
@@ -30,11 +30,10 @@ repos:
         entry: ui-tui/node_modules/.bin/prettier --write
         language: system
         files: '\.([cm]?[jt]s|[jt]sx)$'
-        exclude: '^(ui-tui/packages/hermes-ink/|opendde_harness/tracing/viewer/ui/vendor/)'
 
       - id: eslint-ui-tui
         name: eslint (ui-tui)
         entry: bash -c '[ -d ui-tui/node_modules ] || exit 0; cd ui-tui && npm run lint'
         language: system
         pass_filenames: false
-        files: '^ui-tui/src/.*\.(ts|tsx)$'
+        files: '^ui-tui/src/.*\.ts$'

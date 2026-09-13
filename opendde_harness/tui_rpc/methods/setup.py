@@ -24,10 +24,14 @@ def _detect_provider_configured(payload: dict) -> bool:
     """Return True iff the loaded config payload indicates a usable provider.
 
     The onboarding gate's criterion ("required config complete"): at least one
-    provider has an ``apiKey`` AND ``agents.defaults.model`` is set. Either
-    alone can't drive a turn, so the UI must still park on the setup panel.
-    An explicit non-``auto`` ``agents.defaults.provider`` also counts as a
-    provider signal (legacy configs that pre-date per-provider sections).
+    provider is usable AND ``agents.defaults.model`` is set. Either alone can't
+    drive a turn, so the UI must still park on the setup panel.
+
+    "Usable" is ``providers.auth``'s one question, asked of every entry --
+    including the sign-in ones, whose grant it reads from the model service's
+    credential store. This used to carry two extra branches for the MiniMax
+    plans, which were reached by a sign-in of this project's own; they are
+    reached by an API key now, so the ordinary walk answers for them.
     """
     if not isinstance(payload, dict):
         return False
@@ -40,56 +44,30 @@ def _detect_provider_configured(payload: dict) -> bool:
     if not (isinstance(model, str) and model):
         return False
 
-    # `agents.defaults.provider` used to be waved through on its own, as a
-    # provider signal from configs predating per-provider sections. It is now
-    # written on every model change, so that branch would let a pinned name
-    # stand for credentials nobody has -- the gate would pass with an empty
-    # config. The name still says which section to ask about; whether it holds
-    # anything is asked below, like every other provider.
-    provider = defaults.get("provider")
-    if isinstance(provider, str) and provider in {"minimax_global", "minimax_cn"}:
-        from opendde_harness.providers.minimax_oauth import load_token
-
-        return load_token("global" if provider == "minimax_global" else "cn") is not None
-
+    # A model id names its provider, and that is the only place a provider is
+    # named: `agents.defaults.provider` is gone from the schema, so there is no
+    # second field to wave the gate through on. Whether the provider the id
+    # names holds anything is asked below, of every entry.
     providers = payload.get("providers")
     if isinstance(providers, dict):
         # `providers.auth`, like every other gate. Reading `apiKey` off the raw
         # payload made this the seventh rule and it disagreed with the other six
-        # in both directions -- on the exact two configurations this module's
-        # rewrite was filed to fix. A Gemini section holding only `apiKeyList`
-        # parked a working install on the setup panel; Azure with a key and no
-        # address was waved through into a chat that then could not run.
+        # -- on the exact configuration this module's rewrite was filed to fix:
+        # Azure with a key and no address was waved through into a chat that
+        # then could not run.
         from opendde_harness.config.schema import ProvidersConfig
         from opendde_harness.providers.auth import credential_status
 
         try:
-            sections = ProvidersConfig.model_validate(providers)
+            entries = ProvidersConfig.model_validate(providers)
         except Exception:
-            sections = None
-        if sections is not None:
-            # Iterate the validated instance's own field names, not the raw
-            # payload's keys: `canonical_provider_name` does not decompose
-            # camelCase, so a camelCase key like "azureOpenai" -- the shape
-            # `ProvidersConfig` serializes to -- fails to resolve back to the
-            # `azure_openai` field it validated into, and `sections.get` on it
-            # returns None. The declared fields are always snake_case, so
-            # asking for those by name always resolves. Extra (unspecced)
-            # sections keep their original payload spelling.
-            names = set(type(sections).model_fields) | set(sections.model_extra or {})
-            for name in names:
-                section = sections.get(name)
-                if section is not None and credential_status(name, section, include_external=True).ok:
-                    return True
-
-    from opendde_harness.providers.registry import split_model_id
-
-    model_prefix, _ = split_model_id(model)
-    if model_prefix in {"minimax_global", "minimax_cn"}:
-        from opendde_harness.providers.minimax_oauth import load_token
-
-        region = "global" if model_prefix == "minimax_global" else "cn"
-        return load_token(region) is not None
+            # A section the schema refuses configures nothing. Reporting it as
+            # "no provider" parks the UI on the setup panel, which is where
+            # somebody with an unloadable providers section has to start.
+            return False
+        for provider, entry in entries.items():
+            if credential_status(provider, entry, include_external=True).ok:
+                return True
 
     return False
 

@@ -1,6 +1,6 @@
 // OpenDDE Harness TUI RPC — typed error class hierarchy.
 //
-// Mirrors the 15 server-defined error codes in specs/tui-ipc.md §4.
+// Mirrors the server-defined error codes in specs/tui-ipc.md §4.
 // `rpcErrorFromFrame(frame)` is the canonical constructor used by `client.ts`
 // when a JSON-RPC error response arrives — it selects the matching subclass
 // by `code`, falling back to the generic `RpcError` for unknown codes.
@@ -70,12 +70,6 @@ export class ModelNotAvailableError extends RpcError {
     this.name = 'ModelNotAvailableError'
   }
 }
-export class ModelSwitchInTurnError extends RpcError {
-  constructor(f: JsonRpcErrorObject) {
-    super(f)
-    this.name = 'ModelSwitchInTurnError'
-  }
-}
 export class ConfigFieldReadonlyError extends RpcError {
   constructor(f: JsonRpcErrorObject) {
     super(f)
@@ -112,6 +106,12 @@ export class NotDispatchCompatibleError extends RpcError {
     this.name = 'NotDispatchCompatibleError'
   }
 }
+export class SubscriptionCapacityExceededError extends RpcError {
+  constructor(f: JsonRpcErrorObject) {
+    super(f)
+    this.name = 'SubscriptionCapacityExceededError'
+  }
+}
 
 // -- code → subclass mapping -------------------------------------------------
 
@@ -124,13 +124,13 @@ const CODE_TO_CTOR: Record<number, new (f: JsonRpcErrorObject) => RpcError> = {
   [-32006]: SkillNotFoundError,
   [-32007]: SkillPinConflictError,
   [-32008]: ModelNotAvailableError,
-  [-32009]: ModelSwitchInTurnError,
   [-32010]: ConfigFieldReadonlyError,
   [-32011]: ConfigValidationError,
   [-32012]: NotSupportedInV01Error,
   [-32013]: CliCommandFailedError,
   [-32014]: CliCommandTimeoutError,
-  [-32015]: NotDispatchCompatibleError
+  [-32015]: NotDispatchCompatibleError,
+  [-32016]: SubscriptionCapacityExceededError
 }
 
 /** Pick the right subclass for an incoming JSON-RPC error frame. */

@@ -6,12 +6,13 @@ import tarfile
 import pytest
 from rich.console import Console
 
-from opendde_harness.cli import node_runtime, tui_commands
+from opendde_harness.cli import node_runtime
 from opendde_harness.cli._download import DownloadError
+from opendde_harness.node_runtime import find_node
 
 PACKAGE = f"node-v{node_runtime.NODE_VERSION}-linux-x64"
 ARCHIVE = PACKAGE + ".tar.gz"
-NOTICE = "Node.js >= 22 was not found; installing the Node.js 22.x runtime"
+NOTICE = "Node.js >= 22.19 was not found; installing the Node.js 22.x runtime"
 
 
 @pytest.fixture
@@ -65,7 +66,7 @@ def test_install_provisions_runtime_that_find_node_picks(runtime_home, tarball):
     binary = node_runtime.install_node(console, download=_fake_download(archive), fetch=fetch)
     assert binary == runtime_home / PACKAGE / "bin" / "node" and binary.is_file()
     assert fetched == [f"{node_runtime.NODE_DIST}/v{node_runtime.NODE_VERSION}/SHASUMS256.txt"]
-    assert tui_commands.find_node() == (str(binary), (22, 20, 0))
+    assert find_node() == (str(binary), (22, 20, 0))
     output = buffer.getvalue()
     assert output.count(NOTICE) == 1
     assert f"Node.js v{node_runtime.NODE_VERSION} installed at {binary}" in output
@@ -83,7 +84,7 @@ def test_checksum_mismatch_installs_nothing(runtime_home, tarball):
     assert f"{node_runtime.NODE_DIST}/v{node_runtime.NODE_VERSION}/{ARCHIVE}" in message
     assert "OPENDDE_HARNESS_NODE" in message and node_runtime.DISABLE_ENV in message
     assert list(runtime_home.iterdir()) == []
-    assert tui_commands.find_node() == (None, None)
+    assert find_node() == (None, None)
 
 
 def test_missing_shasum_entry_and_unusable_binary_are_reported(runtime_home, tarball, monkeypatch):

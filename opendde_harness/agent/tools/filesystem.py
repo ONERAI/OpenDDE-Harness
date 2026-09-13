@@ -1,11 +1,26 @@
-"""File system tools: read, write, edit, list."""
+"""File system tools: ``read``, ``write``, ``edit`` and ``ls``.
 
+The names and parameter schemas are pi's, so a prompt, skill or habit written
+for pi's built-ins calls these unchanged. The implementations are the harness's
+own: they carry the permitted-directory boundary, the standing-instructions
+approval gate, and the result caps and hints that the agent loop reads.
+"""
+
+import base64
 import difflib
+import json
 import mimetypes
 from pathlib import Path
 from typing import Any
 
+from opendde_harness.agent.tools.approval import (
+    ALREADY_REFUSED,
+    NOT_INTERACTIVE,
+    ApprovalGate,
+    ApprovalResponder,
+)
 from opendde_harness.agent.tools.base import Tool, ToolResult
+from opendde_harness.context_engine.project_instructions import is_instruction_file
 from opendde_harness.utils.helpers import detect_image_mime
 
 
@@ -34,27 +49,106 @@ class _FsTool(Tool):
         return _resolve_path(path, self._workspace, self._allowed_dir)
 
 
+class _WritingFsTool(_FsTool):
+    """A filesystem tool that changes a file, and so can change its own orders.
+
+    ``AGENTS.md`` and ``ODH.md`` are read into the system prompt as the user's
+    own standing instructions, unfenced, because that is what they are for. A
+    directory being writable is authority to write files in it; it is not the
+    user adopting whatever lands there as instructions. Without this, an agent
+    that could write a file could write its own standing instructions and be
+    following them on the next turn, and the only evidence would be a heading
+    in a prompt nobody reads.
+
+    So a write or an edit to one of those names is asked about, every time,
+    even where the path is inside the permitted directory and an ordinary write
+    there would need no permission at all. The prompt says what the file
+    becomes, because "write AGENTS.md" does not look like a privileged act.
+    """
+
+    external_effects = True
+
+    def __init__(self, workspace: Path | None = None, allowed_dir: Path | None = None):
+        super().__init__(workspace, allowed_dir)
+        self._approval = ApprovalGate(f"{type(self).__name__}_approval_turn")
+
+    def start_approval_turn(
+        self,
+        responder: ApprovalResponder | None,
+        *,
+        conversation_id: str,
+        turn_id: str,
+    ) -> None:
+        """Bind or revoke interactive approval capability for the current turn."""
+        self._approval.start_approval_turn(responder, conversation_id=conversation_id, turn_id=turn_id)
+
+    def set_tool_call_id(self, tool_call_id: str) -> None:
+        """Attach the provider call ID so approval is auditable end to end."""
+        self._approval.set_tool_call_id(tool_call_id)
+
+    async def _approve_instruction_change(self, fp: Path, what: str) -> str | None:
+        """None when this change may go ahead, else what to tell the model.
+
+        Fails closed. A turn with no way to ask -- a background run, a channel
+        with no approval transport -- cannot write standing instructions, which
+        is the point: those are the turns nobody is watching.
+        """
+        if not is_instruction_file(fp):
+            return None
+
+        reason = await self._approval.ask(
+            subject=f"{what} {fp}",
+            description=(
+                f"{what.capitalize()} {fp.name}, which the agent reads on every turn as your own standing instructions"
+            ),
+        )
+
+        if reason is None:
+            return None
+
+        return self._REFUSALS.get(reason, self._REFUSAL_UNANSWERED).format(name=fp.name)
+
+    _REFUSAL_UNANSWERED = "Error: the approval request could not be completed, so {name} was not written"
+    _REFUSALS = {
+        ALREADY_REFUSED: "Error: this change to {name} was already refused earlier in the current turn",
+        NOT_INTERACTIVE: (
+            "Error: {name} is read as the user's standing instructions, so changing it needs their "
+            "approval, and this turn has no way to ask. Tell the user what you would put in it."
+        ),
+        "deny": "Error: the user denied this change to {name}",
+        "timeout": "Error: the approval request expired before it was answered, so {name} was not written",
+        "cancelled": "Error: the approval request was cancelled before it was answered, so {name} was not written",
+    }
+
+
 # ---------------------------------------------------------------------------
-# read_file
+# read
 # ---------------------------------------------------------------------------
 
 
 class ReadFileTool(_FsTool):
-    """Read file contents with optional line-based pagination."""
+    """Read file contents with optional line-based pagination.
+
+    Named ``read`` on the wire, with pi's ``{path, offset, limit}`` schema and
+    its 1-indexed ``offset``, so a prompt or habit written for pi's ``read``
+    works here unchanged.
+    """
 
     _MAX_CHARS = 128_000
     _DEFAULT_LIMIT = 2000
 
     @property
     def name(self) -> str:
-        return "read_file"
+        return "read"
 
     @property
     def description(self) -> str:
         return (
-            "Read the contents of a file. Text files return numbered lines — use offset and limit to "
-            "paginate through large ones. Image files (PNG, JPEG, GIF, WebP, and other common formats) "
-            "return the picture itself, downscaled if needed."
+            "Read the contents of a file. Supports text files and images (jpg, png, gif, webp, bmp). "
+            "Images are sent as attachments, downscaled if large. For text files, output returns "
+            f"numbered lines, truncated to {self._DEFAULT_LIMIT} lines or {self._MAX_CHARS // 1000}KB "
+            "(whichever is hit first). Use offset/limit for large files. When you need the full file, "
+            "continue with offset until complete. Reads are confined to the permitted directory."
         )
 
     @property
@@ -62,15 +156,15 @@ class ReadFileTool(_FsTool):
         return {
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "The file path to read"},
+                "path": {"type": "string", "description": "Path to the file to read (relative or absolute)"},
                 "offset": {
                     "type": "integer",
-                    "description": "Line number to start reading from (1-indexed, default 1)",
+                    "description": "Line number to start reading from (1-indexed)",
                     "minimum": 1,
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Maximum number of lines to read (default 2000)",
+                    "description": "Maximum number of lines to read",
                     "minimum": 1,
                 },
             },
@@ -98,7 +192,7 @@ class ReadFileTool(_FsTool):
             display_text=f"{fp.name} ({meta['width']}x{meta['height']}, ~{meta['tokens']} tok)",
             blocks=[
                 media.text_block(summary),
-                media.image_block(media.to_data_uri(payload, out_mime)),
+                media.image_block(base64.b64encode(payload).decode("ascii"), out_mime),
             ],
         )
 
@@ -173,22 +267,32 @@ class ReadFileTool(_FsTool):
 
 
 # ---------------------------------------------------------------------------
-# write_file
+# write
 # ---------------------------------------------------------------------------
 
 
-class WriteFileTool(_FsTool):
-    """Write content to a file."""
+class WriteFileTool(_WritingFsTool):
+    """Write content to a file.
+
+    Named ``write`` with pi's ``{path, content}`` schema. There is no append
+    mode: pi's ``write`` has none, and a second parameter that changes whether
+    a call replaces or extends a file is the one thing a truncated call must
+    never get wrong (a cut before ``mode`` arrived turned an append into a
+    silent overwrite). A file too long for one reply is started with ``write``
+    and extended with ``edit``, which names the text it is anchored to and so
+    cannot mean two different things.
+    """
 
     @property
     def name(self) -> str:
-        return "write_file"
+        return "write"
 
     @property
     def description(self) -> str:
         return (
-            "Write content to a file at the given path. Creates parent directories if needed. "
-            "Use mode=append to add to a file rather than replace it."
+            "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. "
+            "Automatically creates parent directories. Writes are confined to the permitted "
+            "directory, and a file the agent reads as your standing instructions needs your approval."
         )
 
     @property
@@ -196,17 +300,8 @@ class WriteFileTool(_FsTool):
         return {
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "The file path to write to"},
-                "content": {"type": "string", "description": "The content to write"},
-                "mode": {
-                    "type": "string",
-                    "enum": ["overwrite", "append"],
-                    "description": (
-                        "append adds to the end of the file; overwrite (default) replaces it. "
-                        "Use append to continue a file you have already started -- adding to "
-                        "one written earlier, or building up long content across several calls."
-                    ),
-                },
+                "path": {"type": "string", "description": "Path to the file to write (relative or absolute)"},
+                "content": {"type": "string", "description": "Content to write to the file"},
             },
             "required": ["path", "content"],
         }
@@ -214,34 +309,26 @@ class WriteFileTool(_FsTool):
     @property
     def truncation_hint(self) -> str:
         return (
-            "Arguments cut off by that limit are discarded whole rather than partly saved, "
-            "so write the content across several calls: mode=overwrite to start a file, "
-            "mode=append to continue one you have already begun."
+            "Arguments cut off by that limit are discarded whole rather than partly saved, so "
+            "build the file up instead: write the first part, then extend it with edit, whose "
+            "oldText anchors on text already in the file."
         )
 
     @property
     def incomplete_hint(self) -> str:
         return (
-            "arguments cut off that way are discarded whole rather than partly saved, so "
-            "send the content across several calls -- mode=overwrite to start a file, "
-            "mode=append to continue one you have already begun."
+            "arguments cut off that way are discarded whole rather than partly saved, so build "
+            "the file up instead -- write the first part, then extend it with edit, whose oldText "
+            "anchors on text already in the file."
         )
 
-    async def execute(self, path: str, content: str, mode: str = "overwrite", **kwargs: Any) -> str:
-        if mode not in ("overwrite", "append"):
-            return f"Error: unknown mode '{mode}' for write_file. Use 'overwrite' or 'append'."
-        # An empty append is refused rather than treated as a no-op: it is what
-        # a call cut off before its content field looks like, and the one thing
-        # it must never silently become is an overwrite.
-        if mode == "append" and not content:
-            return "Error: write_file with mode=append needs content; refusing to append nothing."
+    async def execute(self, path: str, content: str, **kwargs: Any) -> str:
         try:
             fp = self._resolve(path)
+            refusal = await self._approve_instruction_change(fp, "write")
+            if refusal:
+                return refusal
             fp.parent.mkdir(parents=True, exist_ok=True)
-            if mode == "append":
-                with fp.open("a", encoding="utf-8") as handle:
-                    handle.write(content)
-                return f"Successfully appended {len(content)} bytes to {fp}"
             fp.write_text(content, encoding="utf-8")
             return f"Successfully wrote {len(content)} bytes to {fp}"
         except PermissionError as e:
@@ -251,7 +338,7 @@ class WriteFileTool(_FsTool):
 
 
 # ---------------------------------------------------------------------------
-# edit_file
+# edit
 # ---------------------------------------------------------------------------
 
 
@@ -281,19 +368,36 @@ def _find_match(content: str, old_text: str) -> tuple[str | None, int]:
     return None, 0
 
 
-class EditFileTool(_FsTool):
-    """Edit a file by replacing text with fallback matching."""
+class EditFileTool(_WritingFsTool):
+    """Edit one file by exact text replacement, one or more places at a time.
+
+    Named ``edit`` with pi's schema: ``{path, edits: [{oldText, newText}]}``.
+    Every ``oldText`` is matched against the *original* file, not against the
+    result of the edits before it, so the model does not have to track offsets
+    it cannot see. Each must match exactly once and the matched regions must not
+    overlap; otherwise nothing is written and the error names the entry that
+    failed.
+
+    ``replace_all`` is gone. It existed to resolve an ambiguous ``oldText`` by
+    applying it everywhere, which is the opposite of what a unique anchor is
+    for: a model that meant one of five occurrences and got all five has no way
+    to tell from the success message. Several occurrences now ask for more
+    context instead.
+    """
 
     @property
     def name(self) -> str:
-        return "edit_file"
+        return "edit"
 
     @property
     def description(self) -> str:
         return (
-            "Edit a file by replacing old_text with new_text. "
-            "Supports minor whitespace/line-ending differences. "
-            "Set replace_all=true to replace every occurrence."
+            "Edit a single file using exact text replacement. Every edits[].oldText must match a "
+            "unique, non-overlapping region of the original file. If two changes affect the same "
+            "block or nearby lines, merge them into one edit instead of emitting overlapping edits. "
+            "Do not include large unchanged regions just to connect distant changes. Edits are "
+            "confined to the permitted directory, and a file the agent reads as your standing "
+            "instructions needs your approval."
         )
 
     @property
@@ -301,57 +405,149 @@ class EditFileTool(_FsTool):
         return {
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "The file path to edit"},
-                "old_text": {"type": "string", "description": "The text to find and replace"},
-                "new_text": {"type": "string", "description": "The text to replace with"},
-                "replace_all": {
-                    "type": "boolean",
-                    "description": "Replace all occurrences (default false)",
+                "path": {"type": "string", "description": "Path to the file to edit (relative or absolute)"},
+                "edits": {
+                    "type": "array",
+                    "description": (
+                        "One or more targeted replacements. Each edit is matched against the "
+                        "original file, not incrementally. Do not include overlapping or nested "
+                        "edits. If two changes touch the same block or nearby lines, merge them "
+                        "into one edit instead."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "oldText": {
+                                "type": "string",
+                                "description": (
+                                    "Exact text for one targeted replacement. It must be unique in "
+                                    "the original file and must not overlap with any other "
+                                    "edits[].oldText in the same call."
+                                ),
+                            },
+                            "newText": {
+                                "type": "string",
+                                "description": "Replacement text for this targeted edit.",
+                            },
+                        },
+                        "required": ["oldText", "newText"],
+                    },
                 },
             },
-            "required": ["path", "old_text", "new_text"],
+            "required": ["path", "edits"],
         }
 
-    async def execute(
-        self,
-        path: str,
-        old_text: str,
-        new_text: str,
-        replace_all: bool = False,
-        **kwargs: Any,
-    ) -> str:
+    def cast_params(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Normalise the shapes models send instead of ``edits`` before validating.
+
+        Some models send ``edits`` as a JSON *string*, some send a single edit
+        object where an array belongs, and some put ``oldText``/``newText`` at
+        the top level as if the old single-edit tool were still here. pi repairs
+        all three before dispatch; this is the same repair at the one hook that
+        runs before :meth:`validate_params`, so a recoverable shape costs the
+        model no round trip.
+        """
+        if not isinstance(params, dict):
+            return super().cast_params(params)
+
+        fixed = dict(params)
+        edits = fixed.get("edits")
+        if isinstance(edits, str):
+            try:
+                parsed = json.loads(edits)
+            except ValueError:
+                parsed = None
+            if isinstance(parsed, list):
+                fixed["edits"] = parsed
+            elif _is_single_edit(parsed):
+                fixed["edits"] = [parsed]
+        elif _is_single_edit(edits):
+            fixed["edits"] = [edits]
+
+        legacy = {"oldText": fixed.pop("oldText", None), "newText": fixed.pop("newText", None)}
+        if isinstance(legacy["oldText"], str) and isinstance(legacy["newText"], str):
+            existing = fixed.get("edits")
+            fixed["edits"] = [*(existing if isinstance(existing, list) else []), legacy]
+
+        return super().cast_params(fixed)
+
+    async def execute(self, path: str, edits: list[dict[str, Any]], **kwargs: Any) -> str:
+        if not isinstance(edits, list) or not edits:
+            return "Error: edits must contain at least one replacement."
+        total = len(edits)
         try:
             fp = self._resolve(path)
             if not fp.exists():
                 return f"Error: File not found: {path}"
 
+            refusal = await self._approve_instruction_change(fp, "edit")
+            if refusal:
+                return refusal
+
             raw = fp.read_bytes()
             uses_crlf = b"\r\n" in raw
             content = raw.decode("utf-8").replace("\r\n", "\n")
-            match, count = _find_match(content, old_text.replace("\r\n", "\n"))
 
-            if match is None:
-                return self._not_found_msg(old_text, content, path)
-            if count > 1 and not replace_all:
-                return (
-                    f"Warning: old_text appears {count} times. "
-                    "Provide more context to make it unique, or set replace_all=true."
-                )
+            # Every edit is located in the *original* content before any of them
+            # is applied, so an earlier replacement cannot move or destroy a
+            # later one's anchor. Nothing is written unless all of them resolve.
+            located: list[tuple[int, int, int, str]] = []  # (start, end, edit index, new text)
+            for index, edit in enumerate(edits):
+                old_text = edit.get("oldText")
+                new_text = edit.get("newText")
+                if not isinstance(old_text, str) or not isinstance(new_text, str):
+                    return f"Error: {_ref(index, total)} needs both oldText and newText as strings."
+                if not old_text:
+                    empty = "oldText" if total == 1 else f"edits[{index}].oldText"
+                    return f"Error: {empty} must not be empty in {path}."
 
-            norm_new = new_text.replace("\r\n", "\n")
-            new_content = content.replace(match, norm_new) if replace_all else content.replace(match, norm_new, 1)
+                match, count = _find_match(content, old_text.replace("\r\n", "\n"))
+                if match is None:
+                    return self._not_found_msg(old_text, content, path, index, total)
+                if count > 1:
+                    unique = "The text must be unique." if total == 1 else "Each oldText must be unique."
+                    return (
+                        f"Error: Found {count} occurrences of {_ref(index, total)} in {path}. "
+                        f"{unique} Please provide more context to make it unique."
+                    )
+                begin = content.index(match)
+                located.append((begin, begin + len(match), index, new_text.replace("\r\n", "\n")))
+
+            located.sort()
+            for (_, prev_end, prev_index, _), (next_begin, _, next_index, _) in zip(located, located[1:], strict=False):
+                if prev_end > next_begin:
+                    return (
+                        f"Error: edits[{prev_index}] and edits[{next_index}] overlap in {path}. "
+                        "Merge them into one edit or target disjoint regions."
+                    )
+
+            # Applied back to front so each replacement leaves the offsets of
+            # the ones before it untouched.
+            new_content = content
+            for begin, finish, _, new_text in reversed(located):
+                new_content = new_content[:begin] + new_text + new_content[finish:]
+
+            if new_content == content:
+                if total == 1:
+                    return (
+                        f"Error: No changes made to {path}. The replacement produced identical content. "
+                        "This might indicate an issue with special characters or the text not existing "
+                        "as expected."
+                    )
+                return f"Error: No changes made to {path}. The replacements produced identical content."
+
             if uses_crlf:
                 new_content = new_content.replace("\n", "\r\n")
 
             fp.write_bytes(new_content.encode("utf-8"))
-            return f"Successfully edited {fp}"
+            return f"Successfully replaced {total} block(s) in {fp}"
         except PermissionError as e:
             return f"Error: {e}"
         except Exception as e:
             return f"Error editing file: {e}"
 
     @staticmethod
-    def _not_found_msg(old_text: str, content: str, path: str) -> str:
+    def _not_found_msg(old_text: str, content: str, path: str, index: int, total: int) -> str:
         lines = content.splitlines(keepends=True)
         old_lines = old_text.splitlines(keepends=True)
         window = len(old_lines)
@@ -362,29 +558,56 @@ class EditFileTool(_FsTool):
             if ratio > best_ratio:
                 best_ratio, best_start = ratio, i
 
+        exactly = "The old text" if total == 1 else "The oldText"
+        head = (
+            f"Error: Could not find {_ref(index, total)} in {path}. "
+            f"{exactly} must match exactly including all whitespace and newlines."
+        )
         if best_ratio > 0.5:
             diff = "\n".join(
                 difflib.unified_diff(
                     old_lines,
                     lines[best_start : best_start + window],
-                    fromfile="old_text (provided)",
+                    fromfile="oldText (provided)",
                     tofile=f"{path} (actual, line {best_start + 1})",
                     lineterm="",
                 )
             )
-            return f"Error: old_text not found in {path}.\nBest match ({best_ratio:.0%} similar) at line {best_start + 1}:\n{diff}"
-        return f"Error: old_text not found in {path}. No similar text found. Verify the file content."
+            return f"{head}\nBest match ({best_ratio:.0%} similar) at line {best_start + 1}:\n{diff}"
+        return f"{head} No similar text found — verify the file content."
+
+
+def _is_single_edit(value: Any) -> bool:
+    """Whether ``value`` is one ``{oldText, newText}`` pair rather than a list."""
+    return isinstance(value, dict) and isinstance(value.get("oldText"), str) and isinstance(value.get("newText"), str)
+
+
+def _ref(index: int, total: int) -> str:
+    """``the text`` for a lone edit, ``edits[i]`` when there are several.
+
+    A single-edit call has no index worth quoting, and pi's own errors say so
+    differently for the two cases; a model told about ``edits[0]`` when it sent
+    one edit goes looking for the other entries it never wrote.
+    """
+    return "the text" if total == 1 else f"edits[{index}]"
 
 
 # ---------------------------------------------------------------------------
-# list_dir
+# ls
 # ---------------------------------------------------------------------------
 
 
 class ListDirTool(_FsTool):
-    """List directory contents with optional recursion."""
+    """List one directory.
 
-    _DEFAULT_MAX = 200
+    Named ``ls`` with pi's ``{path, limit}`` schema, both optional. Neither
+    ``recursive`` nor a per-call ignore list survives the alignment: a recursive
+    listing of an unknown tree is how a single call returns tens of thousands of
+    paths, and ``find`` already answers "what is under here" with a pattern and
+    a cap.
+    """
+
+    _DEFAULT_LIMIT = 500
     _IGNORE_DIRS = {
         ".git",
         "node_modules",
@@ -403,14 +626,15 @@ class ListDirTool(_FsTool):
 
     @property
     def name(self) -> str:
-        return "list_dir"
+        return "ls"
 
     @property
     def description(self) -> str:
         return (
-            "List the contents of a directory. "
-            "Set recursive=true to explore nested structure. "
-            "Common noise directories (.git, node_modules, __pycache__, etc.) are auto-ignored."
+            "List directory contents. Returns entries sorted alphabetically, with '/' suffix for "
+            f"directories. Includes dotfiles. Output is truncated to {self._DEFAULT_LIMIT} entries. "
+            "Build directories and caches (.git, node_modules, __pycache__, and the like) are "
+            "skipped, and listing is confined to the permitted directory."
         )
 
     @property
@@ -418,27 +642,17 @@ class ListDirTool(_FsTool):
         return {
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "The directory path to list"},
-                "recursive": {
-                    "type": "boolean",
-                    "description": "Recursively list all files (default false)",
-                },
-                "max_entries": {
+                "path": {"type": "string", "description": "Directory to list (default: current directory)"},
+                "limit": {
                     "type": "integer",
-                    "description": "Maximum entries to return (default 200)",
+                    "description": f"Maximum number of entries to return (default: {self._DEFAULT_LIMIT})",
                     "minimum": 1,
                 },
             },
-            "required": ["path"],
+            "required": [],
         }
 
-    async def execute(
-        self,
-        path: str,
-        recursive: bool = False,
-        max_entries: int | None = None,
-        **kwargs: Any,
-    ) -> str:
+    async def execute(self, path: str = ".", limit: int | None = None, **kwargs: Any) -> str:
         try:
             dp = self._resolve(path)
             if not dp.exists():
@@ -446,26 +660,16 @@ class ListDirTool(_FsTool):
             if not dp.is_dir():
                 return f"Error: Not a directory: {path}"
 
-            cap = max_entries or self._DEFAULT_MAX
+            cap = limit or self._DEFAULT_LIMIT
             items: list[str] = []
             total = 0
 
-            if recursive:
-                for item in sorted(dp.rglob("*")):
-                    if any(p in self._IGNORE_DIRS for p in item.parts):
-                        continue
-                    total += 1
-                    if len(items) < cap:
-                        rel = item.relative_to(dp)
-                        items.append(f"{rel}/" if item.is_dir() else str(rel))
-            else:
-                for item in sorted(dp.iterdir()):
-                    if item.name in self._IGNORE_DIRS:
-                        continue
-                    total += 1
-                    if len(items) < cap:
-                        pfx = "📁 " if item.is_dir() else "📄 "
-                        items.append(f"{pfx}{item.name}")
+            for item in sorted(dp.iterdir()):
+                if item.name in self._IGNORE_DIRS:
+                    continue
+                total += 1
+                if len(items) < cap:
+                    items.append(f"{item.name}/" if item.is_dir() else item.name)
 
             if not items and total == 0:
                 return f"Directory {path} is empty"

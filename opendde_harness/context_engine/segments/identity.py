@@ -11,10 +11,16 @@ from opendde_harness.context_engine.segments import render
 class IdentitySegmentBuilder:
     name = "identity"
     order = 1
-    needs_prefix = False
 
     def __init__(self, workspace: Path) -> None:
         self._workspace = workspace
 
     async def build(self, ctx: AssemblyContext) -> Segment | None:
-        return Segment(text=render.identity_text(self._workspace))
+        return Segment(
+            text=render.identity_text(
+                self._workspace,
+                ctx.model,
+                language=ctx.language,
+                long_term_memory=ctx.long_term_memory,
+            )
+        )

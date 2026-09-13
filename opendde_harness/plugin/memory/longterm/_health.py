@@ -1,11 +1,10 @@
 """Read what a running long-term memory server can actually do.
 
-``_server._probe_health`` answers "is the process up". From library version 1.2.1
-``/health`` also reports which capabilities the server managed to *build*, and
-those are different questions: 1.2.1 boots with ``[llm]`` alone rather than
-aborting, so a server whose embedding provider is misconfigured still answers
-200 and quietly degrades to keyword-only search. A caller that stops at
-"reachable" therefore reports a healthy install that cannot recall anything.
+``_server._probe_health`` answers "is the process up". ``/health`` also
+reports which capabilities the server managed to *build*, and those are
+different questions: a server whose parser could not be built still answers
+200. A caller that stops at "reachable" therefore reports a healthy install
+that cannot do part of its job.
 
 This module only reports what the server says. Deciding whether that contradicts
 what the user configured belongs to the caller, which is the side that can read
@@ -27,35 +26,26 @@ BACKEND_NAME = "longterm"
 HEALTH_TIMEOUT_S = 5.0
 
 # Config toml section name -> the key /health reports it under. The two differ
-# (`embedding` vs `embed`, `multimodal` vs `multimodal_llm`), so a caller that
-# reuses the section name reads a present capability as missing.
+# (`multimodal` vs `multimodal_llm`), so a caller that reuses the section name
+# reads a present capability as missing. Only the two sections this plugin
+# writes: embedding and rerank are not configured, and the library searches by
+# keyword without them.
 _SECTION_TO_CAPABILITY = {
     "llm": "llm",
-    "embedding": "embed",
-    "rerank": "rerank",
     "multimodal": "multimodal_llm",
 }
 
-# Nothing works without the llm: extraction needs it, and library 1.2.1 will not
-# even boot without `[llm]` configured.
-#
-# Which is also why nothing reaches this branch on 1.2.1: its `/health` reports
-# `llm` as a hardcoded True (`entrypoints/api/routes/health.py`) precisely
-# because a server that got that far must have one. An llm that fails at boot
-# surfaces as an unreachable server instead. Kept because the library's own comment
-# says that literal may become a real probe, and because the section list is the
-# contract, not a description of one release's behaviour.
+# Nothing works without the llm: extraction needs it, and the library will not
+# even boot without `[llm]` configured. The library's `/health` reports `llm`
+# as a hardcoded True precisely because a server that got that far must have
+# one; kept because the library's own comment says that literal may become a
+# real probe.
 REQUIRED_SECTIONS = ("llm",)
 
-# Configured but unbuilt, these cost some part of memory rather than memory
-# itself -- the adapter drops to KEYWORD search without embedding and to the LLM
-# rerank lane without rerank, and without the multimodal llm images / PDFs /
-# audio never make it in. Reported, never treated as a fault.
-#
-# Every optional role the wizard can write belongs here: `update_memory`
-# WRITABLE_SECTIONS is the source of that list, and a role missing from here is
-# one that can fail to build with nobody saying so.
-DEGRADING_SECTIONS = ("embedding", "rerank", "multimodal")
+# Configured but unbuilt, this costs part of memory rather than memory itself:
+# without the multimodal llm images / PDFs / audio never make it in. Reported,
+# never treated as a fault.
+DEGRADING_SECTIONS = ("multimodal",)
 
 
 @dataclass(frozen=True)

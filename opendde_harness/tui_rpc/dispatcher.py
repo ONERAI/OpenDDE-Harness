@@ -106,10 +106,16 @@ class Dispatcher:
                 "code": exc.code,
                 "message": exc.message,
             }
-            if exc.data is not None:
-                err_payload["data"] = exc.data
-            elif exc.detail:
-                err_payload["data"] = {"detail": exc.detail}
+            # The handler's own sentence always travels: a client shows
+            # ``data.detail`` and nothing else, and a handler that also passed
+            # data (a slug, a field) used to have its sentence dropped for it.
+            data = dict(exc.data) if isinstance(exc.data, dict) else exc.data
+            if exc.detail and isinstance(data, dict):
+                data.setdefault("detail", exc.detail)
+            elif exc.detail and data is None:
+                data = {"detail": exc.detail}
+            if data is not None:
+                err_payload["data"] = data
             return {"jsonrpc": "2.0", "id": frame_id, "error": err_payload}
         except SystemExit as exc:
             # Click/Typer can leak SystemExit even with standalone_mode=False;

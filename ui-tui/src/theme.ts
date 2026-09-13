@@ -1,20 +1,51 @@
 // SPDX-License-Identifier: MIT
 // Portions Copyright (c) 2025 Nous Research (hermes-agent, MIT).
+// Portions Copyright (c) 2026 mrzz (pi-claude-theme, MIT): the neutral greys,
+// the semantic green/red/amber, the periwinkle, and the message and tool
+// grounds are that theme's values.
 // Modifications Copyright (c) 2026 EverMind.
-// See NOTICES.md and LICENSES/MIT-hermes-agent.txt.
+// See LICENSES/README.md and LICENSES/MIT-hermes-agent.txt.
+//
+// One curated set per scheme x color tier, so a 256-color terminal gets
+// hand-picked `ansi256(N)` values instead of chalk's lossy hex downsample.
+// Every color the UI draws goes through a `Theme` instance; components never
+// emit raw ANSI.
+//
+// The split the palette is built on: violet is identity, everything else is
+// neutral. The brand violet paints the logo, the accent and primary, the
+// picker's selected row, the busy indicator and the thinking level, and
+// nothing else. Borders, rules, popups, the footer and the message and tool
+// grounds are grey at the reference theme's own levels; links and field labels
+// take a second hue (periwinkle) so a reference is not mistaken for a brand
+// accent; green, red and amber mean success, failure and warning and are never
+// chrome. Text is left unpainted wherever it can be, so it is the terminal's
+// own foreground.
 
-import { activeColorTier } from '@hermes/ink'
+import type { EditorTheme, MarkdownTheme, RgbColor, SelectListTheme, SettingsListTheme } from '@earendil-works/pi-tui'
+import type { ChalkInstance } from 'chalk'
+
+import { Chalk } from 'chalk'
+
+import type { ColorTier } from './lib/colorTier.js'
+
+import { resolveColorTier } from './lib/colorTier.js'
+
+export type ColorScheme = 'dark' | 'light'
+
+/** Paint nothing: the terminal's own color stands. Used for body text and for
+ *  the footer's ground, which both read better in whatever the user's profile
+ *  already chose than in anything this palette could pick for them. */
+export const INHERIT = 'inherit'
 
 export interface ThemeColors {
   primary: string
   accent: string
+  /** The accent one light step up: the band of the busy indicator's shimmer,
+   *  the way Claude Code tints its verb. */
+  shimmer: string
   border: string
   text: string
   muted: string
-  completionBg: string
-  completionCurrentBg: string
-  completionMetaBg: string
-  completionMetaCurrentBg: string
 
   label: string
   ok: string
@@ -22,743 +53,668 @@ export interface ThemeColors {
   warn: string
 
   prompt: string
-  sessionLabel: string
-  sessionBorder: string
+  /** pi's `dim`: the grey a footer, a hint's key or a URL is painted in, one
+   *  step below `muted`. Kept at pi's own two values. */
+  dim: string
 
-  statusBg: string
-  statusFg: string
-  statusGood: string
-  statusWarn: string
-  statusBad: string
-  statusCritical: string
   selectionBg: string
-
-  diffAdded: string
-  diffRemoved: string
-  diffAddedWord: string
-  diffRemovedWord: string
-
-  shellDollar: string
+  userMessageBg: string
+  toolPendingBg: string
+  toolSuccessBg: string
+  toolErrorBg: string
 }
 
-export interface ThemeBrand {
-  name: string
-  icon: string
-  prompt: string
-  welcome: string
-  goodbye: string
-  tool: string
-  helpHeader: string
-}
-
-export interface Theme {
-  color: ThemeColors
-  brand: ThemeBrand
-  bannerLogo: string
-  bannerHero: string
-  // Brand yellow ramp (light → dark), resolved for the active tier. Used for
-  // the gradient banner art.
-  yellow: readonly string[]
-}
-
-export type ColorScheme = 'dark' | 'light'
-
-// ── Color math ───────────────────────────────────────────────────────
-//
-// Only the helpers the truecolor palettes themselves need. There is NO
-// RGB->ANSI conversion at runtime: the reduced-tier palettes below are
-// pre-derived literals (see scripts/gen-color-palettes.mjs), so a level-2
-// terminal gets curated `ansi256(N)` values instead of chalk's lossy hex
-// downsample (which collapsed the dark-green border onto an olive cube cell).
-
-function parseHex(h: string): [number, number, number] | null {
-  const m = /^#?([0-9a-f]{6})$/i.exec(h)
-
-  if (!m) {
-    return null
-  }
-
-  const n = parseInt(m[1]!, 16)
-
-  return [(n >> 16) & 0xff, (n >> 8) & 0xff, n & 0xff]
-}
-
-function mix(a: string, b: string, t: number) {
-  const pa = parseHex(a)
-  const pb = parseHex(b)
-
-  if (!pa || !pb) {
-    return a
-  }
-
-  const lerp = (i: 0 | 1 | 2) => Math.round(pa[i] + (pb[i] - pa[i]) * t)
-
-  return '#' + ((1 << 24) | (lerp(0) << 16) | (lerp(1) << 8) | lerp(2)).toString(16).slice(1)
-}
-
-// ── Brand ────────────────────────────────────────────────────────────
-
-const BRAND: ThemeBrand = {
-  name: 'OpenDDE Harness',
-  icon: 'ϒ',
-  prompt: '❯',
-  welcome: 'Describe the antibody you want to design, or type /help.',
-  goodbye: 'Goodbye! ϒ',
-  tool: '┊',
-  helpHeader: 'Commands'
-}
-
-const cleanPromptSymbol = (s: string | undefined, fallback: string) => {
-  const cleaned = String(s ?? '')
-    .replace(/\s+/g, ' ')
-    .trim()
-
-  return cleaned || fallback
-}
-
-// ── Brand yellow ramp (gradient logo / 3D shadow) ────────────────────
-//
-// A brand asset (opendde-tui-design-system, "Brand ramp"), ordered light → dark.
-// Used for the gradient banner art. The .50/.300/.500/.700/.900 stops are the
-// documented title bands (docs/tui-color-problem/title-gradient-table.md);
-// other stops are interpolated. The banner only reads the first few entries
-// (hero bands) and falls back to the last, so ramp length isn't load-bearing.
-//
-// Truecolor carries an extra .600 stop for a smoother hero gradient (9 entries:
-// [.50,.100,.300,.500,.600,.700,.900,.950,.990]); the reduced 256/16 tiers keep
-// the 8-stop set ([.50,.100,.300,.500,.700,.900,.950,.990]) — the doc defines
-// no .600 there. Dark and light carry DISTINCT scales at truecolor and 256
-// (light re-derived around #B87900, not a dimmed dark scale); 16 is `yellow`.
-
-const YELLOW_RAMP_TC_DARK: readonly string[] = [
-  '#F5F3FF',
-  '#EDE9FE',
-  '#C4B5FD',
-  '#A78BFA',
-  '#8B5CF6',
-  '#7C3AED',
-  '#5B21B6',
-  '#3B0764',
-  '#1E103F'
-]
-
-const YELLOW_RAMP_TC_LIGHT: readonly string[] = [
-  '#EDE9FE',
-  '#DDD6FE',
-  '#C4B5FD',
-  '#6D28D9',
-  '#5B21B6',
-  '#4C1D95',
-  '#3B0764',
-  '#2E1065',
-  '#1E0A3C'
-]
-
-const YELLOW_RAMP_256_DARK: readonly string[] = [
-  'ansi256(189)',
-  'ansi256(183)',
-  'ansi256(147)',
-  'ansi256(141)',
-  'ansi256(99)',
-  'ansi256(93)',
-  'ansi256(55)',
-  'ansi256(53)'
-]
-
-const YELLOW_RAMP_256_LIGHT: readonly string[] = [
-  'ansi256(189)',
-  'ansi256(183)',
-  'ansi256(141)',
-  'ansi256(91)',
-  'ansi256(55)',
-  'ansi256(54)',
-  'ansi256(53)',
-  'ansi256(52)'
-]
-
-const YELLOW_RAMP_16: readonly string[] = [
-  'ansi:magentaBright',
-  'ansi:magentaBright',
-  'ansi:magentaBright',
-  'ansi:magentaBright',
-  'ansi:magentaBright',
-  'ansi:magentaBright',
-  'ansi:magentaBright',
-  'ansi:magentaBright'
-]
-
-function yellowRamp(tier: 0 | 1 | 2 | 3, scheme: ColorScheme): readonly string[] {
-  if (tier === 2) {
-    return scheme === 'light' ? YELLOW_RAMP_256_LIGHT : YELLOW_RAMP_256_DARK
-  }
-  if (tier === 1) {
-    return YELLOW_RAMP_16
-  }
-  return scheme === 'light' ? YELLOW_RAMP_TC_LIGHT : YELLOW_RAMP_TC_DARK
-}
+export type ThemeToken = keyof ThemeColors
 
 // ── Tier 3: truecolor (source of truth) ──────────────────────────────
 
-export const DARK_THEME: Theme = {
-  color: {
-    primary: '#A78BFA',
-    accent: '#8B5CF6',
-    border: '#2d333b',
-    text: '#FFF5EA',
-    muted: '#858482',
-    completionBg: '#000000',
-    completionCurrentBg: '#251A3D',
-    completionMetaBg: '#080808',
-    completionMetaCurrentBg: '#201634',
+const DARK_TRUECOLOR: ThemeColors = {
+  // Identity.
+  primary: '#A78BFA',
+  accent: '#8B5CF6',
+  shimmer: '#A97AFF',
+  prompt: '#A78BFA',
+  selectionBg: '#3A3350',
 
-    label: '#858482',
-    ok: '#3ee07a',
-    error: '#ec6a5e',
-    warn: '#f5a623',
+  // Text: the terminal's own, with grey for what is deliberately secondary.
+  text: INHERIT,
+  muted: '#999999',
+  label: '#8FA0F0',
+  dim: '#666666',
 
-    prompt: '#A78BFA',
-    sessionLabel: '#858482',
-    sessionBorder: '#2d333b',
+  // Chrome.
+  border: '#505050',
 
-    statusBg: '#000000',
-    statusFg: '#999999',
-    statusGood: '#3ee07a',
-    statusWarn: '#f5a623',
-    statusBad: '#ec6a5e',
-    statusCritical: '#ec6a5e',
-    selectionBg: '#4C1D95',
+  // Meaning.
+  ok: '#4EBA65',
+  error: '#FF6B80',
+  warn: '#FFC107',
 
-    diffAdded: '#13260f',
-    diffRemoved: '#2a1416',
-    diffAddedWord: '#86c957',
-    diffRemovedWord: '#f85149',
-    shellDollar: '#A78BFA'
-  },
-
-  brand: BRAND,
-
-  bannerLogo: '',
-  bannerHero: '',
-  yellow: YELLOW_RAMP_TC_DARK
+  // Grounds. Flat greys: a band is a ground, and success is said by what is in
+  // the panel rather than by tinting it.
+  userMessageBg: '#373737',
+  toolPendingBg: '#2E2E2E',
+  toolSuccessBg: '#2E2E2E',
+  toolErrorBg: '#362B2D'
 }
 
-// Light-terminal palette: darker, higher-contrast values that stay legible on
-// white backgrounds. Same shape as DARK_THEME so `fromSkin` still layers on
-// top cleanly (#11300).
-export const LIGHT_THEME: Theme = {
-  color: {
-    primary: '#6D28D9',
-    accent: '#7C3AED',
-    border: '#d0d7de',
-    text: '#24201a',
-    muted: '#57606a',
-    completionBg: '#f6f8fa',
-    completionCurrentBg: '#F5F3FF',
-    completionMetaBg: '#eef1f4',
-    completionMetaCurrentBg: '#EDE9FE',
+// Light-terminal palette: the same structure at the reference's light levels.
+const LIGHT_TRUECOLOR: ThemeColors = {
+  primary: '#7C3AED',
+  accent: '#6D28D9',
+  shimmer: '#8B46F7',
+  prompt: '#7C3AED',
+  selectionBg: '#E9E4F7',
 
-    label: '#6e7681',
-    ok: '#1f7a33',
-    error: '#cf222e',
-    warn: '#a05500',
+  text: INHERIT,
+  muted: '#666666',
+  label: '#4B5BD4',
+  dim: '#767676',
 
-    prompt: '#6D28D9',
-    sessionLabel: '#6e7681',
-    sessionBorder: '#d0d7de',
+  border: '#AFAFAF',
 
-    statusBg: '#f6f8fa',
-    statusFg: '#57606a',
-    statusGood: '#1f7a33',
-    statusWarn: '#a05500',
-    statusBad: '#cf222e',
-    statusCritical: '#cf222e',
-    selectionBg: '#DDD6FE',
+  ok: '#2C7A39',
+  error: '#AB2B3F',
+  warn: '#966C1E',
 
-    diffAdded: '#e6f7dd',
-    diffRemoved: '#ffe3e0',
-    diffAddedWord: '#3f6f1f',
-    diffRemovedWord: '#c0282f',
-    shellDollar: '#6D28D9'
-  },
-
-  brand: BRAND,
-
-  bannerLogo: '',
-  bannerHero: '',
-  yellow: YELLOW_RAMP_TC_LIGHT
+  userMessageBg: '#F0F0F0',
+  toolPendingBg: '#F5F5F5',
+  toolSuccessBg: '#F5F5F5',
+  toolErrorBg: '#F9EFEF'
 }
 
-// ── Tier 2: 256-color (per design tokens, docs/tui-color-problem/tokens.md) ──
-
-const DARK_256_COLORS: ThemeColors = {
-  primary: 'ansi256(141)',
-  accent: 'ansi256(141)',
-  border: 'ansi256(236)',
-  text: 'ansi256(255)',
-  muted: 'ansi256(102)',
-  completionBg: 'ansi256(16)',
-  completionCurrentBg: 'ansi256(234)',
-  completionMetaBg: 'ansi256(232)',
-  completionMetaCurrentBg: 'ansi256(234)',
-  label: 'ansi256(102)',
-  ok: 'ansi256(78)',
-  error: 'ansi256(203)',
-  warn: 'ansi256(214)',
-  prompt: 'ansi256(141)',
-  sessionLabel: 'ansi256(102)',
-  sessionBorder: 'ansi256(236)',
-  statusBg: 'ansi256(16)',
-  statusFg: 'ansi256(246)',
-  statusGood: 'ansi256(78)',
-  statusWarn: 'ansi256(214)',
-  statusBad: 'ansi256(203)',
-  statusCritical: 'ansi256(203)',
-  selectionBg: 'ansi256(54)',
-  diffAdded: 'ansi256(234)',
-  diffRemoved: 'ansi256(234)',
-  diffAddedWord: 'ansi256(107)',
-  diffRemovedWord: 'ansi256(203)',
-  shellDollar: 'ansi256(141)'
-}
-
-const LIGHT_256_COLORS: ThemeColors = {
-  primary: 'ansi256(91)',
-  accent: 'ansi256(91)',
-  border: 'ansi256(188)',
-  text: 'ansi256(234)',
-  muted: 'ansi256(59)',
-  completionBg: 'ansi256(231)',
-  completionCurrentBg: 'ansi256(230)',
-  completionMetaBg: 'ansi256(255)',
-  completionMetaCurrentBg: 'ansi256(229)',
-  label: 'ansi256(243)',
-  ok: 'ansi256(29)',
-  error: 'ansi256(160)',
-  warn: 'ansi256(130)',
-  prompt: 'ansi256(91)',
-  sessionLabel: 'ansi256(243)',
-  sessionBorder: 'ansi256(188)',
-  statusBg: 'ansi256(231)',
-  statusFg: 'ansi256(59)',
-  statusGood: 'ansi256(29)',
-  statusWarn: 'ansi256(130)',
-  statusBad: 'ansi256(160)',
-  statusCritical: 'ansi256(160)',
-  selectionBg: 'ansi256(183)',
-  diffAdded: 'ansi256(194)',
-  diffRemoved: 'ansi256(224)',
-  diffAddedWord: 'ansi256(64)',
-  diffRemovedWord: 'ansi256(124)',
-  shellDollar: 'ansi256(91)'
-}
-
-// ── Tier 1: 16-color (per design tokens, docs/tui-color-problem/tokens.md) ──
+// ── Tier 2: 256-color ────────────────────────────────────────────────
 //
-// Two caveats vs the token spec, which a single color string can't encode:
-//   - `reverse` highlights (completionCurrentBg/completionMetaCurrentBg/
-//     selectionBg) fall back to brightBlack — the spec's stated alternative.
-//   - statusCritical's `+ bold` is dropped (bold is a text style, not a
-//     color), leaving it `red` like the spec's base.
+// Nearest slot to each truecolor value, except where two roles would land on
+// the same grey: the picker's selected row keeps a violet-tinted ground rather
+// than collapsing onto the user band's, and a failed tool keeps a red one.
 
-const DARK_16_COLORS: ThemeColors = {
+const DARK_256: ThemeColors = {
+  primary: 'ansi256(141)',
+  accent: 'ansi256(99)',
+  shimmer: 'ansi256(141)',
+  prompt: 'ansi256(141)',
+  selectionBg: 'ansi256(60)',
+
+  text: INHERIT,
+  muted: 'ansi256(246)',
+  label: 'ansi256(111)',
+  dim: 'ansi256(241)',
+
+  border: 'ansi256(240)',
+
+  ok: 'ansi256(71)',
+  error: 'ansi256(204)',
+  warn: 'ansi256(214)',
+
+  userMessageBg: 'ansi256(237)',
+  toolPendingBg: 'ansi256(236)',
+  toolSuccessBg: 'ansi256(236)',
+  toolErrorBg: 'ansi256(52)'
+}
+
+const LIGHT_256: ThemeColors = {
+  primary: 'ansi256(93)',
+  accent: 'ansi256(92)',
+  shimmer: 'ansi256(99)',
+  prompt: 'ansi256(93)',
+  selectionBg: 'ansi256(189)',
+
+  text: INHERIT,
+  muted: 'ansi256(241)',
+  label: 'ansi256(62)',
+  dim: 'ansi256(243)',
+
+  border: 'ansi256(145)',
+
+  ok: 'ansi256(29)',
+  error: 'ansi256(125)',
+  warn: 'ansi256(94)',
+
+  userMessageBg: 'ansi256(255)',
+  toolPendingBg: 'ansi256(255)',
+  toolSuccessBg: 'ansi256(255)',
+  toolErrorBg: 'ansi256(224)'
+}
+
+// ── Tier 1: 16-color ─────────────────────────────────────────────────
+//
+// The same split with eight hues to spend it on: magenta is the identity,
+// every piece of chrome is one of the two blacks or the terminal's own, and no
+// ground is tinted toward the brand. A reverse highlight has no color to fall
+// back to, so the picker's selected row is told apart by its accent text and
+// its cursor rather than by a band.
+
+const DARK_16: ThemeColors = {
   primary: 'ansi:magentaBright',
   accent: 'ansi:magentaBright',
-  border: 'ansi:blackBright',
-  text: 'ansi:white',
+  shimmer: 'ansi:white',
+  prompt: 'ansi:magentaBright',
+  selectionBg: 'ansi:blackBright',
+
+  text: INHERIT,
   muted: 'ansi:blackBright',
-  completionBg: 'ansi:black',
-  completionCurrentBg: 'ansi:blackBright',
-  completionMetaBg: 'ansi:black',
-  completionMetaCurrentBg: 'ansi:blackBright',
-  label: 'ansi:blackBright',
+  label: 'ansi:blueBright',
+  dim: 'ansi:blackBright',
+
+  border: 'ansi:blackBright',
+
   ok: 'ansi:greenBright',
   error: 'ansi:redBright',
   warn: 'ansi:yellow',
-  prompt: 'ansi:magentaBright',
-  sessionLabel: 'ansi:blackBright',
-  sessionBorder: 'ansi:blackBright',
-  statusBg: 'ansi:black',
-  statusFg: 'ansi:blackBright',
-  statusGood: 'ansi:greenBright',
-  statusWarn: 'ansi:yellow',
-  statusBad: 'ansi:redBright',
-  statusCritical: 'ansi:red',
-  selectionBg: 'ansi:magenta',
-  diffAdded: 'ansi:blackBright',
-  diffRemoved: 'ansi:blackBright',
-  diffAddedWord: 'ansi:green',
-  diffRemovedWord: 'ansi:red',
-  shellDollar: 'ansi:magentaBright'
+
+  userMessageBg: 'ansi:blackBright',
+  toolPendingBg: 'ansi:black',
+  toolSuccessBg: 'ansi:black',
+  toolErrorBg: 'ansi:red'
 }
 
-const LIGHT_16_COLORS: ThemeColors = {
+const LIGHT_16: ThemeColors = {
   primary: 'ansi:magenta',
   accent: 'ansi:magenta',
-  border: 'ansi:blackBright',
-  text: 'ansi:black',
+  shimmer: 'ansi:magentaBright',
+  prompt: 'ansi:magenta',
+  selectionBg: 'ansi:white',
+
+  text: INHERIT,
   muted: 'ansi:blackBright',
-  completionBg: 'ansi:white',
-  completionCurrentBg: 'ansi:blackBright',
-  completionMetaBg: 'ansi:white',
-  completionMetaCurrentBg: 'ansi:blackBright',
-  label: 'ansi:blackBright',
+  label: 'ansi:blue',
+  dim: 'ansi:blackBright',
+
+  border: 'ansi:blackBright',
+
   ok: 'ansi:green',
   error: 'ansi:red',
   warn: 'ansi:yellow',
-  prompt: 'ansi:magenta',
-  sessionLabel: 'ansi:blackBright',
-  sessionBorder: 'ansi:blackBright',
-  statusBg: 'ansi:white',
-  statusFg: 'ansi:blackBright',
-  statusGood: 'ansi:green',
-  statusWarn: 'ansi:yellow',
-  statusBad: 'ansi:red',
-  statusCritical: 'ansi:red',
-  selectionBg: 'ansi:magentaBright',
-  diffAdded: 'ansi:blackBright',
-  diffRemoved: 'ansi:blackBright',
-  diffAddedWord: 'ansi:green',
-  diffRemovedWord: 'ansi:red',
-  shellDollar: 'ansi:magenta'
+
+  userMessageBg: 'ansi:white',
+  toolPendingBg: 'ansi:white',
+  toolSuccessBg: 'ansi:white',
+  toolErrorBg: 'ansi:redBright'
 }
 
-const DARK_256: Theme = { ...DARK_THEME, color: DARK_256_COLORS, yellow: YELLOW_RAMP_256_DARK }
-const DARK_16: Theme = { ...DARK_THEME, color: DARK_16_COLORS, yellow: YELLOW_RAMP_16 }
-const LIGHT_256: Theme = { ...LIGHT_THEME, color: LIGHT_256_COLORS, yellow: YELLOW_RAMP_256_LIGHT }
-const LIGHT_16: Theme = { ...LIGHT_THEME, color: LIGHT_16_COLORS, yellow: YELLOW_RAMP_16 }
+// ── The wordmark ramp ────────────────────────────────────────────────
+//
+// The four bands the startup wordmark is drawn in, top to bottom, and the only
+// color the banner art is allowed to use. It is a ramp rather than a token
+// because the wordmark is a gradient: its rows are split into as many bands as
+// this has entries.
+//
+// Every band is a violet. The ramp used to open at the brand scale's lightest
+// stops (#F5F3FF, #EDE9FE), which read as white rather than as the brand on a
+// dark terminal, and to close on its darkest (#3B0764, #1E103F), which read as
+// black on a light one. Both ends now stay inside the violet family, so the
+// gradient reads as one color getting deeper and never as white-to-violet or
+// violet-to-black.
+//
+// The light ramp sits a step deeper than the dark one: the same violet that is
+// comfortable on a near-black ground is pale on a white one. Its lightest band
+// measures 4.2:1 against white and its darkest 9.0:1; on dark the range is
+// 3.0:1 to 9.3:1 against #1b1b1b. Nothing is near either ground.
 
-/**
- * Pick the palette for a scheme + color tier. Tier 3 (truecolor) and tier 0
- * (no color — chalk strips the codes anyway) both use the hex palette, so the
- * truecolor `Theme` reference is returned unchanged for identity checks.
- */
-export function resolveTheme(scheme: ColorScheme, tier: 0 | 1 | 2 | 3): Theme {
-  if (scheme === 'light') {
-    if (tier === 2) {
-      return LIGHT_256
-    }
-    if (tier === 1) {
-      return LIGHT_16
-    }
-    return LIGHT_THEME
+const WORDMARK_RAMP_TRUECOLOR_DARK: readonly string[] = ['#C4B5FD', '#A78BFA', '#8B5CF6', '#7C3AED']
+
+const WORDMARK_RAMP_TRUECOLOR_LIGHT: readonly string[] = ['#8B5CF6', '#7C3AED', '#6D28D9', '#5B21B6']
+
+const WORDMARK_RAMP_256_DARK: readonly string[] = ['ansi256(183)', 'ansi256(141)', 'ansi256(99)', 'ansi256(93)']
+
+const WORDMARK_RAMP_256_LIGHT: readonly string[] = ['ansi256(99)', 'ansi256(93)', 'ansi256(56)', 'ansi256(55)']
+
+/** Eight hues have no gradient to give: every band is the one violet there is. */
+const WORDMARK_RAMP_16_DARK: readonly string[] = Array.from({ length: 4 }, () => 'ansi:magentaBright')
+
+const WORDMARK_RAMP_16_LIGHT: readonly string[] = Array.from({ length: 4 }, () => 'ansi:magenta')
+
+/** The wordmark's bands for a scheme + tier, lightest first. */
+export function resolveBrandRamp(scheme: ColorScheme, tier: ColorTier): readonly string[] {
+  if (tier === 1) {
+    return scheme === 'light' ? WORDMARK_RAMP_16_LIGHT : WORDMARK_RAMP_16_DARK
   }
 
   if (tier === 2) {
-    return DARK_256
+    return scheme === 'light' ? WORDMARK_RAMP_256_LIGHT : WORDMARK_RAMP_256_DARK
   }
-  if (tier === 1) {
-    return DARK_16
+
+  return scheme === 'light' ? WORDMARK_RAMP_TRUECOLOR_LIGHT : WORDMARK_RAMP_TRUECOLOR_DARK
+}
+
+/**
+ * Pick the palette for a scheme + color tier. Tier 3 (truecolor) and tier 0
+ * (no color — chalk strips the codes anyway) share the hex palette.
+ */
+export function resolvePalette(scheme: ColorScheme, tier: ColorTier): ThemeColors {
+  if (scheme === 'light') {
+    return tier === 2 ? LIGHT_256 : tier === 1 ? LIGHT_16 : LIGHT_TRUECOLOR
   }
-  return DARK_THEME
+
+  return tier === 2 ? DARK_256 : tier === 1 ? DARK_16 : DARK_TRUECOLOR
 }
 
 // ── Light/dark detection ─────────────────────────────────────────────
 
 const TRUE_RE = /^(?:1|true|yes|on)$/
 const FALSE_RE = /^(?:0|false|no|off)$/
-
-// TERM_PROGRAM fallback allow-list for terminals whose default profile is
-// light and which may not expose COLORFGBG. Empty by default: a TERM_PROGRAM
-// alone can't tell a light profile from a dark one (Terminal.app ships both
-// and emits no COLORFGBG either way), and dark profiles are common, so an
-// undetectable terminal stays dark unless an explicit signal (OPENDDE_HARNESS_TUI_THEME
-// / OPENDDE_HARNESS_TUI_LIGHT / OPENDDE_HARNESS_TUI_BACKGROUND / COLORFGBG) says light. Still
-// injectable so tests can exercise the precedence rules.
-const LIGHT_DEFAULT_TERM_PROGRAMS = new Set<string>([])
-
-// Best-effort RGB → luminance check.  Currently only accepts a 3- or
-// 6-digit hex value (with or without a leading `#`); the env var name
-// `OPENDDE_HARNESS_TUI_BACKGROUND` is intentionally generic so a future OSC11
-// query helper can cache its answer there too, but additional formats
-// (rgb()/hsl()/named colours) would need explicit parsing here first.
-const LUMA_LIGHT_THRESHOLD = 0.6
-
-// Strict allow-list: parseInt(..., 16) silently truncates at the first
-// non-hex character (e.g. `fffgff` would parse as `fff` and yield a
-// false-positive "white" reading), so reject anything that doesn't match
-// the canonical 3- or 6-digit shape up front.
 const HEX_3_RE = /^[0-9a-f]{3}$/
 const HEX_6_RE = /^[0-9a-f]{6}$/
 
-function backgroundLuminance(raw: string): null | number {
-  const v = raw.trim().toLowerCase()
+// Rec. 709 luma above this reads as a light background.
+const LUMA_LIGHT_THRESHOLD = 0.6
 
-  if (!v) {
-    return null
-  }
+// TERM_PROGRAM allow-list for terminals whose default profile is light and
+// which may not expose COLORFGBG. Empty in production: TERM_PROGRAM alone
+// can't tell a light profile from a dark one (Terminal.app ships both and
+// emits no COLORFGBG either way), so an undetectable terminal stays dark.
+// Injectable so the precedence rules stay testable.
+const LIGHT_DEFAULT_TERM_PROGRAMS = new Set<string>([])
 
-  const hex = v.startsWith('#') ? v.slice(1) : v
-
-  const rgb = HEX_6_RE.test(hex)
-    ? [parseInt(hex.slice(0, 2), 16), parseInt(hex.slice(2, 4), 16), parseInt(hex.slice(4, 6), 16)]
-    : HEX_3_RE.test(hex)
-      ? [parseInt(hex[0]! + hex[0]!, 16), parseInt(hex[1]! + hex[1]!, 16), parseInt(hex[2]! + hex[2]!, 16)]
-      : null
-
-  if (!rgb) {
-    return null
-  }
-
-  // Rec. 709 luma — close enough for "is this background bright".
-  return (0.2126 * rgb[0]! + 0.7152 * rgb[1]! + 0.0722 * rgb[2]!) / 255
+function luminance(rgb: RgbColor): number {
+  return (0.2126 * rgb.r + 0.7152 * rgb.g + 0.0722 * rgb.b) / 255
 }
 
-// Pick light vs dark with ordered, explainable signals (#11300):
-//
-//   1. `OPENDDE_HARNESS_TUI_LIGHT` boolean — `1`/`true`/`yes`/`on` → light;
-//      `0`/`false`/`no`/`off` → dark.  Either explicit value wins
-//      regardless of any later signal.
-//   2. `OPENDDE_HARNESS_TUI_THEME` named override — `light` / `dark` win over
-//      every signal below.
-//   3. `OPENDDE_HARNESS_TUI_BACKGROUND` hex hint (3- or 6-digit) — luminance
-//      ≥ LUMA_LIGHT_THRESHOLD → light.
-//   4. `COLORFGBG` last field — XFCE / rxvt / Terminal.app emit
-//      slot 7 or 15 on light profiles; 0–15 ranges are otherwise
-//      treated as authoritatively dark so the TERM_PROGRAM
-//      allow-list below cannot override an explicit dark profile.
-//   5. `TERM_PROGRAM` light-default allow-list (empty by default; see
-//      LIGHT_DEFAULT_TERM_PROGRAMS).
-//
-// Anything we can't decide stays dark — the default OpenDDE Harness palette
-// is the dark one.
-export function detectLightMode(
-  env: NodeJS.ProcessEnv = process.env,
-  // Injectable so tests can prove the COLORFGBG-over-TERM_PROGRAM
-  // precedence rule even though the production allow-list is empty.
-  lightDefaultTermPrograms: ReadonlySet<string> = LIGHT_DEFAULT_TERM_PROGRAMS
-): boolean {
+/** Parse a 3- or 6-digit hex string into RGB. Strict: `parseInt` truncates at
+ *  the first non-hex character, so `fffgff` would otherwise read as white. */
+function parseHex(raw: string): RgbColor | null {
+  const v = raw.trim().toLowerCase()
+  const hex = v.startsWith('#') ? v.slice(1) : v
+
+  if (HEX_6_RE.test(hex)) {
+    return {
+      r: parseInt(hex.slice(0, 2), 16),
+      g: parseInt(hex.slice(2, 4), 16),
+      b: parseInt(hex.slice(4, 6), 16)
+    }
+  }
+
+  if (HEX_3_RE.test(hex)) {
+    return {
+      r: parseInt(hex[0]! + hex[0]!, 16),
+      g: parseInt(hex[1]! + hex[1]!, 16),
+      b: parseInt(hex[2]! + hex[2]!, 16)
+    }
+  }
+
+  return null
+}
+
+/** The scheme the user asked for outright, or null when they said nothing.
+ *  `OPENDDE_HARNESS_TUI_LIGHT` wins over `OPENDDE_HARNESS_TUI_THEME`; both win
+ *  over anything measured, including a live OSC 11 reply. */
+export function explicitScheme(env: NodeJS.ProcessEnv): ColorScheme | null {
   const lightFlag = (env.OPENDDE_HARNESS_TUI_LIGHT ?? '').trim().toLowerCase()
 
   if (TRUE_RE.test(lightFlag)) {
-    return true
+    return 'light'
   }
 
   if (FALSE_RE.test(lightFlag)) {
-    return false
+    return 'dark'
   }
 
   const themeFlag = (env.OPENDDE_HARNESS_TUI_THEME ?? '').trim().toLowerCase()
 
-  if (themeFlag === 'light') {
-    return true
-  }
-
-  if (themeFlag === 'dark') {
-    return false
-  }
-
-  const bgHint = backgroundLuminance(env.OPENDDE_HARNESS_TUI_BACKGROUND ?? '')
-
-  if (bgHint !== null) {
-    return bgHint >= LUMA_LIGHT_THRESHOLD
-  }
-
-  const colorfgbg = (env.COLORFGBG ?? '').trim()
-
-  if (colorfgbg) {
-    // Validate as a decimal integer before coercing — `Number('')` is 0,
-    // so a malformed `COLORFGBG='15;'` would otherwise look like an
-    // authoritative dark slot and incorrectly block the TERM_PROGRAM
-    // allow-list.  Anything that isn't pure digits falls through.
-    const lastField = colorfgbg.split(';').at(-1) ?? ''
-
-    if (/^\d+$/.test(lastField)) {
-      const bg = Number(lastField)
-
-      if (bg === 7 || bg === 15) {
-        return true
-      }
-
-      // Slots 0–6 and 8–14 are the dark half of the 0–15 ANSI range.
-      // When COLORFGBG is set we trust it as authoritative — a non-light
-      // value here shouldn't get overridden by the TERM_PROGRAM allow-list.
-      if (bg >= 0 && bg < 16) {
-        return false
-      }
-    }
-  }
-
-  const termProgram = (env.TERM_PROGRAM ?? '').trim()
-
-  return lightDefaultTermPrograms.has(termProgram)
-}
-
-const DEFAULT_LIGHT_MODE = detectLightMode()
-const DEFAULT_SCHEME: ColorScheme = DEFAULT_LIGHT_MODE ? 'light' : 'dark'
-
-export const DEFAULT_THEME: Theme = resolveTheme(DEFAULT_SCHEME, activeColorTier())
-
-// Scheme detected at runtime by the OSC 11 background-color probe (see
-// applyDetectedBackground). Null until — or unless — the terminal answers the
-// query. When set it wins over the env-sniffed DEFAULT_SCHEME for every theme
-// built afterwards, so a late reply re-themes the whole app.
-let detectedScheme: ColorScheme | null = null
-
-/** Effective light/dark scheme: the OSC 11 probe result if we have one, else
- *  the env-sniffed default. Theme builders read this (not DEFAULT_SCHEME) so a
- *  late probe reply takes effect when the theme is rebuilt. */
-export function currentScheme(): ColorScheme {
-  return detectedScheme ?? DEFAULT_SCHEME
-}
-
-/** Curated per-scheme palette for the current scheme + color tier, with no
- *  skin applied. Used to rebuild the theme when the probe flips the scheme
- *  before any gateway skin has arrived. */
-export function resolveCurrentDefaultTheme(): Theme {
-  return resolveTheme(currentScheme(), activeColorTier())
-}
-
-/** Truecolor hex for the OSC 12 hardware-cursor color. OSC 12 takes an RGB
- *  value, so we use the hex primary regardless of the text color tier — a
- *  256/16 terminal still renders its cursor in truecolor. A skin's hex primary
- *  (tier 3) is honored; otherwise the curated per-scheme title color. */
-export function cursorColorHex(theme: Theme): string {
-  const p = theme.color.primary
-
-  return p.startsWith('#') ? p : currentScheme() === 'light' ? LIGHT_THEME.color.primary : DARK_THEME.color.primary
-}
-
-// Parse an OSC 11 background reply payload into a #rrggbb hex string.
-// xterm-class terminals answer `rgb:RRRR/GGGG/BBBB` (1-4 hex digits per
-// channel, scaled to that channel's max); a few reply `#RRGGBB`. Anything
-// else returns null so the caller keeps the env-based scheme.
-function oscColorToHex(data: string): null | string {
-  const s = data.trim().toLowerCase()
-  const m = /^rgba?:([0-9a-f]{1,4})\/([0-9a-f]{1,4})\/([0-9a-f]{1,4})/.exec(s)
-
-  if (m) {
-    const scale = (h: string) => Math.round((parseInt(h, 16) / (16 ** h.length - 1)) * 255)
-
-    return '#' + [m[1]!, m[2]!, m[3]!].map(h => scale(h).toString(16).padStart(2, '0')).join('')
-  }
-
-  const hex = s.startsWith('#') ? s.slice(1) : s
-
-  if (HEX_6_RE.test(hex)) {
-    return '#' + hex
-  }
-
-  if (HEX_3_RE.test(hex)) {
-    return '#' + [...hex].map(c => c + c).join('')
+  if (themeFlag === 'light' || themeFlag === 'dark') {
+    return themeFlag
   }
 
   return null
 }
 
 /**
- * Fold an OSC 11 background-color reply into light/dark detection.
- *
- * Caches the parsed color into OPENDDE_HARNESS_TUI_BACKGROUND and re-runs
- * detectLightMode() so the existing precedence rules apply unchanged — an
- * explicit OPENDDE_HARNESS_TUI_THEME / OPENDDE_HARNESS_TUI_LIGHT still wins over the measured
- * background. Returns the resolved scheme and whether it differs from the
- * scheme that was in effect (so the caller knows whether to re-theme), or
- * null when the reply isn't a color we can parse.
+ * Light or dark, from ordered signals:
+ *   1. `OPENDDE_HARNESS_TUI_LIGHT` / `OPENDDE_HARNESS_TUI_THEME` (explicit).
+ *   2. `OPENDDE_HARNESS_TUI_BACKGROUND` hex hint (3- or 6-digit).
+ *   3. `COLORFGBG` last field — slot 7/15 is light; any other 0-15 slot is
+ *      authoritatively dark, so the allow-list below cannot override it.
+ *   4. `TERM_PROGRAM` light-default allow-list (empty by default).
+ * Anything undecidable stays dark — the default palette is the dark one.
  */
-export function applyDetectedBackground(oscData: string): { changed: boolean; scheme: ColorScheme } | null {
-  const hex = oscColorToHex(oscData)
+export function detectScheme(
+  env: NodeJS.ProcessEnv,
+  lightDefaultTermPrograms: ReadonlySet<string> = LIGHT_DEFAULT_TERM_PROGRAMS
+): ColorScheme {
+  const explicit = explicitScheme(env)
 
-  if (!hex) {
-    return null
+  if (explicit) {
+    return explicit
   }
 
-  process.env.OPENDDE_HARNESS_TUI_BACKGROUND = hex
-  const scheme: ColorScheme = detectLightMode() ? 'light' : 'dark'
-  const changed = scheme !== currentScheme()
-  detectedScheme = scheme
+  const hint = parseHex(env.OPENDDE_HARNESS_TUI_BACKGROUND ?? '')
 
-  return { changed, scheme }
+  if (hint) {
+    return luminance(hint) >= LUMA_LIGHT_THRESHOLD ? 'light' : 'dark'
+  }
+
+  const colorfgbg = (env.COLORFGBG ?? '').trim()
+
+  if (colorfgbg) {
+    // Validate as a decimal integer first: `Number('')` is 0, so a malformed
+    // `COLORFGBG='15;'` would otherwise look like an authoritative dark slot.
+    const lastField = colorfgbg.split(';').at(-1) ?? ''
+
+    if (/^\d+$/.test(lastField)) {
+      const bg = Number(lastField)
+
+      if (bg === 7 || bg === 15) {
+        return 'light'
+      }
+
+      if (bg >= 0 && bg < 16) {
+        return 'dark'
+      }
+    }
+  }
+
+  return lightDefaultTermPrograms.has((env.TERM_PROGRAM ?? '').trim()) ? 'light' : 'dark'
 }
 
-// ── Skin → Theme ─────────────────────────────────────────────────────
+// ── `tui.theme` ──────────────────────────────────────────────────────
+//
+// The gateway stores a palette name. Only the two palettes this UI ships can be
+// named, plus `default`, which leaves the choice to detection. The value is not
+// validated when it is stored (the config schema keeps it a plain string so a
+// name written by an older release cannot stop the config loading), so it is
+// validated here, and anything else falls back to detection.
 
-function skinColors(colors: Record<string, string>): ThemeColors {
-  const base = (currentScheme() === 'light' ? LIGHT_THEME : DARK_THEME).color
-  const c = (k: string) => colors[k]
-  const hasSkinColors = Object.keys(colors).length > 0
+export const THEME_NAMES = ['default', 'dark', 'light'] as const
 
-  const accent = c('ui_accent') ?? c('banner_accent') ?? base.accent
-  const bannerAccent = c('banner_accent') ?? c('banner_title') ?? base.accent
-  const muted = c('banner_dim') ?? base.muted
-  const completionBg = c('completion_menu_bg') ?? base.completionBg
+export type ThemeName = (typeof THEME_NAMES)[number]
 
-  const completionCurrentBg =
-    c('completion_menu_current_bg') ??
-    (hasSkinColors ? mix(completionBg, bannerAccent, 0.25) : base.completionCurrentBg)
+/** The palette this value names, or nothing when it names none. */
+export function resolveThemeName(value: unknown): ThemeName | undefined {
+  const name = String(value ?? '')
+    .trim()
+    .toLowerCase()
 
-  // Meta columns cascade off the matching skin key, then fall back to the
-  // palette's own (distinct) meta value — so an empty skin reproduces the
-  // default theme exactly while a skin that sets only the main completion bg
-  // still carries it into the meta column.
-  const completionMetaBg = c('completion_menu_meta_bg') ?? c('completion_menu_bg') ?? base.completionMetaBg
-  const completionMetaCurrentBg =
-    c('completion_menu_meta_current_bg') ??
-    c('completion_menu_current_bg') ??
-    (hasSkinColors ? completionCurrentBg : base.completionMetaCurrentBg)
+  return (THEME_NAMES as readonly string[]).includes(name) ? (name as ThemeName) : undefined
+}
 
-  return {
-    primary: c('ui_primary') ?? c('banner_title') ?? base.primary,
-    accent,
-    border: c('ui_border') ?? c('banner_border') ?? base.border,
-    text: c('ui_text') ?? c('banner_text') ?? base.text,
-    muted,
-    completionBg,
-    completionCurrentBg,
-    completionMetaBg,
-    completionMetaCurrentBg,
+/** The scheme a name fixes, or null when it leaves the choice to detection. */
+export function schemeForThemeName(name: ThemeName): ColorScheme | null {
+  return name === 'default' ? null : name
+}
 
-    label: c('ui_label') ?? base.label,
-    ok: c('ui_ok') ?? base.ok,
-    error: c('ui_error') ?? base.error,
-    warn: c('ui_warn') ?? base.warn,
+export interface ConfiguredThemeOutcome {
+  /** The stored value named no palette. It was ignored; say so. */
+  invalid: boolean
+  /** The palette changed, so what is already on screen has to be repainted. */
+  repaint: boolean
+}
 
-    prompt: c('prompt') ?? c('banner_text') ?? base.prompt,
-    sessionLabel: c('session_label') ?? base.sessionLabel,
-    sessionBorder: c('session_border') ?? base.sessionBorder,
+/**
+ * Apply the stored `tui.theme`.
+ *
+ * Precedence, highest first: `OPENDDE_HARNESS_TUI_LIGHT` / `_THEME`, which pin
+ * the theme at construction; then this; then what the environment and the
+ * terminal imply. A name applied here pins the palette too, so the terminal's
+ * background reply cannot move a palette the user chose.
+ */
+export function applyConfiguredTheme(theme: Theme, value: unknown): ConfiguredThemeOutcome {
+  const raw = String(value ?? '').trim()
 
-    statusBg: base.statusBg,
-    statusFg: base.statusFg,
-    statusGood: c('ui_ok') ?? base.statusGood,
-    statusWarn: c('ui_warn') ?? base.statusWarn,
-    statusBad: base.statusBad,
-    statusCritical: base.statusCritical,
-    selectionBg:
-      c('selection_bg') ?? c('completion_menu_current_bg') ?? (hasSkinColors ? completionCurrentBg : base.selectionBg),
+  if (!raw) {
+    return { invalid: false, repaint: false }
+  }
 
-    diffAdded: base.diffAdded,
-    diffRemoved: base.diffRemoved,
-    diffAddedWord: base.diffAddedWord,
-    diffRemovedWord: base.diffRemovedWord,
-    shellDollar: c('shell_dollar') ?? base.shellDollar
+  const name = resolveThemeName(raw)
+
+  if (!name) {
+    return { invalid: true, repaint: false }
+  }
+
+  const scheme = schemeForThemeName(name)
+
+  // `default` asks for detection, which is what is already in force; and an
+  // environment variable that named a palette outranks the stored one.
+  if (!scheme || theme.pinned) {
+    return { invalid: false, repaint: false }
+  }
+
+  return { invalid: false, repaint: theme.pinScheme(scheme) }
+}
+
+/** The scheme implied by a terminal's measured background color. */
+export function schemeFromBackground(rgb: RgbColor): ColorScheme {
+  return luminance(rgb) >= LUMA_LIGHT_THRESHOLD ? 'light' : 'dark'
+}
+
+// ── Theme ────────────────────────────────────────────────────────────
+
+const ANSI_256_RE = /^ansi256\(\s?(\d+)\s?\)$/
+
+type Paint = (text: string) => string
+
+/**
+ * The palette in use, as callable styles. Holds its own `Chalk` instance pinned
+ * to the resolved tier, so nothing depends on the global chalk singleton's
+ * auto-detection or on module import order.
+ *
+ * The scheme is mutable: an OSC 11 background reply can arrive after boot, and
+ * every component holds this same instance, so `setScheme` re-themes the whole
+ * app in place (callers still need to invalidate and re-render).
+ */
+export class Theme {
+  readonly tier: ColorTier
+
+  private readonly chalk: ChalkInstance
+  private readonly fgPaint = new Map<ThemeToken, Paint>()
+  private readonly bgPaint = new Map<ThemeToken, Paint>()
+  private rampPaint: Paint[] = []
+
+  private currentScheme: ColorScheme
+  private currentColors: ThemeColors
+  private pinnedScheme = false
+
+  constructor(scheme: ColorScheme, tier: ColorTier, chalkInstance?: ChalkInstance) {
+    this.tier = tier
+    this.chalk = chalkInstance ?? new Chalk({ level: tier })
+    this.currentScheme = scheme
+    this.currentColors = resolvePalette(scheme, tier)
+    this.buildPaints()
+  }
+
+  get scheme(): ColorScheme {
+    return this.currentScheme
+  }
+
+  get colors(): ThemeColors {
+    return this.currentColors
+  }
+
+  /** Whether a choice fixed this palette, as opposed to a measurement. */
+  get pinned(): boolean {
+    return this.pinnedScheme
+  }
+
+  /** Swap the palette in place. Returns whether anything changed.
+   *
+   *  A pinned palette refuses: this is the path the terminal's background
+   *  reply takes, and a measurement must not overrule what the user asked for.
+   */
+  setScheme(scheme: ColorScheme): boolean {
+    return this.pinnedScheme ? false : this.applyScheme(scheme)
+  }
+
+  /** Choose the palette and keep it. Returns whether anything changed. */
+  pinScheme(scheme: ColorScheme): boolean {
+    this.pinnedScheme = true
+
+    return this.applyScheme(scheme)
+  }
+
+  private applyScheme(scheme: ColorScheme): boolean {
+    if (scheme === this.currentScheme) {
+      return false
+    }
+
+    this.currentScheme = scheme
+    this.currentColors = resolvePalette(scheme, this.tier)
+    this.buildPaints()
+
+    return true
+  }
+
+  /** pi's strikethrough, for an id a list still carries but no provider serves. */
+  strikethrough(text: string): string {
+    return this.chalk.strikethrough(text)
+  }
+
+  fg(token: ThemeToken, text: string): string {
+    return this.fgPaint.get(token)!(text)
+  }
+
+  bg(token: ThemeToken, text: string): string {
+    return this.bgPaint.get(token)!(text)
+  }
+
+  /** How many bands the brand ramp offers. The banner splits its art into
+   *  this many, so the gradient spans the art whatever its height. */
+  get rampBands(): number {
+    return this.rampPaint.length
+  }
+
+  /** One band of the brand ramp, 0 = lightest. Out-of-range clamps to the
+   *  darkest entry rather than throwing: callers band art by arithmetic. */
+  ramp(band: number, text: string): string {
+    const paint = this.rampPaint[Math.max(0, Math.min(this.rampPaint.length - 1, band))]
+
+    return paint ? paint(text) : text
+  }
+
+  bold(text: string): string {
+    return this.chalk.bold(text)
+  }
+
+  dim(text: string): string {
+    return this.chalk.dim(text)
+  }
+
+  italic(text: string): string {
+    return this.chalk.italic(text)
+  }
+
+  underline(text: string): string {
+    return this.chalk.underline(text)
+  }
+
+  /** Markdown rendering colors for pi-tui's `Markdown` component. */
+  markdownTheme(): MarkdownTheme {
+    return {
+      // Prose is not identity. The reference leaves headings, bullets and code
+      // blocks at the terminal's own foreground, gives links and inline code
+      // its periwinkle, and the URL its dim grey; brand violet on a heading or
+      // a `span` of code is decoration, which rule 1 of the palette spec puts
+      // outside what violet is for.
+      heading: text => this.chalk.bold(this.fg('text', text)),
+      link: text => this.fg('label', text),
+      linkUrl: text => this.fg('dim', text),
+      code: text => this.fg('label', text),
+      codeBlock: text => this.fg('text', text),
+      codeBlockBorder: text => this.fg('border', text),
+      quote: text => this.fg('muted', text),
+      quoteBorder: text => this.fg('border', text),
+      hr: text => this.fg('border', text),
+      listBullet: text => this.fg('text', text),
+      bold: text => this.chalk.bold(text),
+      italic: text => this.chalk.italic(text),
+      strikethrough: text => this.chalk.strikethrough(text),
+      underline: text => this.chalk.underline(text)
+    }
+  }
+
+  /** Selection-list colors, shared by the editor's autocomplete and by pickers. */
+  selectListTheme(): SelectListTheme {
+    return {
+      selectedPrefix: text => this.fg('accent', text),
+      selectedText: text => this.fg('accent', text),
+      description: text => this.fg('muted', text),
+      scrollInfo: text => this.fg('muted', text),
+      noMatch: text => this.fg('muted', text)
+    }
+  }
+
+  /** The small editable-enum list, used for the Wire field in the key form. */
+  settingsListTheme(): SettingsListTheme {
+    return {
+      label: (text, selected) => (selected ? this.fg('accent', text) : this.fg('text', text)),
+      value: (text, selected) => (selected ? this.fg('accent', text) : this.fg('muted', text)),
+      description: text => this.fg('muted', text),
+      cursor: '\u2192 ',
+      hint: text => this.fg('muted', text)
+    }
+  }
+
+  editorTheme(): EditorTheme {
+    return {
+      borderColor: text => this.fg('border', text),
+      selectList: this.selectListTheme()
+    }
+  }
+
+  private buildPaints(): void {
+    this.fgPaint.clear()
+    this.bgPaint.clear()
+
+    for (const [token, value] of Object.entries(this.currentColors) as [ThemeToken, string][]) {
+      this.fgPaint.set(token, this.paintFor(value, 'foreground'))
+      this.bgPaint.set(token, this.paintFor(value, 'background'))
+    }
+
+    this.rampPaint = resolveBrandRamp(this.currentScheme, this.tier).map(value => this.paintFor(value, 'foreground'))
+  }
+
+  /**
+   * Turn one palette value into a style function. Values come in four shapes:
+   * `#rrggbb`, `ansi256(N)`, `ansi:<chalk color name>`, and `inherit`.
+   */
+  private paintFor(value: string, type: 'background' | 'foreground'): Paint {
+    const c = this.chalk
+
+    // Deliberately unpainted, so the terminal's own foreground or ground
+    // stands. Not the same as an unknown value, which also ends at the
+    // identity below but is a mistake rather than a choice.
+    if (value === INHERIT) {
+      return text => text
+    }
+
+    if (value.startsWith('#')) {
+      return type === 'foreground' ? c.hex(value) : c.bgHex(value)
+    }
+
+    const ansi256 = ANSI_256_RE.exec(value)
+
+    if (ansi256) {
+      const n = Number(ansi256[1])
+
+      return type === 'foreground' ? c.ansi256(n) : c.bgAnsi256(n)
+    }
+
+    if (value.startsWith('ansi:')) {
+      const name = value.slice('ansi:'.length)
+      const key = type === 'foreground' ? name : 'bg' + name[0]!.toUpperCase() + name.slice(1)
+      const paint = (c as unknown as Record<string, Paint | undefined>)[key]
+
+      if (paint) {
+        return paint.bind(c) as Paint
+      }
+    }
+
+    return text => text
   }
 }
 
-export function fromSkin(
-  colors: Record<string, string>,
-  branding: Record<string, string>,
-  bannerLogo = '',
-  bannerHero = '',
-  toolPrefix = '',
-  helpHeader = ''
-): Theme {
-  const d = DEFAULT_THEME
+/**
+ * The theme this process should render with, from the environment.
+ *
+ * A palette the environment named is pinned: neither the stored `tui.theme` nor
+ * the terminal's own background reply may move it afterwards.
+ */
+export function createTheme(env: NodeJS.ProcessEnv = process.env, detectedLevel = new Chalk().level): Theme {
+  const theme = new Theme(detectScheme(env), resolveColorTier(env, detectedLevel))
+  const explicit = explicitScheme(env)
 
-  const brand: ThemeBrand = {
-    name: branding.agent_name ?? d.brand.name,
-    icon: d.brand.icon,
-    prompt: cleanPromptSymbol(branding.prompt_symbol, d.brand.prompt),
-    welcome: branding.welcome ?? d.brand.welcome,
-    goodbye: branding.goodbye ?? d.brand.goodbye,
-    tool: toolPrefix || d.brand.tool,
-    helpHeader: branding.help_header ?? (helpHeader || d.brand.helpHeader)
+  if (explicit) {
+    theme.pinScheme(explicit)
   }
 
-  // Skins are authored in truecolor hex. The reduced tiers can't represent
-  // arbitrary hex, so fall back to the curated built-in palette for that tier
-  // (per product decision) — only branding + banner art carry over. The hex
-  // path covers tier 3 and, harmlessly, tier 0 (codes are stripped anyway).
-  const tier = activeColorTier()
-  const color = tier === 1 || tier === 2 ? resolveTheme(currentScheme(), tier).color : skinColors(colors)
-
-  return { color, brand, bannerLogo, bannerHero, yellow: yellowRamp(tier, currentScheme()) }
+  return theme
 }

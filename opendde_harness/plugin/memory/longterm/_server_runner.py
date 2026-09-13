@@ -1,37 +1,43 @@
-"""Start the long-term memory server with OpenDDE Harness's configurable OpenAI API protocol adapter."""
+"""Start the long-term memory server with this project's model layer as its LLM.
+
+The library's server is started in this process after its LLM seam is pointed
+at :class:`~opendde_harness.plugin.memory.longterm._service_llm.ModelServiceLLMClient`,
+so every model call the server makes -- extraction, consolidation, the
+retrieval decider, multimodal parsing -- goes to the conversation's default
+model through the model service. Started by ``_server.py`` as
+``python -m opendde_harness.plugin.memory.longterm._server_runner <server
+command line> --root <root> --config <config.json>``; the config path is what
+the client resolves the default model from, and it is passed rather than
+inherited because a ``--config`` given to the parent lives in its memory, not
+in its environment.
+"""
 
 from __future__ import annotations
 
 import sys
-import tomllib
 from pathlib import Path
-from typing import Literal
 
-from opendde_harness.plugin.memory.longterm._library import CONFIG_FILENAME, patch_llm_client, start_server
+from opendde_harness.plugin.memory.longterm._library import patch_llm_client, start_server
 
 
-def configured_api_mode(root: Path) -> Literal["responses", "chat"]:
-    """Read ``[llm].api_mode``; Responses is the intentional default."""
-    with (root / CONFIG_FILENAME).open("rb") as handle:
-        value = (tomllib.load(handle).get("llm") or {}).get("api_mode", "responses")
-    if value not in {"responses", "chat"}:
-        raise ValueError(f"invalid [llm].api_mode={value!r}; expected 'responses' or 'chat'")
-    return value
+def _option(args: list[str], name: str) -> Path:
+    try:
+        return Path(args[args.index(name) + 1]).expanduser().resolve()
+    except (ValueError, IndexError) as exc:
+        raise SystemExit(f"{name} PATH is required") from exc
 
 
 def main(argv: list[str] | None = None) -> None:
     args = list(sys.argv[1:] if argv is None else argv)
-    try:
-        root = Path(args[args.index("--root") + 1]).expanduser().resolve()
-    except (ValueError, IndexError) as exc:
-        raise SystemExit("--root PATH is required") from exc
+    root = _option(args, "--root")
+    config_path = _option(args, "--config")
 
-    mode = configured_api_mode(root)
-    if mode == "responses":
-        from ._responses_llm import ResponsesLLMClient
+    from opendde_harness.config.loader import set_config_path
 
-        patch_llm_client(ResponsesLLMClient)
+    from ._service_llm import ModelServiceLLMClient
 
+    set_config_path(config_path)
+    patch_llm_client(ModelServiceLLMClient)
     start_server(root)
 
 

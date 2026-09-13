@@ -1,4 +1,4 @@
-"""Segment 4 — always-available skill catalog. Host-owned."""
+"""Segment 5 — always-available skill catalog. Host-owned."""
 
 from __future__ import annotations
 
@@ -13,8 +13,7 @@ if TYPE_CHECKING:
 
 class ActiveSkillsSegmentBuilder:
     name = "active_skills"
-    order = 4
-    needs_prefix = False
+    order = 5
 
     def __init__(self, skill_catalog: "LocalSkillCatalog") -> None:
         self._skills = skill_catalog

@@ -120,7 +120,7 @@ class Span:
 
         For spans whose true type is only known after the call — e.g. a ``tool.call``
         that turns out to be a ``skill.read`` (a ``use_skill`` / ``read_skill`` tool,
-        or a ``read_file`` of a SKILL.md). Nesting is unaffected (span_id is fixed).
+        or a ``read`` of a SKILL.md). Nesting is unaffected (span_id is fixed).
         """
         self.name = name
         if kind:

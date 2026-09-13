@@ -301,8 +301,12 @@ different scaffold topologies. Binder-side `hotspots` is not a supported key.
 | `compute.placement.mpnn` | Optional SolubleMPNN GPU index. |
 | `compute.placement.cp_degree` | Defaults to the length of an explicit `fold` GPU list, otherwise `1`; must equal that list length when supplied. |
 | `llm.model_name` | Inherit configured default model; task model override. |
-| `llm.temperature` | Inherit the phase profile; task generation temperature override. |
 | `llm.max_tokens` | Inherit the phase profile; positive output token limit. |
+
+A sampling temperature is not a task setting. It belongs to the row of the model
+being called: `ddeharness provider model set <provider> <model> --temperature`.
+A number that suits one model is wrong for the next, and some models refuse the
+parameter outright.
 
 ## Removing redundant settings safely
 

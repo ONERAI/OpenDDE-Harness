@@ -16,19 +16,16 @@ export default function base({ js, tsPlugin, tsParser, unusedImports, perfection
         sourceType: 'module',
         parser: tsParser,
         parserOptions: {
-          ecmaFeatures: { jsx: true },
-        },
+          ecmaFeatures: { jsx: true }
+        }
       },
       plugins: {
         '@typescript-eslint': tsPlugin,
         'unused-imports': unusedImports,
-        perfectionist,
+        perfectionist
       },
       rules: {
-        ...tsPlugin.configs['flat/recommended'].reduce(
-          (acc, cfg) => ({ ...acc, ...(cfg.rules ?? {}) }),
-          {},
-        ),
+        ...tsPlugin.configs['flat/recommended'].reduce((acc, cfg) => ({ ...acc, ...(cfg.rules ?? {}) }), {}),
         '@typescript-eslint/consistent-type-imports': 'error',
         '@typescript-eslint/no-explicit-any': 'warn',
         '@typescript-eslint/no-unused-vars': 'off',
@@ -39,8 +36,8 @@ export default function base({ js, tsPlugin, tsParser, unusedImports, perfection
         'no-unused-expressions': 'off',
         '@typescript-eslint/no-unused-expressions': 'warn',
         'no-undef': 'off',
-        'no-unused-vars': 'off',
-      },
-    },
+        'no-unused-vars': 'off'
+      }
+    }
   ]
 }

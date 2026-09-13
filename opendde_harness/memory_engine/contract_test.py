@@ -25,6 +25,7 @@ from __future__ import annotations
 import pytest
 
 from opendde_harness.memory_engine.backend import Memory, MemoryBackend
+from opendde_harness.providers import messages as msg
 
 
 class MemoryBackendContractTests:
@@ -91,10 +92,7 @@ class MemoryBackendContractTests:
         """
         await backend.store(
             "contract-session",
-            [
-                {"role": "user", "content": "I love Python"},
-                {"role": "assistant", "content": "Noted."},
-            ],
+            [msg.user_message("I love Python"), msg.assistant_message("Noted.")],
         )
         hits = await backend.recall(
             "programming",
@@ -107,7 +105,7 @@ class MemoryBackendContractTests:
         """``store`` with metadata must not raise."""
         await backend.store(
             "contract-metadata",
-            [{"role": "user", "content": "test"}],
+            [msg.user_message("test")],
             metadata={"app_id": "test", "project_id": "test", "is_final": True},
         )
 

@@ -2,20 +2,18 @@
 
 Contract source: ``docs/openspec/changes/tui-ipc-bridge/specs/tui-ipc.md §3.6``.
 
-The v0.1 surface exposes only **four hot-changeable** keys; any other write
-target raises :class:`ConfigFieldReadonlyError` (-32010). Values are stored
+The surface is the ``tui.*`` preference fields, derived from
+the schema section itself; any other write target raises
+:class:`ConfigFieldReadonlyError` (-32010). Values are stored
 in ``~/.opendde_harness/config.json`` using dotted-path nesting (``tui.theme`` →
 ``{"tui": {"theme": "..."}}``) so that the same file is loadable by the legacy
-``opendde_harness.config.opendde_harness_loader`` without any schema gymnastics.
+``opendde_harness.config.loader`` without any schema gymnastics.
 
 Validation
 ----------
 
 Per-key validators reject:
 
-* ``agent.thinking_budget``: must be a non-negative integer.
-* ``agent.temperature``: must be a number (int/float) in the closed range
-  ``[0.0, 2.0]``.
 * ``tui.theme``: must be a non-empty string matching ``[A-Za-z0-9_-]+``.
 * ``tui.show_token_usage``: must be a boolean.
 
@@ -25,21 +23,22 @@ Anything else → :class:`ConfigValidationError` (-32011).
 from __future__ import annotations
 
 import json
-import re
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any
+
+from loguru import logger
+from pydantic import ValidationError
+from pydantic.alias_generators import to_camel
 
 from opendde_harness.cli._helpers import load_runtime_config, make_provider
-from opendde_harness.providers import pin
+from opendde_harness.config.schema import TuiConfig
+from opendde_harness.providers import model_id
 from opendde_harness.providers.auth import MissingCredentialsError
-from opendde_harness.providers.wire import stored_model_id
 from opendde_harness.tui_rpc.errors import (
     ConfigFieldReadonlyError,
     ConfigValidationError,
     ModelNotAvailableError,
-    ModelSwitchInTurnError,
 )
-from opendde_harness.tui_rpc.methods.turn import is_turn_active
 
 if TYPE_CHECKING:
     from opendde_harness.tui_rpc.dispatcher import Dispatcher
@@ -49,91 +48,12 @@ if TYPE_CHECKING:
 _CONFIG_DIR_NAME = ".opendde_harness"
 _CONFIG_FILENAME = "config.json"
 
-# Default values returned by config.get when the on-disk config omits the key.
-_DEFAULTS: dict[str, Any] = {
-    "agent.thinking_budget": 0,
-    "agent.temperature": 1.0,
-    "tui.theme": "default",
-    "tui.show_token_usage": True,
+# The persisted section defines the writable fields, defaults and validation.
+_HOT_FIELDS = {
+    f"{section}.{name}": (schema, name) for section, schema in (("tui", TuiConfig),) for name in schema.model_fields
 }
-
-
-# ---------------------------------------------------------------------------
-# Per-key validators
-# ---------------------------------------------------------------------------
-
-
-_THEME_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
-
-
-def _validate_thinking_budget(value: Any) -> int:
-    # Booleans are a subclass of int — reject them explicitly so True doesn't
-    # silently coerce to 1.
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ConfigValidationError(
-            "agent.thinking_budget must be a non-negative integer",
-            data={"field": "agent.thinking_budget", "got": repr(value)},
-        )
-    if value < 0:
-        raise ConfigValidationError(
-            "agent.thinking_budget must be non-negative",
-            data={"field": "agent.thinking_budget", "value": value},
-        )
-    return value
-
-
-def _validate_temperature(value: Any) -> float:
-    if isinstance(value, bool):  # bool is a subclass of int — reject upfront
-        raise ConfigValidationError(
-            "agent.temperature must be a number in [0, 2]",
-            data={"field": "agent.temperature", "got": repr(value)},
-        )
-    if not isinstance(value, (int, float)):
-        raise ConfigValidationError(
-            "agent.temperature must be a number in [0, 2]",
-            data={"field": "agent.temperature", "got": repr(value)},
-        )
-    if not (0.0 <= float(value) <= 2.0):
-        raise ConfigValidationError(
-            "agent.temperature out of range [0, 2]",
-            data={"field": "agent.temperature", "value": value},
-        )
-    return float(value)
-
-
-def _validate_theme(value: Any) -> str:
-    if not isinstance(value, str) or not value:
-        raise ConfigValidationError(
-            "tui.theme must be a non-empty string",
-            data={"field": "tui.theme", "got": repr(value)},
-        )
-    if not _THEME_NAME_RE.match(value):
-        raise ConfigValidationError(
-            "tui.theme must match [A-Za-z0-9_-]+",
-            data={"field": "tui.theme", "value": value},
-        )
-    return value
-
-
-def _validate_show_token_usage(value: Any) -> bool:
-    if not isinstance(value, bool):
-        raise ConfigValidationError(
-            "tui.show_token_usage must be a boolean",
-            data={"field": "tui.show_token_usage", "got": repr(value)},
-        )
-    return value
-
-
-_VALIDATORS: dict[str, Callable[[Any], Any]] = {
-    "agent.thinking_budget": _validate_thinking_budget,
-    "agent.temperature": _validate_temperature,
-    "tui.theme": _validate_theme,
-    "tui.show_token_usage": _validate_show_token_usage,
-}
-
-# Public: the canonical writable-key set; consumers can iterate to enumerate
-# defaults without mutating ``_DEFAULTS`` directly.
-CONFIG_WRITABLE_KEYS: tuple[str, ...] = tuple(_VALIDATORS.keys())
+_DEFAULTS = {key: schema.model_fields[name].default for key, (schema, name) in _HOT_FIELDS.items()}
+CONFIG_WRITABLE_KEYS: tuple[str, ...] = tuple(_HOT_FIELDS)
 
 
 # ---------------------------------------------------------------------------
@@ -173,9 +93,9 @@ def _get_nested(payload: dict[str, Any], dotted_key: str) -> Any | None:
     parts = dotted_key.split(".")
     cur: Any = payload
     for part in parts:
-        if not isinstance(cur, dict) or part not in cur:
+        if not isinstance(cur, dict):
             return None
-        cur = cur[part]
+        cur = cur.get(to_camel(part), cur.get(part))
     return cur
 
 
@@ -188,6 +108,9 @@ def _set_nested(payload: dict[str, Any], dotted_key: str, value: Any) -> None:
             nxt = {}
             cur[part] = nxt
         cur = nxt
+    # save_config emits camelCase. Replace that spelling instead of leaving two
+    # versions of a field, which the strict schema rejects as an extra input.
+    cur.pop(to_camel(parts[-1]), None)
     cur[parts[-1]] = value
 
 
@@ -215,7 +138,7 @@ async def config_get(params: dict) -> dict:
     payload = _load_config()
     out: dict[str, Any] = {}
     for key in requested:
-        if key not in _VALIDATORS:
+        if key not in _HOT_FIELDS:
             # Unknown / non-whitelisted key — silently omit per spec.
             continue
         value = _get_nested(payload, key)
@@ -230,8 +153,9 @@ async def config_set(
 ) -> dict:
     """Write a single whitelisted key. Returns ``{applied, previous}``.
 
-    The special key ``"model"`` switches the live agent loop's provider/model
-    (returns ``{applied, previous, value}``); see :func:`_set_model`.
+    The special key ``"model"`` switches the model this session runs on, or
+    the default new ones start on (returns ``{applied, previous, value, scope,
+    ...}``); see :func:`_set_model`.
 
     Raises:
         ConfigValidationError (-32011): params shape or value invalid.
@@ -259,13 +183,20 @@ async def config_set(
     if key == "model":
         return _set_model(params, raw_value, agent_loop_factory)
 
-    if key not in _VALIDATORS:
+    if key not in _HOT_FIELDS:
         raise ConfigFieldReadonlyError(
             f"key '{key}' is not in the v0.1 hot-changeable whitelist",
             data={"field": key, "writable": list(CONFIG_WRITABLE_KEYS)},
         )
 
-    validated = _VALIDATORS[key](raw_value)
+    schema, field = _HOT_FIELDS[key]
+    try:
+        validated = getattr(schema.model_validate({field: raw_value}), field)
+    except ValidationError as exc:
+        raise ConfigValidationError(
+            f"{key}: {exc.errors()[0]['msg']}",
+            data={"field": key, "got": repr(raw_value)},
+        ) from exc
 
     payload = _load_config()
     previous = _get_nested(payload, key)
@@ -280,61 +211,69 @@ def _set_model(
     raw_value: Any,
     agent_loop_factory: "AgentLoopFactory | None",
 ) -> dict:
-    """Switch the global model (and provider) and reassign the live loop.
+    """Switch the model this session runs on, or the default new ones start on.
 
-    Build the provider from the prospective config BEFORE persisting, so a
-    rebuild failure aborts cleanly with the on-disk model untouched.
+    Two scopes, because they answer different questions. With a
+    ``session_id`` (what the picker sends) the switch is scoped to that
+    session: no other session moves, and ``agents.defaults`` is left alone so
+    a new session still starts on the configured default. Pass
+    ``scope="default"``, or omit ``session_id``, to change that default
+    instead; sessions that already switched keep their own model.
+
+    Either way the provider is built before anything is persisted or applied,
+    so a rebuild failure aborts with the on-disk model untouched.
+
+    A switch during a turn is not refused. The running turn holds the binding
+    it started on for its whole tree, so the new model takes effect on the
+    session's next turn -- which is what a user asking mid-answer means.
     """
     if not isinstance(raw_value, str) or not raw_value:
         raise ConfigValidationError(
             "config.set model value must be a non-empty string",
             data={"field": "value", "got": repr(raw_value)},
         )
-    new_provider = params.get("provider")
-    if new_provider is not None and not isinstance(new_provider, str):
-        raise ConfigValidationError(
-            "config.set model provider must be a string",
-            data={"field": "provider", "got": repr(new_provider)},
-        )
-    # Bare `/model <name>` carries no provider; derive it from the model so a
-    # previously-forced provider does not silently mis-route the new model. The
-    # picker always sends one, so this is the hand-typed path. The rule itself is
-    # `providers.pin`, which `ddeharness provider use` asks too.
-    if new_provider is None:
-        new_provider = pin.resolve(raw_value, pinned=_get_nested(_load_config(), "agents.defaults.provider") or "")
-        if new_provider is None:
-            raise ConfigValidationError(
-                f"cannot tell which provider serves {raw_value!r}; qualify it as <provider>/{raw_value}",
-                data={"field": "value", "got": raw_value},
-            )
+    # The id names its provider or it names nobody. There is no provider field
+    # beside it any more and nothing derives one from the spelling: a bare
+    # `/model gpt-5.5` is refused here rather than sent to whichever vendor a
+    # table guessed, which is how one vendor's model reached another vendor's
+    # key. The sentence is the schema's own, so the refusal the TUI shows and
+    # the one `ddeharness` prints for the same input are the same sentence.
+    if not model_id.provider_of(raw_value):
+        from opendde_harness.config.schema import Config
 
-    # Stored the way every other surface stores it -- naming its provider -- so
-    # the three cannot disagree about what was chosen. A hand-typed bare id used
-    # to be written raw here while the wizard qualified the same input, which is
-    # the spelling drift the storage rule exists to end. `auto` names nobody,
-    # so there is no prefix to add.
-    if new_provider and new_provider != pin.AUTO:
-        raw_value = stored_model_id(new_provider, raw_value)
+        # ``model_construct`` because this is a refusal path: it skips every
+        # validator, so an environment that itself names a bare model cannot
+        # turn "qualify that id" into an internal error, and the method reads
+        # nothing off the instance when it is given the id to explain.
+        raise ConfigValidationError(
+            Config.model_construct().explain_unrouted(raw_value),
+            data={"field": "value", "got": raw_value},
+        )
 
     session_id = params.get("session_id")
-    if isinstance(session_id, str) and session_id and is_turn_active(session_id):
-        raise ModelSwitchInTurnError(
-            f"cannot switch model while session {session_id!r} has an active turn",
-            data={"session_id": session_id},
+    scope = params.get("scope")
+    if scope not in (None, "session", "default"):
+        raise ConfigValidationError(
+            "config.set model scope must be 'session' or 'default'",
+            data={"field": "scope", "got": repr(scope)},
         )
-
-    payload = _load_config()
-    previous = _get_nested(payload, "agents.defaults.model")
+    has_session = isinstance(session_id, str) and bool(session_id)
+    if scope == "session" and not has_session:
+        # Never widen a scope the caller narrowed: falling through to the
+        # default branch here would write agents.defaults and move every
+        # session that never switched. The TUI sends a session_id that is null
+        # until the first session.create resolves, so this is reachable.
+        raise ConfigValidationError(
+            "config.set model scope 'session' needs a session_id",
+            data={"field": "session_id", "got": repr(session_id)},
+        )
+    session_scoped = scope != "default" and has_session
 
     loop = agent_loop_factory() if agent_loop_factory is not None else None
-    built_provider = None
+    binding = None
     if loop is not None:
-        runtime = load_runtime_config(None, None)
-        runtime.agents.defaults.model = raw_value
-        if new_provider is not None:
-            runtime.agents.defaults.provider = new_provider
         try:
-            built_provider = make_provider(runtime)
+            binding = _build_binding(loop, raw_value)
         except MissingCredentialsError as exc:
             # Carried through as the sentence the user needs. `typer.Exit`
             # subclasses RuntimeError, so this used to land in the branch below
@@ -350,20 +289,103 @@ def _set_model(
                 data={"model": raw_value, "error": str(exc)},
             ) from exc
 
+    if session_scoped:
+        if loop is None:
+            # Nothing was built, so nothing was validated -- do not report a
+            # switch that did not happen.
+            return {"applied": False, "previous": None, "value": raw_value, "scope": "session"}
+        previous = loop.session_model(session_id)
+        loop.set_session_binding(session_id, binding)
+        _remember_session_model(loop, session_id, raw_value)
+        return {
+            "applied": True,
+            "previous": previous,
+            "value": raw_value,
+            "scope": "session",
+            "session_id": session_id,
+            "applies_to_session": True,
+        }
+
+    # A default-scoped switch still moves the asking conversation when that
+    # conversation never chose a model of its own, because it reads the
+    # default. Answered here rather than inferred from the scope: the client
+    # cannot see which sessions have their own binding.
+    follows_default = None
+    if loop is not None and has_session:
+        follows_default = not loop.has_session_binding(session_id)
+
+    payload = _load_config()
+    previous = _get_nested(payload, "agents.defaults.model")
+    # The model id is the whole switch. `agents.defaults.provider` used to be
+    # written beside it and is gone from the schema: two fields naming one
+    # provider disagreed, and the field won over the id.
     _set_nested(payload, "agents.defaults.model", raw_value)
-    if new_provider is not None:
-        _set_nested(payload, "agents.defaults.provider", new_provider)
     _save_config(payload)
 
     if loop is not None:
-        # Not a two-attribute assignment: the loop hands its provider to the
-        # subagent manager, the context engine and the consolidator at build
-        # time, and each keeps it. set_provider is what reaches them (and
-        # re-resolves the context window at adoption -- which for a parked
-        # switch happens long after this call returns).
-        loop.set_provider(built_provider, raw_value)
+        # Not a two-attribute assignment: the subagent manager and the context
+        # engine each hold a fallback for work that runs outside a turn, and
+        # this is what re-points them.
+        loop.set_default_binding(binding)
 
-    return {"applied": True, "previous": previous, "value": raw_value}
+    result = {"applied": True, "previous": previous, "value": raw_value, "scope": "default"}
+    if follows_default is not None:
+        # Absent rather than null when there is no session to answer for: the
+        # wire contract types it as a boolean.
+        result["applies_to_session"] = follows_default
+    return result
+
+
+def _remember_session_model(loop: Any, session_key: str, model: str) -> None:
+    """Persist the choice on the session, so a restart does not undo it.
+
+    Stored on the session record rather than in ``agents.defaults``: it is
+    this conversation's model, and a new conversation must still start on the
+    configured default.
+
+    The model id is all that is stored. The provider used to be written beside
+    it, for a restore to rebuild the binding with; the id names it now, and the
+    restore reads the provider from the id it already has.
+
+    Written in memory unconditionally, saved only for a session that already
+    has a file. ``session.create`` is lazy -- it mints a key and writes
+    nothing until the session's first real save -- so saving here would
+    manufacture a record with zero messages for anyone who runs ``/model``
+    before saying anything. The choice still reaches disk: it rides the
+    session's first real save. ``session.title`` guards the same case the
+    same way.
+    """
+    sessions = loop.sessions
+    try:
+        session = sessions.get_or_create(session_key)
+        session.metadata["model"] = model
+        if sessions.exists(session_key):
+            sessions.save(session)
+    except Exception:
+        logger.warning("could not persist the model on session {!r}", session_key, exc_info=True)
+
+
+def _build_binding(loop: Any, model: str) -> Any:
+    """One provider per (provider, model), reused across sessions and switches.
+
+    Building one resolves a credential and starts a model service, so a session
+    flipping between two models must not pay twice. The pool is the loop's;
+    without one (a one-shot wiring, a test) build directly from the prospective
+    config.
+
+    Only the model id goes in. It is qualified by the time it gets here, and the
+    pool routes on its prefix, so there is nothing else to hand over -- naming
+    the provider a second time is what let a caller redirect a model to a
+    credential that does not serve it.
+    """
+    from opendde_harness.providers.binding import ModelBinding
+
+    pool = loop.provider_pool
+    if pool is not None:
+        return pool.bind(model)
+    runtime = load_runtime_config(None, None)
+    runtime.agents.defaults.model = model
+    return ModelBinding(make_provider(runtime), model)
 
 
 def register_config_methods(

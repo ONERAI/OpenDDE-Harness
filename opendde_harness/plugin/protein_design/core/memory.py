@@ -9,6 +9,7 @@ from typing import Any
 
 from opendde_harness.memory_engine.backend import MemoryBackend
 from opendde_harness.plugin.protein_design.agents.skills import LearnedSkill
+from opendde_harness.providers import messages as msg
 
 logger = logging.getLogger(__name__)
 
@@ -132,41 +133,29 @@ class DesignMemory:
             learned_skill_ids = action.get("learned_skills", [])
         tool_call_id = f"design-cycle-{cycle}"
         messages = [
-            {
-                "role": "user",
-                "content": task_intent,
-            },
-            {
-                "role": "assistant",
-                "content": "Apply the selected design strategy and evaluate its outcome.",
-                "tool_calls": [
-                    {
-                        "id": tool_call_id,
-                        "type": "function",
-                        "function": {
-                            "name": selected_skill,
-                            "arguments": json.dumps(
-                                {
-                                    "target": target,
-                                    "cycle": cycle,
-                                    "applied_learned_skill_ids": learned_skill_ids,
-                                },
-                                ensure_ascii=False,
-                            ),
+            msg.user_message(task_intent),
+            msg.assistant_message(
+                "Apply the selected design strategy and evaluate its outcome.",
+                tool_calls=[
+                    msg.tool_call_block(
+                        tool_call_id,
+                        selected_skill,
+                        {
+                            "target": target,
+                            "cycle": cycle,
+                            "applied_learned_skill_ids": learned_skill_ids,
                         },
-                    }
+                    )
                 ],
-            },
-            {
-                "role": "tool",
-                "tool_call_id": tool_call_id,
-                "name": selected_skill,
-                "content": json.dumps(outcome, ensure_ascii=False, default=str),
-            },
-            {
-                "role": "assistant",
-                "content": ("\n".join(insights) or str(outcome.get("key_insight") or lesson.get("summary") or "")),
-            },
+            ),
+            msg.tool_result_message(
+                tool_call_id,
+                selected_skill,
+                json.dumps(outcome, ensure_ascii=False, default=str),
+            ),
+            msg.assistant_message(
+                "\n".join(insights) or str(outcome.get("key_insight") or lesson.get("summary") or "")
+            ),
         ]
         try:
             return await self._backend.store(

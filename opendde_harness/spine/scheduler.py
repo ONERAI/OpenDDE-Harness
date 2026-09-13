@@ -32,6 +32,20 @@ _SYSTEM_ORIGINS = (Origin.SUBAGENT,)
 _DEFAULT_IDLE_TTL = 300.0  # seconds a lane may sit idle before the reaper reclaims it
 _SWEEP_INTERVAL = 60.0  # seconds between reaper sweeps
 _DEPTH_WARN_THRESHOLD = 50  # warn once when a lane's pending queue reaches this depth
+_SURVIVOR_WAIT_S = 5.0  # bound on shutdown's post-cancel wait for a straggling turn
+
+
+def _resolve(fut: asyncio.Future, outcome: TurnOutcome | None = None) -> None:
+    """Resolve a turn's terminal future, tolerating one that is already terminal.
+
+    The worker is the sole *resolver*, but not the sole party that can end a
+    future: a caller awaiting result() can have its wait cancelled, and a
+    hard-killed worker leaves shutdown to finish the job. A completion path that
+    raised InvalidStateError here would abandon the rest of the lane's queue, so
+    every path goes through this check instead of calling set_result directly.
+    """
+    if not fut.done():
+        fut.set_result(outcome)
 
 
 class SchedulerDrainingError(Exception):
@@ -130,7 +144,7 @@ class Lane:
         for i, (_req, queued) in enumerate(self._pending):
             if queued is fut:
                 del self._pending[i]
-                fut.set_result(None)
+                _resolve(fut)
                 return
         for i, (_req, pending_inject) in enumerate(self._inject_mailbox):
             if pending_inject is fut:
@@ -138,7 +152,7 @@ class Lane:
                 # itself. Once drained/merged it is no longer here, so cancelling
                 # its handle is a no-op — it cannot kill the host turn.
                 del self._inject_mailbox[i]
-                fut.set_result(None)
+                _resolve(fut)
                 return
         if fut is self._running_fut and self._run_task is not None and not self._run_task.done():
             self._run_task.cancel()
@@ -168,11 +182,11 @@ class Lane:
         stopped = 0
         while self._pending:
             _req, fut = self._pending.popleft()
-            fut.set_result(None)  # a queued turn never ran: resolve as cancelled
+            _resolve(fut)  # a queued turn never ran: resolve as cancelled
             stopped += 1
         while self._inject_mailbox:
             _req, fut = self._inject_mailbox.popleft()
-            fut.set_result(None)  # undrained inject: resolve cancelled, no revival
+            _resolve(fut)  # undrained inject: resolve cancelled, no revival
             stopped += 1
         return stopped
 
@@ -191,50 +205,64 @@ class Lane:
         return now - self._idle_since
 
     async def _run_worker(self) -> None:
-        while self._pending:
-            req, fut = self._pending.popleft()
-            self._running_fut = fut
-            # Create the task synchronously (no await before this) so the turn is
-            # cancel-visible via _run_task the moment it leaves the queue.
-            self._run_task = asyncio.create_task(self._run_turn(req))
-            outcome: TurnOutcome | None = None
-            try:
-                outcome = await self._run_task  # None on cancel/failure, outcome on success
-            except asyncio.CancelledError:
-                if not self._run_task.cancelled():
-                    # The worker itself was cancelled (process shutdown): cascade
-                    # to the payload and await its cleanup — its finally emits
-                    # TurnFailed and resolves any chained inject — so it leaves no
-                    # zombie, then re-raise. (Normal shutdown cancels payloads, not
-                    # workers; this path is the hard-kill case, a single cancel.)
-                    self._run_task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await self._run_task
-                    raise
-                # payload cancelled: the turn emitted its own terminal
-            finally:
-                # Sole resolver: resolve on every exit, including a cancel that
-                # lands before the task body (and its handlers) ever runs. (A
-                # merged inject is resolved inside _run_turn, not here.)
-                fut.set_result(outcome)
-                # An inject the turn never drained falls back to a fresh APPEND
-                # turn (no message lost); USER injects log the fallback so a
-                # silent "why didn't my inject inject" is debuggable.
-                while self._inject_mailbox:
-                    inject_req, inject_fut = self._inject_mailbox.popleft()
-                    if inject_req.origin is Origin.USER:
-                        logger.info(
-                            "inject fell back to append (not merged): origin={}",
-                            inject_req.origin,
-                        )
-                    self._enqueue(inject_req, inject_fut)
-                self._run_task = None
-                self._running_fut = None
-        # Idle exit: stamp the reaper's silence clock, with no await between the
-        # queue check and return — a submit racing the exit must not be lost
-        # (lost-wakeup), and the same gap keeps the stamp atomic against submit
-        # clearing it.
-        self._idle_since = time.monotonic()
+        try:
+            while self._pending:
+                req, fut = self._pending.popleft()
+                self._running_fut = fut
+                # Create the task synchronously (no await before this) so the turn is
+                # cancel-visible via _run_task the moment it leaves the queue.
+                self._run_task = asyncio.create_task(self._run_turn(req))
+                outcome: TurnOutcome | None = None
+                try:
+                    outcome = await self._run_task  # None on cancel/failure, outcome on success
+                except asyncio.CancelledError:
+                    if not self._run_task.cancelled():
+                        # The worker itself was cancelled (process shutdown): cascade
+                        # to the payload and await its cleanup — its finally emits
+                        # TurnFailed and resolves any chained inject — so it leaves no
+                        # zombie, then re-raise. (Normal shutdown cancels payloads, not
+                        # workers; this path is the hard-kill case, a single cancel.)
+                        self._run_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await self._run_task
+                        raise
+                    # payload cancelled: the turn emitted its own terminal
+                except Exception:
+                    # _run_turn handles its own failures; this catches one that
+                    # escaped them (a sink that raises while reporting a failure).
+                    # Log it and move on — a dead worker would strand every turn
+                    # still queued behind this one.
+                    logger.exception("lane {}: turn raised past its own handlers", self._conversation_id)
+                finally:
+                    # Resolve on every exit, including a cancel that lands before
+                    # the task body (and its handlers) ever runs. (A merged inject
+                    # is resolved inside _run_turn, not here.) Tolerant of an
+                    # already-terminal future: a caller's abandoned wait or a
+                    # shutdown straggler sweep may have ended it first.
+                    _resolve(fut, outcome)
+                    # An inject the turn never drained falls back to a fresh APPEND
+                    # turn (no message lost); USER injects log the fallback so a
+                    # silent "why didn't my inject inject" is debuggable.
+                    while self._inject_mailbox:
+                        inject_req, inject_fut = self._inject_mailbox.popleft()
+                        if inject_req.origin is Origin.USER:
+                            logger.info(
+                                "inject fell back to append (not merged): origin={}",
+                                inject_req.origin,
+                            )
+                        self._enqueue(inject_req, inject_fut)
+                    self._run_task = None
+                    self._running_fut = None
+        finally:
+            # Idle exit: stamp the reaper's silence clock, with no await between
+            # the queue check and return — a submit racing the exit must not be
+            # lost (lost-wakeup), and the same gap keeps the stamp atomic against
+            # submit clearing it. Leaving any other way (the worker cancelled)
+            # means nothing will ever run what is still queued, so resolve it here
+            # rather than leave its callers waiting forever.
+            if self._pending or self._inject_mailbox:
+                self.drain_pending()
+            self._idle_since = time.monotonic()
 
     def _make_emit(self, req: TurnRequest) -> Emit:
         async def emit(event: RunnerEvent) -> None:
@@ -283,7 +311,7 @@ class Lane:
             # A drained inject shares this turn's outcome (None on cancel/failure);
             # resolved here, in the turn that merged it, not by the worker.
             for inject_fut in chained:
-                inject_fut.set_result(outcome)
+                _resolve(inject_fut, outcome)
         latency_ms = (time.monotonic() - run_start) * 1000
         await self._sink(
             TurnEnded(
@@ -304,7 +332,14 @@ class TurnHandle:
         self._fut = fut
 
     async def result(self) -> TurnOutcome | None:
-        return await self._fut
+        """Wait for this turn to finish.
+
+        Shielded: cancelling the wait (an RPC disconnect, a client timeout, an
+        ``asyncio.wait_for`` around it) abandons the wait only — it does not
+        cancel the turn, which would also kill the future the lane's worker is
+        about to resolve. Stopping the turn itself is ``cancel()``.
+        """
+        return await asyncio.shield(self._fut)
 
     def cancel(self) -> None:
         self._lane.cancel_turn(self._fut)
@@ -391,7 +426,19 @@ class Scheduler:
             lane.cancel_running()
         survivors = [fut for fut in running if not fut.done()]
         if survivors:
-            await asyncio.wait(survivors)
+            # Bounded: a payload that swallows its cancellation must not hold
+            # shutdown open forever. Whatever is still unresolved after the bound
+            # is resolved here as cancelled, so result() never hangs; the worker's
+            # own (later) resolve tolerates an already-terminal future.
+            _done, pending = await asyncio.wait(survivors, timeout=_SURVIVOR_WAIT_S)
+            if pending:
+                logger.warning(
+                    "shutdown: {} turn(s) did not stop within {}s; resolving as cancelled",
+                    len(pending),
+                    _SURVIVOR_WAIT_S,
+                )
+                for fut in pending:
+                    _resolve(fut)
 
     def _effective_busy(self, req: TurnRequest) -> BusyPolicy:
         """Resolve the busy policy actually applied. INJECT and INTERRUPT are

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Portions Copyright (c) 2025 Nous Research (hermes-agent, MIT).
 // Modifications Copyright (c) 2026 EverMind.
-// See NOTICES.md and LICENSES/MIT-hermes-agent.txt.
+// See LICENSES/README.md and LICENSES/MIT-hermes-agent.txt.
 
 import { writeSync } from 'node:fs'
 
@@ -21,6 +21,7 @@ export const TERMINAL_MODE_RESET =
   '\x1b[?1004l' + // focus events
   '\x1b[?2004l' + // bracketed paste
   '\x1b[?1049l' + // alternate screen
+  '\x1b[?7h' + // autowrap, which the alternate screen turns off
   '\x1b[<u' + // kitty keyboard
   '\x1b[>4m' + // modifyOtherKeys
   '\x1b[0m' + // attributes

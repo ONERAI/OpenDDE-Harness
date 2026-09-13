@@ -1,9 +1,12 @@
 """``ddeharness doctor`` — health check (static + optional --probe).
 
-The static checks are zero-network and millisecond-fast. Memory and, when
-Protein Design is configured, the compute service are probed over HTTP;
-without a Protein Design configuration doctor touches neither Docker nor the
-network. ``--probe`` sends one chat exchange via
+The static checks reach no vendor. The one child they start is the model
+service, asked what it knows about the default model and closed again -- a
+catalogue read, with no credential store written and no key seeded. The store is
+read, though, because "is this provider signed in" has no other answer. Memory
+and, when Protein Design is configured, the compute service are probed over
+HTTP; without a Protein Design configuration doctor touches neither Docker nor
+the network. ``--probe`` sends one chat exchange via
 :func:`opendde_harness.cli._helpers.send_probe`.
 
 Exit codes:
@@ -21,11 +24,13 @@ from typing import TYPE_CHECKING, Optional
 import typer
 from rich.console import Console
 
-from opendde_harness import __logo__
+from opendde_harness import __logo__, __version__
 from opendde_harness.cli._helpers import print_probe_troubleshooting, send_probe
+from opendde_harness.plugin.memory.longterm.doctor import MemoryInfo, render_memory
 
 if TYPE_CHECKING:
     from opendde_harness.config.opendde_harness import OpenDDEHarnessConfig
+    from opendde_harness.providers.rates import Resolved
 
 console = Console()
 
@@ -44,65 +49,79 @@ class PathsInfo:
 class RoutingInfo:
     model: str
     provider: Optional[str]
-    max_tokens: int
+    max_tokens: Optional[int]
     context_window_tokens: Optional[int]
     # Which tier answered each number (providers/rates SOURCE_*), so a figure
-    # that is an estimate or unknown reads as one rather than as a setting.
-    max_tokens_source: str = "estimated"
+    # nothing measured reads as unknown rather than as a setting.
+    max_tokens_source: str = "unknown"
     context_window_source: str = "unknown"
-    # The wire the default model's requests travel on, when its provider has
-    # two to choose from; "" otherwise.
-    wire: str = ""
-    wire_source: str = ""
+    # The wire the default model's requests travel on, and what decided it.
+    # Always declared and never probed: a provider this config declares names
+    # its own ``api``, one of its model rows may override that for a single
+    # model, and one of pi's own providers carries pi's -- which lives inside
+    # pi-ai and cannot be read without starting the service, so it is named as
+    # pi's rather than guessed from the provider's id.
+    api: str = ""
+    api_source: str = ""
+    #: Why the model reaches no provider, when it reaches none. Taken from
+    #: ``Config.explain_unrouted`` rather than re-derived here, so doctor and
+    #: every other surface give the same reason for the same config.
+    unrouted_reason: str = ""
+
+
+@dataclass
+class ProviderInfo:
+    """One configured provider, and what actually answers for it.
+
+    ``source`` is the part worth reporting rather than merely "has a key":
+    a key in ``config.json``, a key in the vendor's own environment variable and
+    a sign-in in the model service's credential store all read as configured,
+    and somebody asking why a provider answers -- or answers as the wrong
+    account -- needs to know which of the three did.
+    """
+
+    name: str
+    display_name: str
+    #: Does this config declare the provider (an address of its own), rather
+    #: than name one of pi's built-ins?
+    declared: bool
+    configured: bool
+    #: ``providers.auth`` KIND_*: which shape of credential this entry is.
+    kind: str
+    #: ``config`` / ``environment`` / ``store`` / ``declared``, or "" for none.
+    source: str = ""
+    #: The environment variable the key was read from, when that is the source.
+    env_var: str = ""
+    base_url: str = ""
+    #: Whether ``config.json`` itself holds a key for this entry. Separate from
+    #: ``source`` because a declared provider reports as reachable by its
+    #: address whether or not it also carries one.
+    has_key: bool = False
+    #: What is missing, in the words that say how to supply it.
+    missing: list[str] = field(default_factory=list)
+    model_count: int = 0
+    routes_default: bool = False
+    #: The bare id the default model asks this provider for, when it is the one
+    #: that routes it. Empty otherwise.
+    default_served: str = ""
+
+    @property
+    def serves_nothing(self) -> bool:
+        """A provider this config declares, with no models: it can serve none.
+
+        pi has no catalogue for a declared provider, so the entry's ``models``
+        list *is* its catalogue. Empty, the entry is dropped from the model
+        service's configuration outright
+        (:func:`opendde_harness.providers.pi_auth.configure_payload`) -- so every
+        model id naming it fails at the request, and nothing before this line
+        ever said why.
+        """
+        return self.declared and not self.model_count
 
 
 @dataclass
 class FeaturesInfo:
     skill_forge_enabled: bool = False
-
-
-@dataclass
-class MemoryInfo:
-    """What the memory backend is, and what it can actually do.
-
-    ``configured`` comes from the config files; ``capabilities`` from a running
-    server's ``/health``. Keeping both is the point: from library 1.2.1 a server
-    whose embedding provider failed to build still answers 200 and degrades to
-    keyword-only search, so the two can disagree, and that disagreement is the
-    fault worth reporting.
-    """
-
-    backend: Optional[str] = None
-    root: Optional[str] = None
-    owned: bool = True
-    address: Optional[str] = None
-    server_running: bool = False
-    reports_capabilities: bool = False
-    configured: list[str] = field(default_factory=list)
-    capabilities: dict[str, bool] = field(default_factory=dict)
-    retrieval: Optional[str] = None
-    #: Set when memory exists on disk but the runtime will not use it.
-    disabled_reason: Optional[str] = None
-
-    @property
-    def unbuilt(self) -> list[str]:
-        """Roles the user configured that the server could not build."""
-        from opendde_harness.plugin.memory.longterm._health import capability_available
-
-        return [s for s in self.configured if capability_available(self.capabilities, s) is False]
-
-    @property
-    def broken(self) -> list[str]:
-        """Unbuilt roles that memory cannot work without at all.
-
-        Separate from :attr:`unbuilt` because the others cost quality, not
-        function: without embedding the adapter searches lexically instead of
-        semantically, and that is a worse memory rather than no memory. Only this
-        list decides the exit code.
-        """
-        from opendde_harness.plugin.memory.longterm._health import REQUIRED_SECTIONS
-
-        return [s for s in self.unbuilt if s in REQUIRED_SECTIONS]
 
 
 @dataclass
@@ -117,10 +136,17 @@ class ProbeResult:
 @dataclass
 class DoctorReport:
     version: int = 1
+    #: The OpenDDE Harness this is, and -- when PyPI has a newer one -- what
+    #: it is and the command that installs it here.
+    harness_version: str = ""
+    update: Optional[dict] = None
     config_loaded: bool = False
     config_error: Optional[str] = None
     paths: Optional[PathsInfo] = None
     routing: Optional[RoutingInfo] = None
+    #: Every provider the config holds an entry for. Empty before the config
+    #: loads, which is why an unconfigured install has nothing to say here.
+    providers: list[ProviderInfo] = field(default_factory=list)
     features: Optional[FeaturesInfo] = None
     memory: Optional[MemoryInfo] = None
     probe: Optional[ProbeResult] = None
@@ -147,7 +173,12 @@ class DoctorReport:
 
 
 def _gather_static_checks() -> DoctorReport:
-    """Inspect config / routing / features. Strictly zero-network."""
+    """Inspect config / routing / features. No vendor is contacted.
+
+    The model layer is asked what it serves for the default model
+    (:func:`_catalogue_row`), which reads pi's own built-in rows in a child
+    process and nothing else.
+    """
     from opendde_harness.config.loader import ConfigSchemaError, get_config_path, load_config
 
     config_path = get_config_path()
@@ -155,7 +186,7 @@ def _gather_static_checks() -> DoctorReport:
         config_path=str(config_path),
         config_exists=config_path.exists(),
     )
-    report = DoctorReport(paths=paths)
+    report = DoctorReport(paths=paths, harness_version=__version__, update=_update_available())
 
     if not paths.config_exists:
         return report
@@ -190,27 +221,25 @@ def _gather_static_checks() -> DoctorReport:
     paths.workspace_path = str(workspace)
     paths.workspace_exists = workspace.exists()
 
-    from opendde_harness.providers.catalog import overlay_for
-    from opendde_harness.providers.rates import resolve_context_window, resolve_max_output_tokens
-
     defaults = config.agents.defaults
-    overlay = overlay_for(config.providers.model_overlays(), defaults.model)
     # What a request will actually carry, resolved the same way the loop
     # resolves it -- doctor reporting a configured number that no longer
     # exists would be reporting a setting, not the behaviour.
-    ceiling = resolve_max_output_tokens(defaults.model, overlay=overlay)
-    window = resolve_context_window(defaults.model, overlay=overlay)
-    wire, wire_source = _wire_facts(config)
+    ceiling, window = _model_limits(config, defaults.model)
+    api, api_source = _api_facts(config)
+    provider = config.get_provider_name()
     report.routing = RoutingInfo(
         model=defaults.model,
-        provider=config.get_provider_name(),
+        provider=provider,
         max_tokens=ceiling.tokens,
         context_window_tokens=window.tokens,
         max_tokens_source=ceiling.source,
         context_window_source=window.source,
-        wire=wire,
-        wire_source=wire_source,
+        api=api,
+        api_source=api_source,
+        unrouted_reason="" if provider else config.explain_unrouted(defaults.model),
     )
+    report.providers = _gather_providers(config)
 
     try:
         skill_forge_on = bool(config.skill_forge.enabled)
@@ -221,75 +250,15 @@ def _gather_static_checks() -> DoctorReport:
 
 
 def _probe_memory(config: "OpenDDEHarnessConfig") -> MemoryInfo:
-    """Ask the memory server what it can do. Local HTTP only, never raises.
+    """The memory plugin's own diagnosis. Local HTTP only, never raises.
 
     Deliberately not part of ``_gather_static_checks``: that stays zero-network.
     This one talks to localhost, which is cheap enough to run unconditionally --
     unlike ``--probe``, it spends no tokens and reaches no third party.
     """
-    backend = config.memory.backend
-    info = MemoryInfo(backend=backend)
-    from opendde_harness.config.update_memory import memory_owned, memory_role_configured, memory_root
-    from opendde_harness.plugin.memory.longterm._health import BACKEND_NAME
+    from opendde_harness.plugin.memory.longterm.doctor import probe_memory
 
-    if backend != BACKEND_NAME:
-        # Memory can sit on disk and still be off: the wizard records a managed
-        # root and starts a service, then leaves the backend unset while a
-        # required role has no credentials. Recall answers zero hits forever
-        # and every other surface looks healthy, so this is the one place that
-        # can say why.
-        if backend is None and memory_owned() and memory_root().is_dir():
-            from opendde_harness.plugin.memory.longterm._health import REQUIRED_SECTIONS
-
-            missing = [s for s in REQUIRED_SECTIONS if not memory_role_configured(s)]
-            info.root = str(memory_root())
-            info.disabled_reason = f"no credentials for {', '.join(missing)}" if missing else "turned off in config"
-        return info
-    from opendde_harness.plugin.memory.longterm._health import (
-        DEGRADING_SECTIONS,
-        REQUIRED_SECTIONS,
-        configured_base_url,
-        probe_capabilities,
-    )
-
-    # Which memories, and whose. Neither was reachable from any command before:
-    # the wizard printed the path once while converging and nothing showed it
-    # again, so "where are my memories" had no answer short of reading
-    # config.json by hand. This is the place that question gets asked.
-    info.owned = memory_owned()
-    info.address = configured_base_url(config)
-    report = probe_capabilities(configured_base_url(config))
-    info.server_running = report.reachable
-    info.reports_capabilities = report.reports_capabilities
-    info.capabilities = dict(report.capabilities)
-
-    if info.owned:
-        info.root = str(memory_root())
-        info.configured = [s for s in (*REQUIRED_SECTIONS, *DEGRADING_SECTIONS) if memory_role_configured(s)]
-        # Recall quality is decided by the embedding role in the user-level
-        # memory config: with it recall matches meaning, without it only keywords.
-        info.retrieval = "semantic" if "embedding" in info.configured else "keyword-only"
-        return info
-
-    # A root the user runs. Nothing here may come from the local filesystem:
-    # no root is recorded for it, so ``memory_root()`` would answer with the
-    # fallback -- a directory that is not theirs and holds none of their
-    # memories -- and the roles read out of that directory's toml would
-    # describe an install nobody is using. Reading their toml is not an option
-    # either; not touching it is the promise. What the server says about itself
-    # is the only honest source, and when it is down there is no source at all.
-    info.root = None
-    # Every section the server has an opinion about -- built or failed. Taking
-    # only the built ones made ``unbuilt`` (the failed subset of this list)
-    # structurally empty, so ``broken`` and the exit code could never fire and
-    # a server that could not build its LLM reported healthy. OpenDDE Harness cannot read
-    # their toml to learn what they configured, and does not need to: a section
-    # the server reports as unavailable is one it tried to build and could not.
-    info.configured = [s for s in (*REQUIRED_SECTIONS, *DEGRADING_SECTIONS) if report.available(s) is not None]
-    info.retrieval = None
-    if report.reports_capabilities:
-        info.retrieval = "semantic" if report.available("embedding") is True else "keyword-only"
-    return info
+    return probe_memory(config)
 
 
 def _run_llm_probe(timeout_s: int) -> ProbeResult:
@@ -301,114 +270,254 @@ def _run_llm_probe(timeout_s: int) -> ProbeResult:
         return ProbeResult(ok=False, error=str(exc) or exc.__class__.__name__)
 
 
-def _render_memory_capabilities(memory: MemoryInfo) -> None:
-    """Report the running server's capabilities, or say why they are unknown.
+def _model_limits(config, model: str) -> tuple["Resolved", "Resolved"]:
+    """``(output ceiling, context window)`` a request for ``model`` will carry.
 
-    "Server running" and "server can recall" stopped being the same statement in
-    library 1.2.1, so they are printed as separate lines rather than one tick.
+    The same two tiers the loop walks -- the user's declaration for this model
+    (``AgentLoop.resolve_window``, ``providers.base.send_max_tokens``), then the
+    model layer's own row for it -- so doctor reports the behaviour rather than a
+    setting. Unknown where neither answers: an invented number here would read
+    as a measurement.
     """
-    from opendde_harness.plugin.memory.longterm._health import BACKEND_NAME, capability_available
+    from opendde_harness.providers import model_id
+    from opendde_harness.providers.base import declared_tokens
+    from opendde_harness.providers.rates import SOURCE_DECLARED, SOURCE_SERVICE, SOURCE_UNKNOWN, Resolved
 
-    if memory.disabled_reason:
-        console.print("\n[bold]Memory[/bold]")
-        console.print(f"  Memories:   {memory.root}")
-        console.print(f"  [yellow]Disabled:   {memory.disabled_reason}; recall returns nothing.[/yellow]")
-        console.print("  [dim]Run ddeharness onboard to finish memory setup.[/dim]")
-        return
-    if memory.backend != BACKEND_NAME:
-        return
-    if memory.root:
-        console.print(f"  Memories:   {memory.root}")
-    if not memory.owned:
-        console.print(
-            "  [dim]Managed by you -- OpenDDE Harness reads it at the address below and never writes,\n"
-            "  starts or stops it, so it does not track where on disk it keeps them.[/dim]"
-        )
-    console.print(f"  Address:    {memory.address}")
-    if not memory.server_running:
-        console.print("  Server:     [dim]not running  (starts on demand)[/dim]")
-        if memory.configured:
-            console.print(f"  Configured: {', '.join(memory.configured)}")
-        return
-    console.print("  Server:     [green]running[/green]")
-    if not memory.reports_capabilities:
-        console.print("  [dim]This server does not report capabilities (library < 1.2.1).[/dim]")
-        if memory.configured:
-            console.print(f"  Configured: {', '.join(memory.configured)}")
-        return
-    from opendde_harness.plugin.memory.longterm._health import DEGRADING_SECTIONS, REQUIRED_SECTIONS
+    # The declaration is the model's own row on its provider's entry, looked up
+    # by the qualified id exactly: a row declared for a self-hosted model must
+    # never answer for a hosted one that happens to share its name.
+    declared = model_id.row_for(config.providers, model)
+    ceiling = declared_tokens(declared, "max_tokens")
+    window = declared_tokens(declared, "context_window")
+    reported = {} if ceiling and window else _catalogue_row(config, model, declared)
 
-    for section in (*REQUIRED_SECTIONS, *DEGRADING_SECTIONS):
-        label = f"  {section + ':':<12}"
-        if section not in memory.configured:
-            console.print(f"{label}[dim]not configured{_degradation_note(section)}[/dim]")
-            continue
-        state = capability_available(memory.capabilities, section)
-        if state is True:
-            console.print(f"{label}[green]✓[/green]")
-        elif state is False:
-            console.print(f"{label}[red]✗ configured, but the server could not build it[/red]")
-        else:
-            console.print(f"{label}[dim]not reported[/dim]")
-    if memory.unbuilt:
-        console.print()
-        if memory.broken:
-            console.print(
-                f"  [yellow]⚠ Memory needs {' and '.join(memory.broken)} and cannot work until this is fixed.[/yellow]"
-            )
-        else:
-            # "memory", not "recall": an unbuilt multimodal llm costs ingest of
-            # images / PDFs / audio, which recall never sees either way.
-            console.print(
-                f"  [yellow]⚠ {' and '.join(memory.unbuilt)} is configured but unavailable, so memory "
-                "runs degraded.[/yellow]"
-            )
-        console.print(f"  [dim]Check the server log: {_server_log_hint()}[/dim]")
+    def resolved(written: Optional[int], field: str) -> "Resolved":
+        if written:
+            return Resolved(written, SOURCE_DECLARED)
+        value = reported.get(field)
+        if isinstance(value, int) and value > 0:
+            return Resolved(value, SOURCE_SERVICE)
+        return Resolved(None, SOURCE_UNKNOWN)
+
+    return resolved(ceiling, "maxTokens"), resolved(window, "contextWindow")
 
 
-def _degradation_note(section: str) -> str:
-    """What is lost by leaving an optional role unconfigured.
+def _catalogue_row(config, model: str, declared) -> dict:
+    """What the model layer says about ``model``, or ``{}`` when it cannot say.
 
-    Stated per role rather than as one blanket "optional": they degrade
-    differently, and a user deciding whether to configure embedding needs to know
-    it costs semantic recall specifically.
+    Asked over the service's ``catalog`` request, which reads pi's own built-in
+    rows and is answered without a ``configure``: this command reports on a
+    configuration, it does not install one, so it starts a bare child, asks and
+    closes it -- no credential store is written and no key is seeded. Rows for
+    the provider this model is actually routed to win; otherwise every row for
+    the id is merged, the same way ``configure`` sizes a declared model.
+
+    Anything that goes wrong -- no Node, no built bundle -- is "unknown". A
+    diagnostic that cannot read a fact says so; it does not fail.
     """
-    return {
-        "embedding": "  (recall matches keywords, not meaning)",
-        "rerank": "  (agent-track recall uses the LLM lane instead of a cross-encoder)",
-        "multimodal": "  (images, PDFs and audio stay out of memory)",
-    }.get(section, "")
+    import asyncio
+
+    from opendde_harness.providers import model_id
+    from opendde_harness.providers.model_service import ModelService
+    from opendde_harness.providers.pi_auth import merged_catalog_row
+
+    prefix, served = model_id.split(model)
+    wanted = (declared.catalog_model if declared is not None else None) or served or model
+    if not wanted:
+        return {}
+
+    async def ask() -> list[dict]:
+        service = ModelService()
+        await service.start()
+        try:
+            return await service.catalog(wanted)
+        finally:
+            await service.close()
+
+    try:
+        rows = asyncio.run(ask())
+    except Exception:  # noqa: BLE001 - a fact doctor cannot read is reported as unknown
+        return {}
+    # The id's own prefix is the provider, and pi's ids are pi's ids -- there is
+    # no name to translate on the way in or out any more.
+    routed = config.get_provider_name(model) or prefix
+    return merged_catalog_row([row for row in rows if row.get("provider") == routed] or rows)
 
 
-def _server_log_hint() -> str:
-    from opendde_harness.plugin.memory.longterm._server import server_log_path
+def _api_facts(config) -> tuple[str, str]:
+    """(wire, what decided it) for the default model, or two empties when unrouted.
 
-    return str(server_log_path())
-
-
-def _wire_facts(config) -> tuple[str, str]:
-    """(wire, where it came from) for the default model, or two empties.
-
-    The same precedence the request uses: the model's overlay, then the
-    section, then the provider's default.
+    The wire is declared, never probed, and there are exactly three answers. A
+    model row's own ``api`` wins, because one relay can serve different models on
+    different wires. Otherwise a provider this config declares names its ``api``,
+    which the schema requires of it alongside the address. And for one of pi's
+    own built-ins the wire is pi's: it lives in pi-ai's provider table, this
+    process would have to start the model service to read it, and naming pi as
+    the holder is the honest report -- the per-vendor default table that used to
+    answer here was this project keeping a second copy of pi's own fact, and it
+    went stale by construction.
     """
-    from opendde_harness.providers.catalog import overlay_for
-    from opendde_harness.providers.registry import default_wire, find_by_name
+    from opendde_harness.providers import model_id
 
-    name = config.get_provider_name() or ""
-    spec = find_by_name(name)
-    if spec is None or spec.model_prefix != "openai":
+    model = config.agents.defaults.model or ""
+    name = config.get_provider_name(model) or ""
+    entry = config.providers.get(name)
+    if entry is None:
         return "", ""
-    overlay = overlay_for(config.providers.model_overlays(), config.agents.defaults.model or "")
-    if overlay is not None and overlay.wire:
-        return overlay.wire, "model overlay"
-    section = config.providers.get(name)
-    declared = getattr(section, "wire", None)
-    return (declared, "section") if declared else (default_wire(name), f"{name} default")
+    row = model_id.row_for(config.providers, model)
+    if row is not None and row.api:
+        return row.api, f"the {row.id} row on providers.{name}"
+    if entry.api:
+        return entry.api, f"providers.{name}.api"
+    return "pi's own", f"{name} is one of pi's built-ins; only the model service holds its wire"
+
+
+def _gather_providers(config) -> list[ProviderInfo]:
+    """Every provider the config holds an entry for, and what answers for it.
+
+    The ``providers`` section is the configured set -- an entry is there because
+    somebody wrote it -- and :func:`opendde_harness.providers.auth.credential_status`
+    is what adds the material the file does not hold. Asked with
+    ``include_external`` because doctor reports what is true right now: a sign-in
+    in the model service's store and a key in the vendor's own environment
+    variable both reach the vendor, and reading the file alone called each of
+    them unset.
+    """
+    from opendde_harness.providers import model_id, pi_ids
+    from opendde_harness.providers.auth import KIND_API_KEY, configured_key, credential_status, env_key_name
+
+    default_model = config.agents.defaults.model or ""
+    routed = model_id.provider_of(default_model)
+    infos: list[ProviderInfo] = []
+    for provider, entry in config.providers.items():
+        status = credential_status(provider, entry, include_external=True)
+        infos.append(
+            ProviderInfo(
+                name=provider,
+                display_name=pi_ids.display_name(provider, entry.name),
+                declared=entry.declared,
+                configured=status.ok,
+                kind=status.kind,
+                source=status.source,
+                # Named only for the case it explains. A whole environment chain
+                # (the AWS one, Google ADC) also reports as "environment" and has
+                # no single variable to point at.
+                env_var=(
+                    env_key_name(provider) if status.kind == KIND_API_KEY and status.source == "environment" else ""
+                ),
+                base_url=entry.base_url,
+                has_key=bool(configured_key(entry)),
+                missing=[requirement.hint or requirement.label for requirement in status.missing],
+                model_count=len(entry.models),
+                routes_default=provider == routed,
+                # The id as the endpoint is asked for it, so a remedy naming it
+                # does not tell the user to type the provider twice.
+                default_served=model_id.display(provider, default_model) if provider == routed else "",
+            )
+        )
+    return infos
+
+
+def _declare_hint(model: str, flag: str) -> str:
+    """The ``provider model set`` command that declares one limit for ``model``.
+
+    A limit is declared per model, on a row of its provider's own entry, so the
+    remedy has to name the two halves of the model id separately -- printing the
+    qualified id would be telling the user to type the provider twice.
+    """
+    from opendde_harness.providers import model_id
+
+    provider, served = model_id.split(model)
+    return f"declare it: ddeharness provider model set {provider or '<provider>'} {served} {flag} <tokens>"
+
+
+def _credential_detail(info: ProviderInfo) -> str:
+    """What answers for a configured provider, in one phrase.
+
+    The phrase is the ``source``, not a tick: "configured" is true of a key in
+    ``config.json``, a key in the vendor's environment variable and a sign-in in
+    the model service's store alike, and which one answered is the fact somebody
+    reading doctor is here for.
+    """
+    from opendde_harness.providers.auth import KIND_AMBIENT, KIND_DEVICE_FLOW
+
+    if info.kind == KIND_DEVICE_FLOW:
+        # Before the address, because an entry can carry both and the sign-in is
+        # what reaches the vendor.
+        return "signed in  [dim](grant in the model service's credential store)[/dim]"
+    if info.kind == KIND_AMBIENT:
+        # A whole environment chain rather than one variable, so there is no key
+        # to name a source for.
+        return "the environment's own credentials"
+    if info.source == "declared":
+        # For a provider this config declares the address is what makes it
+        # reachable, and a key is optional -- a self-hosted server wants none.
+        held = "key in config.json" if info.has_key else "no key"
+        return f"{info.base_url}  [dim]({held})[/dim]"
+    if info.source == "environment":
+        return f"key from [cyan]{info.env_var}[/cyan]" if info.env_var else "key from the environment"
+    if info.source == "store":
+        return "key in the model service's credential store"
+    if info.source == "config":
+        return "key in config.json"
+    return "configured"
+
+
+def _render_providers(providers: list[ProviderInfo]) -> None:
+    """One line per configured provider, and the two faults only doctor sees.
+
+    An entry that reaches nothing is a fault rather than a blank, because an
+    entry exists only where somebody wrote one: nothing is offered empty and
+    waiting to be filled in. So every entry gets a line here, unlike ``status``,
+    which folds the unusable ones into a count.
+    """
+    if not providers:
+        return
+    console.print("\n[bold]Providers[/bold]")
+    width = max(len(info.name) for info in providers)
+    for info in providers:
+        label = f"  {info.name:<{width}}"
+        routes = "  [dim]← routes the default model[/dim]" if info.routes_default else ""
+        if info.configured:
+            console.print(f"{label}  [green]✓[/green] {_credential_detail(info)}{routes}")
+        else:
+            console.print(f"{label}  [red]✗[/red] needs {'; '.join(info.missing) or 'configuring'}{routes}")
+        if info.serves_nothing:
+            # pi ships no catalogue for a provider this config declares, so an
+            # empty ``models`` list is not "everything it serves" but nothing:
+            # the entry never reaches the model service at all, and the failure
+            # otherwise surfaces as an unroutable model id at the first request.
+            console.print(
+                f"  [yellow]⚠ {info.name} declares an address but no models, so it can serve none: "
+                "pi has no catalogue for a provider this config declares.[/yellow]"
+            )
+            console.print(
+                f"    [dim]ddeharness provider set {info.name} --models {info.default_served or '<model id>'}[/dim]"
+            )
+
+
+def _update_available() -> Optional[dict]:
+    """PyPI's newer release and the command for it, or None. Doctor is the one
+    place that waits for the answer: it is a check, and a few seconds is what
+    a check costs."""
+    from opendde_harness.cli.update_notice import update_notice
+
+    notice = update_notice(__version__, wait=5.0)
+    return {"latest": notice[0], "command": notice[1]} if notice else None
 
 
 def _render_human_output(report: DoctorReport) -> None:
     console.print(f"\n{__logo__} OpenDDE Harness Doctor\n")
+
+    console.print("[bold]Version[/bold]")
+    if report.update:
+        console.print(
+            f"  {report.harness_version}  [yellow]↑ {report.update['latest']} is on PyPI[/yellow]  "
+            f"[dim]update with: {report.update['command']}[/dim]"
+        )
+    else:
+        console.print(f"  {report.harness_version}  [green]✓[/green]")
+    console.print()
 
     paths = report.paths
     assert paths is not None  # _gather_static_checks always populates this
@@ -453,20 +562,31 @@ def _render_human_output(report: DoctorReport) -> None:
             console.print(f"  Routes to:    {routing.provider}")
         else:
             console.print("  Routes to:    [red]<unresolved>[/red]")
-        console.print(f"  Max tokens:   {routing.max_tokens}  [dim]({routing.max_tokens_source})[/dim]")
+        if routing.max_tokens:
+            console.print(f"  Max tokens:   {routing.max_tokens}  [dim]({routing.max_tokens_source})[/dim]")
+        else:
+            console.print(
+                "  Max tokens:   [yellow]unknown[/yellow]  "
+                "[dim](nothing declares one, and the model service refuses a request with no ceiling)[/dim]"
+            )
+            # Only worth saying once the model reaches a provider: with no entry
+            # to hold the row, the fix is the entry and the tail line says so.
+            if routing.provider:
+                console.print(f"                [dim]{_declare_hint(routing.model, '--max-tokens')}[/dim]")
         if routing.context_window_tokens:
             console.print(
                 f"  Context win:  {routing.context_window_tokens}  [dim]({routing.context_window_source})[/dim]"
             )
         else:
             console.print(
-                "  Context win:  [yellow]unknown[/yellow]  [dim](no table lists this model; history is not trimmed)[/dim]"
+                "  Context win:  [yellow]unknown[/yellow]  [dim](the model layer lists no window; history is not trimmed)[/dim]"
             )
-            console.print(
-                f"                [dim]declare providers.<name>.modelOverlay.{routing.model!r}.contextWindowTokens to size it[/dim]"
-            )
-        if routing.wire:
-            console.print(f"  Wire:         {routing.wire}  [dim]({routing.wire_source})[/dim]")
+            if routing.provider:
+                console.print(f"                [dim]{_declare_hint(routing.model, '--context-window')}[/dim]")
+        if routing.api:
+            console.print(f"  Wire:         {routing.api}  [dim]({routing.api_source})[/dim]")
+
+    _render_providers(report.providers)
 
     features = report.features
     if features is not None:
@@ -476,17 +596,11 @@ def _render_human_output(report: DoctorReport) -> None:
 
     memory = report.memory
     if memory is not None and memory.disabled_reason:
-        _render_memory_capabilities(memory)
+        render_memory(console, memory)
     elif memory is not None and memory.backend:
         console.print("\n[bold]Memory[/bold]")
         console.print(f"  Backend:    {memory.backend}")
-        if memory.retrieval == "semantic":
-            console.print("  Retrieval:  semantic")
-        elif memory.retrieval:
-            console.print("  Retrieval:  [dim]keyword-only  (no embedding key)[/dim]")
-        elif not memory.owned:
-            console.print("  Retrieval:  [dim]unknown  (the server you run is not answering)[/dim]")
-        _render_memory_capabilities(memory)
+        render_memory(console, memory)
 
     if report.probe is not None:
         console.print("\n[bold]LLM Probe[/bold]")
@@ -521,9 +635,7 @@ def _render_human_output(report: DoctorReport) -> None:
         console.print(f"[yellow]⚠ Config file is {reason}; the checks above ran on built-in defaults.[/yellow]")
         console.print(f"Fix [cyan]{paths.config_path}[/cyan] (JSON allows no comments or trailing commas).")
     elif routing and routing.provider is None:
-        console.print(
-            f"[red]✗ Model [bold]{routing.model}[/bold] could not be routed to any configured provider.[/red]"
-        )
+        console.print(f"[red]✗ Model [bold]{routing.model}[/bold] could not be routed: {routing.unrouted_reason}[/red]")
         console.print(
             "Run [cyan]ddeharness provider list[/cyan] / [cyan]ddeharness provider set[/cyan] to fix routing."
         )

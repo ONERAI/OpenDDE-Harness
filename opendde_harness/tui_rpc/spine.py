@@ -10,20 +10,27 @@ share one per-outlet FIFO. spine never imports tui_rpc; tui_rpc imports spine.
 Why ``message.complete`` is fired from the sink (not from a stream-close): it is
 an unconditional per-turn signal — the front-end clears its turn slot on it, so a
 turn that streams nothing (empty reply, tool-only) must still emit it or the UI
-wedges. The sink awaits ``wait_idle`` first so it lands after the turn's last
-``token.delta``; an empty turn never built a queue, so the barrier returns at
-once. This is the REPL's ``result() -> wait_idle`` render barrier moved into the
-sink.
+wedges. The sink awaits the hub's per-conversation delivery fence first, so it
+lands after the turn's last ``token.delta``; an empty turn never built a queue,
+so the barrier returns at once. The fence is bounded and reports whether the
+output actually rendered, so a wedged or failing outlet cannot leave the turn
+without a ``message.complete``. This is the REPL's ``result() -> wait_idle``
+render barrier moved into the sink.
 """
 
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from loguru import logger
+
+from opendde_harness.agent.loop.accounting import session_wire_usage
 from opendde_harness.agent.spine_runner import AgentTurnRunner
-from opendde_harness.agent.tools.shell import ApprovalResponder, ExecTool
+from opendde_harness.agent.tools.approval import ApprovalResponder
 from opendde_harness.spine import (
     Deliverable,
     EpisodeStart,
+    Notice,
+    NoticeKind,
     Origin,
     OriginPools,
     Reasoning,
@@ -39,7 +46,7 @@ from opendde_harness.spine import (
     TurnStarted,
     TurnUsage,
 )
-from opendde_harness.spine.delivery import Capabilities, DeliveryHub
+from opendde_harness.spine.delivery import Capabilities, DeliveryHub, DeliveryReport
 from opendde_harness.spine.events import TurnEvent
 from opendde_harness.spine.runner import Drain, Emit
 from opendde_harness.tui_rpc.subscriptions import SubscriptionEmitter
@@ -59,7 +66,9 @@ class TuiTurnRunner(AgentTurnRunner):
 
     - it keeps ``outcome.usage_detail`` so the sink can attach the full usage
       (cost / context, richer than the three-field TurnOutcome.usage) to
-      ``message.complete``; the rich usage stays TUI-internal, off the wire;
+      ``message.complete``, and adds the session's running totals from the same
+      tracker ``/status`` reads, so the footer's dollar figure and ``/status``'s
+      are one number rather than two that disagree;
     - it fires the synthetic tool.complete when the turn replied via the
       message tool (the loop's general tool path skips the message tool), so the
       UI records that the agent acted.
@@ -82,21 +91,75 @@ class TuiTurnRunner(AgentTurnRunner):
     async def run(self, req: TurnRequest, emit: Emit, drain: Drain) -> TurnOutcome:
         cid = _conversation_id(req)
         tools = getattr(self._loop, "tools", None)
-        exec_tool = tools.get("exec") if tools is not None else None
-        if isinstance(exec_tool, ExecTool):
-            # Approval capability is rebound for every turn. Only USER origin
-            # receives the TUI responder; background origins share this process
-            # but must still fail closed as non-interactive.
-            # The IDs bind any response to this exact conversation and turn.
-            exec_tool.start_approval_turn(
+        # Approval capability is rebound for every turn. Only USER origin
+        # receives the TUI responder; background origins share this process
+        # but must still fail closed as non-interactive.
+        # The IDs bind any response to this exact conversation and turn.
+        #
+        # Every tool that can ask, not the shell alone: writing AGENTS.md or
+        # ODH.md is a privileged act too, and a gate nobody binds is a gate
+        # that refuses every time. Duck-typed, because the alternative is a
+        # base class that most tools would implement emptily.
+        for tool in _approvable(tools):
+            tool.start_approval_turn(
                 self._approval_responder if req.origin is Origin.USER else None,
                 conversation_id=cid,
                 turn_id=self._turn_ids.get(cid, ""),
             )
-        outcome = await self._loop.run_turn(req, emit, drain, stream=True, inline_tool_stream=True)
+        outcome = await self._loop.run_turn(req, emit, drain, stream=True)
 
-        self._usages[cid] = dict(outcome.usage_detail)
+        # The turn's own figures, plus the session's. Read here rather than in
+        # the sink because this is where the loop is: the last call and any
+        # compaction made on the turn's behalf are recorded by the time run_turn
+        # returns, so the totals are complete, and the sink only forwards them.
+        usage = dict(outcome.usage_detail)
+        usage.update(session_wire_usage(_session_usage(self._loop, cid)))
+        self._usages[cid] = usage
         return outcome
+
+
+def _session_usage(agent_loop: Any, session_key: str) -> Any:
+    """This session's totals from the loop's usage tracker, or None without one.
+
+    ``session_key`` is the conversation id, which is the key the loop records
+    every call of the turn under (``AgentLoop.run_turn`` sets the same string on
+    ``CURRENT_SESSION_KEY``); asking under any other spelling would answer for a
+    session with no calls in it.
+    """
+    tracker = getattr(agent_loop, "usage_tracker", None)
+    if tracker is None:
+        return None
+    try:
+        return tracker.session_usage(session_key)
+    except Exception:  # pragma: no cover - a tracker that cannot answer reports nothing
+        logger.debug("tui usage: could not read session totals for {!r}", session_key)
+        return None
+
+
+def _approvable(tools: Any) -> list[Any]:
+    """Every registered tool that can be handed an approval transport.
+
+    Asks the registry by name and fetches each one, which is all this module
+    has ever assumed of it.
+    """
+    if tools is None:
+        return []
+
+    found = []
+
+    for name in getattr(tools, "tool_names", []):
+        tool = tools.get(name)
+
+        if callable(getattr(tool, "start_approval_turn", None)):
+            found.append(tool)
+
+    return found
+
+
+#: The Notice kinds the TUI is shown. PROGRESS and TOOL_HINT are the turn
+#: narrating itself, which the transcript already does; these two are facts
+#: about the turn the user would otherwise never learn.
+_NOTICE_ON_THE_WIRE = frozenset({NoticeKind.MODEL_FALLBACK, NoticeKind.DELIVERY_FAILED})
 
 
 class TuiOutlet:
@@ -105,9 +168,11 @@ class TuiOutlet:
     (-> token.delta), and the discrete deliverables via ``deliver`` (Reasoning ->
     thinking.delta, ToolEvent -> tool.start / tool.complete, a non-streamed Text
     -> a token.delta, TurnRetry -> turn.retry, TurnUsage -> turn.usage). The turn's completion (``message.complete``) and failure
-    (``error``) are emitted by the sink after the render barrier. Notice and
-    MediaOut are eaten — the wire protocol has no event for them and the TUI shows
-    no per-turn progress or tool media today (a known gap, deferred)."""
+    (``error``) are emitted by the sink after the render barrier. A Notice rides
+    turn.notice, but only for the kinds that are the user's business rather than
+    the turn's chatter: see ``_NOTICE_ON_THE_WIRE``. MediaOut is eaten — the wire
+    protocol has no event for it and the TUI shows no tool media today (a known
+    gap, deferred)."""
 
     def __init__(self, channel: str, emitter: SubscriptionEmitter) -> None:
         self.name = channel
@@ -167,6 +232,12 @@ class TuiOutlet:
                     },
                 },
             )
+        elif isinstance(out, Notice):
+            if out.kind in _NOTICE_ON_THE_WIRE and out.detail:
+                await self._emitter.emit(
+                    cid,
+                    {"type": "turn.notice", "payload": {"kind": str(out.kind), "text": out.detail}},
+                )
         elif isinstance(out, TurnRetry):
             await self._emitter.emit(
                 cid,
@@ -180,7 +251,7 @@ class TuiOutlet:
                     },
                 },
             )
-        # Notice / MediaOut: eaten (no wire event today).
+        # MediaOut, and every other Notice kind: eaten (no wire event today).
 
     async def send_stream_chunk(self, chat_id: str, stream_id: str, delta: str, *, done: bool = False) -> None:
         if done:
@@ -196,6 +267,15 @@ class TuiOutlet:
         await self._emitter.emit(
             conversation_id,
             {"type": "message.complete", "payload": {"turn_id": turn_id, "usage": usage}},
+        )
+
+    async def emit_notice(self, conversation_id: str, kind: NoticeKind, text: str) -> None:
+        """A fact about the turn the transcript cannot show, sent straight to the
+        subscription rather than through the hub — the hub's queue for this
+        conversation is what a delivery failure is about."""
+        await self._emitter.emit(
+            conversation_id,
+            {"type": "turn.notice", "payload": {"kind": str(kind), "text": text}},
         )
 
     async def emit_error(self, conversation_id: str, code: int, message: str, reason: str, detail: str = "") -> None:
@@ -221,13 +301,31 @@ def _make_tui_sink(
     This sink is build_tui's alone — the CLI keeps its own lifecycle-dropping
     sink."""
 
-    async def _finish(conversation_id: str) -> None:
+    async def _finish(conversation_id: str) -> DeliveryReport:
         # close_stream clears the hub's per-stream state (so the next turn on this
-        # conversation reopens cleanly); wait_idle then blocks until every queued
-        # token.delta has been delivered — an empty turn never built a queue, so
-        # it returns at once.
+        # conversation reopens cleanly); the fence then blocks until every queued
+        # token.delta of *this* conversation has been delivered or explicitly
+        # failed — an empty turn never built a queue, so it returns at once. The
+        # fence is bounded and per-conversation: neither a wedged outlet nor
+        # another chat's backlog can hold message.complete.
         await hub.close_stream(conversation_id)
-        await hub.wait_idle(channel)
+        return await hub.fence(channel, conversation_id)
+
+    async def _report_lost_output(conversation_id: str, report: DeliveryReport) -> None:
+        """Tell the user their output did not all reach the screen. Best-effort:
+        message.complete matters more than this notice, so a failure here is
+        logged, never raised."""
+        logger.warning(
+            "tui delivery incomplete: conversation={!r} failed={} timed_out={}",
+            conversation_id,
+            report.failed,
+            report.timed_out,
+        )
+        detail = "Some output could not be shown" + (" (delivery timed out)" if report.timed_out else "")
+        try:
+            await outlet.emit_notice(conversation_id, NoticeKind.DELIVERY_FAILED, detail)
+        except Exception:
+            logger.exception("tui delivery notice failed: conversation={!r}", conversation_id)
 
     def _drop(conversation_id: str) -> None:
         turn_ids.pop(conversation_id, None)
@@ -237,7 +335,9 @@ def _make_tui_sink(
 
     async def sink(event: TurnEvent) -> None:
         if isinstance(event, TurnEnded):
-            await _finish(event.conversation_id)
+            report = await _finish(event.conversation_id)
+            if not report.ok:
+                await _report_lost_output(event.conversation_id, report)
             turn_id = turn_ids.get(event.conversation_id)
             usage = usages.get(event.conversation_id) or {
                 "prompt_tokens": 0,
@@ -248,7 +348,7 @@ def _make_tui_sink(
             await outlet.emit_complete(event.conversation_id, turn_id, usage)
             return
         if isinstance(event, TurnFailed):
-            await _finish(event.conversation_id)
+            await _finish(event.conversation_id)  # a failed turn's own error is the report
             _drop(event.conversation_id)
             # A cancelled turn's error is emitted by turn.cancel, not here, to
             # avoid a double error event.

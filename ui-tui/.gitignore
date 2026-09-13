@@ -1,13 +1,3 @@
-# Node
 node_modules/
 dist/
-.tsbuildinfo
-*.tsbuildinfo
-
-# Test
-coverage/
-.vitest-cache/
-
-# Editor
-.vscode/
-.idea/
+.build-lock

@@ -1,254 +1,302 @@
-// SPDX-License-Identifier: MIT
-// Portions Copyright (c) 2025 Nous Research (hermes-agent, MIT).
-// Modifications Copyright (c) 2026 EverMind.
-// See NOTICES.md and LICENSES/MIT-hermes-agent.txt.
+// Ported from `<scratchpad>/tui-bench/verify_streaming.ts`. The contract is
+// that splitting the stream into frozen blocks is invisible: at every prefix
+// the component renders exactly what a whole-text `Markdown` would.
 
-import { render } from 'ink-testing-library'
-import { createElement } from 'react'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import type { MarkdownTheme } from '@earendil-works/pi-tui'
 
-import type * as emojiModule from '../lib/emoji.js'
-import type * as syntaxModule from '../lib/syntax.js'
+import { Markdown } from '@earendil-works/pi-tui'
+import { describe, expect, it } from 'vitest'
 
-import { Md } from '../components/markdown.js'
-import { findStableBoundary, splitStableBlocks, StreamingMd } from '../components/streamingMarkdown.js'
-import { LIVE_RENDER_MAX_CHARS } from '../config/limits.js'
-import { ensureEmojiPresentation } from '../lib/emoji.js'
-import { highlightLine } from '../lib/syntax.js'
-import { boundedLiveRenderText } from '../lib/text.js'
+import { StreamingMarkdown } from '../components/streamingMarkdown.js'
+import { Theme } from '../theme.js'
+import { buildStream, streamText } from './streams.js'
 
-// Every markdown parse (cache miss) passes its text through
-// ensureEmojiPresentation exactly once, and every highlighted code row calls
-// highlightLine once per render: counting them measures the streaming work
-// without timing anything.
-vi.mock('../lib/emoji.js', async importOriginal => {
-  const mod = await importOriginal<typeof emojiModule>()
+const THEME = new Theme('dark', 3).markdownTheme()
+const WIDTH = 120
+const PAD = 1
 
-  return { ...mod, ensureEmojiPresentation: vi.fn(mod.ensureEmojiPresentation) }
-})
-
-vi.mock('../lib/syntax.js', async importOriginal => {
-  const mod = await importOriginal<typeof syntaxModule>()
-
-  return { ...mod, highlightLine: vi.fn(mod.highlightLine) }
-})
-// We test the pure boundary logic by rendering the component's ref
-// behaviour through repeated calls. Since React isn't being rendered here,
-// we reach into the module to test findStableBoundary via its exported
-// behaviour — but the pure helper isn't exported. So test the component's
-// observable output: pass sequential text values and verify the stable
-// prefix never retreats.
-//
-// Strategy: mount StreamingMd in isolation and observe which <Md>
-// instances it renders (by text prop). Without a DOM renderer that's
-// heavy, so we validate the helper behaviour by directly invoking the
-// fence/boundary logic via a re-exported surface.
-import { DEFAULT_THEME } from '../theme.js'
-
-describe('findStableBoundary', () => {
-  it('returns -1 when no blank line exists yet', () => {
-    expect(findStableBoundary('partial line with no newline yet')).toBe(-1)
-  })
-
-  it('returns -1 when only single newlines exist', () => {
-    expect(findStableBoundary('line one\nline two\nline three')).toBe(-1)
-  })
-
-  it('splits after the last blank line separator', () => {
-    // 'first\n\nsecond\n\nthird' → last blank = before 'third'
-    const text = 'first paragraph\n\nsecond paragraph\n\nthird'
-    const idx = findStableBoundary(text)
-
-    expect(text.slice(0, idx)).toBe('first paragraph\n\nsecond paragraph\n\n')
-    expect(text.slice(idx)).toBe('third')
-  })
-
-  it('refuses to split inside an open fenced block', () => {
-    // Fence opens, contains a blank line inside the code, no close yet.
-    const text = '```ts\nfn();\n\nmore code here'
-
-    expect(findStableBoundary(text)).toBe(-1)
-  })
-
-  it('splits before an open fenced block but not inside', () => {
-    const text = 'intro paragraph\n\n```ts\nfn();\n\nmore code'
-    const idx = findStableBoundary(text)
-
-    expect(text.slice(0, idx)).toBe('intro paragraph\n\n')
-    expect(text.slice(idx).startsWith('```ts')).toBe(true)
-  })
-
-  it('allows splitting after a fenced block closes', () => {
-    const text = '```ts\nfn();\n```\n\nnarration continues'
-    const idx = findStableBoundary(text)
-
-    expect(text.slice(0, idx)).toBe('```ts\nfn();\n```\n\n')
-    expect(text.slice(idx)).toBe('narration continues')
-  })
-
-  it('walks backwards through nested fence boundaries safely', () => {
-    // Two closed fences + narration + one new open fence. The only legal
-    // split is before the open fence, not between the closed ones.
-    const text = '```js\na\n```\n\nmid text\n\n```python\nstill open'
-    const idx = findStableBoundary(text)
-
-    expect(text.slice(0, idx)).toBe('```js\na\n```\n\nmid text\n\n')
-  })
-
-  it('handles empty input', () => {
-    expect(findStableBoundary('')).toBe(-1)
-  })
-
-  it('refuses to split inside an open $$ math block', () => {
-    // Display math has been opened but not closed; the only blank line
-    // sits inside the open block, so there's no safe boundary yet.
-    const text = '$$\nx + y\n\nmore math'
-
-    expect(findStableBoundary(text)).toBe(-1)
-  })
-
-  it('allows splitting after a $$ math block closes', () => {
-    const text = '$$\nx + y = z\n$$\n\nnarration continues'
-    const idx = findStableBoundary(text)
-
-    expect(text.slice(0, idx)).toBe('$$\nx + y = z\n$$\n\n')
-    expect(text.slice(idx)).toBe('narration continues')
-  })
-
-  it('splits before an open $$ block but not inside', () => {
-    // Mirror of the existing fenced-code test: prose, then an unclosed
-    // math block. The only safe boundary is the blank line BEFORE `$$`.
-    const text = 'intro paragraph\n\n$$\nx + y\n\nmore'
-    const idx = findStableBoundary(text)
-
-    expect(text.slice(0, idx)).toBe('intro paragraph\n\n')
-    expect(text.slice(idx).startsWith('$$')).toBe(true)
-  })
-
-  it('treats single-line $$x$$ as zero net toggle', () => {
-    // `$$x = y$$` opens AND closes on one line, so the stable boundary
-    // after it is allowed.
-    const text = 'intro\n\n$$x = y$$\n\nnarration'
-    const idx = findStableBoundary(text)
-
-    expect(text.slice(0, idx)).toBe('intro\n\n$$x = y$$\n\n')
-    expect(text.slice(idx)).toBe('narration')
-  })
-
-  it('refuses to split inside an open \\[ math block', () => {
-    const text = '\\[\nx + y\n\nmore'
-
-    expect(findStableBoundary(text)).toBe(-1)
-  })
-})
-
-describe('streaming theme assumption', () => {
-  it('theme is exportable (component import sanity check)', () => {
-    // Sanity that the theme we pass doesn't change shape. Component import
-    // already happens above — this is a smoke test that the module graph
-    // for streamingMarkdown wires up without cycles.
-    expect(DEFAULT_THEME.color.accent).toBeTruthy()
-  })
-})
-
-describe('splitStableBlocks', () => {
-  it('emits completed blocks and keeps the in-flight remainder', () => {
-    expect(splitStableBlocks('a\n\nb\n\n\nc')).toEqual({ blocks: ['a\n\n', 'b\n\n\n'], tail: 'c' })
-    expect(splitStableBlocks('```\nx\n\ny\n```\n\nz')).toEqual({ blocks: ['```\nx\n\ny\n```\n\n'], tail: 'z' })
-    expect(splitStableBlocks('a\n\n')).toEqual({ blocks: ['a\n\n'], tail: '' })
-  })
-})
-
-const PARA = (n: number) =>
-  `Paragraph ${n} keeps going with **bold**, \`code\` and enough words that it wraps across a few terminal rows.`
-
-const stream = (text: string, size: number) => {
-  const deltas: string[] = []
-
-  for (let i = 0; i < text.length; i += size) {
-    deltas.push(text.slice(i, i + size))
-  }
-
-  return deltas
+function whole(text: string, theme: MarkdownTheme = THEME): string[] {
+  return new Markdown(text, PAD, 0, theme).render(WIDTH)
 }
 
-const parseWork = () => vi.mocked(ensureEmojiPresentation).mock.calls.reduce((chars, [text]) => chars + text.length, 0)
+/** How many entries the component is holding in caches of its own, counting
+ *  nested ones. */
+function retainedEntries(component: object): number {
+  const count = (value: unknown): number => {
+    if (value instanceof Set) {
+      return value.size
+    }
 
-const live = (text: string) => createElement(StreamingMd, { compact: false, t: DEFAULT_THEME, text })
+    if (!(value instanceof Map)) {
+      return 0
+    }
 
-describe('StreamingMd streaming cost', () => {
-  beforeEach(() => {
-    vi.mocked(ensureEmojiPresentation).mockClear()
-    vi.mocked(highlightLine).mockClear()
+    return [...value.values()].reduce<number>((total, nested) => total + count(nested), value.size)
+  }
+
+  return Object.values(component).reduce<number>((total, value) => total + count(value), 0)
+}
+
+/** Feed `text` one character at a time, comparing every prefix. Returns the
+ *  prefixes that did not match a whole-text render. */
+function mismatchesByCharacter(text: string, theme: MarkdownTheme = THEME): number[] {
+  const component = new StreamingMarkdown('', PAD, theme)
+  const mismatches: number[] = []
+
+  for (let i = 1; i <= text.length; i++) {
+    const prefix = text.slice(0, i)
+
+    component.setText(prefix)
+
+    if (JSON.stringify(component.render(WIDTH)) !== JSON.stringify(whole(prefix, theme))) {
+      mismatches.push(i)
+    }
+  }
+
+  return mismatches
+}
+
+const BOUNDARY_CASES: Record<string, string> = {
+  bracketMath: '\\[\nx + y\n\nz = 2\n\\]\n\nNext paragraph.\n',
+  crlf: 'First.\r\n \t\r\nSecond.\r\n\r\nThird.\r\n',
+  indentedCode: '    const x = 1\n\n    const y = 2\n\nNext paragraph.\n',
+  looseList: '- first\n\n- second\n\n  continued paragraph\n\nNext paragraph.\n',
+  math: '$$\nx + y\n\nz = 2\n$$\n\nNext paragraph.\n',
+  openFence: '````ts\nconst x = 1\n\n~~~\n```\nconst y = 2\n````\n\nNext paragraph.\n',
+  paragraphs: 'First paragraph.\n\nSecond paragraph.\n\nThird paragraph.',
+  quote: '> first\n>\n> second\n\n> continued\n\nNext paragraph.\n',
+  setext: 'A heading\n---\n\nNext paragraph.\n',
+  table: '| a | b |\n|---|---|\n| c | d |\n\nNext paragraph.\n',
+  tildeFence: '~~~ts\nconst x = 1\n\n```\nconst y = 2\n~~~\n\nNext paragraph.\n'
+}
+
+describe('StreamingMarkdown boundaries', () => {
+  for (const [name, text] of Object.entries(BOUNDARY_CASES)) {
+    it(`matches a whole-text Markdown at every prefix: ${name}`, () => {
+      expect(mismatchesByCharacter(text)).toEqual([])
+    })
+  }
+
+  // A link definition resolves document-wide, in both directions, so blocks
+  // that could depend on one are not independent and are not split.
+  const NONLOCAL_CASES: Record<string, string> = {
+    definitionAfterUse: '[label][ref]\n\nAnother paragraph.\n\n[ref]: https://example.com\n',
+    definitionBeforeUse: '[ref]: https://example.com\n\nAnother paragraph.\n\n[label][ref]\n',
+    footnote: 'A claim[^1].\n\nAnother paragraph.\n\n[^1]: the note\n',
+    // An HTML comment swallows the blank line that would otherwise close a
+    // block, so a boundary declared inside one is not a boundary.
+    htmlComment: '<!--\nfirst\n\nsecond\n-->\n\nAfter\n',
+    htmlCommentInline: 'Text <!-- a note\n\nstill the note --> and on.\n\nAfter\n',
+    indentedDefinition: '   [ref]: https://example.com\n\nText.\n\n[label][ref]\n'
+  }
+
+  for (const [name, text] of Object.entries(NONLOCAL_CASES)) {
+    it(`matches a whole-text Markdown at every prefix: ${name}`, () => {
+      expect(mismatchesByCharacter(text)).toEqual([])
+    })
+  }
+
+  it('stops splitting from the delta that opens an HTML comment', () => {
+    const component = new StreamingMarkdown('', PAD, THEME)
+
+    component.setText('First paragraph.\n\nSecond paragraph.\n\n')
+    expect(component.children.length).toBeGreaterThan(1)
+
+    component.setText('First paragraph.\n\nSecond paragraph.\n\n<!--\nnote\n')
+
+    expect(component.children.length).toBe(1)
   })
 
-  it('renders a completed stream exactly like a one-shot <Md>', () => {
-    const text = [
-      '# Title',
-      '',
-      PARA(1),
-      '',
-      '- one\n- two',
-      '',
-      '```ts\nconst a = 1\nconst b = "two"\n```',
-      '',
-      '| k | v |\n|---|---|\n| a | 1 |',
-      '',
-      '> quoted',
-      '',
-      PARA(2)
-    ].join('\n')
-    const streaming = render(live(''))
+  it('stops splitting from the delta that defines a reference', () => {
+    const component = new StreamingMarkdown('', PAD, THEME)
 
-    let buf = ''
+    component.setText('First paragraph.\n\nSecond paragraph.\n\n')
+    expect(component.children.length).toBeGreaterThan(1)
 
-    for (const delta of stream(text, 7)) {
-      buf += delta
-      streaming.rerender(live(buf))
-    }
+    component.setText('First paragraph.\n\nSecond paragraph.\n\n[ref]: https://example.com\n\n[a][ref]\n')
 
-    const oneShot = render(createElement(Md, { compact: false, t: DEFAULT_THEME, text }))
-
-    expect(streaming.lastFrame()).toBe(oneShot.lastFrame())
+    // One `Markdown` again: the already-frozen blocks were given back so the
+    // definition can reach the use.
+    expect(component.children.length).toBe(1)
+    expect(component.render(WIDTH)).toEqual(
+      whole('First paragraph.\n\nSecond paragraph.\n\n[ref]: https://example.com\n\n[a][ref]\n')
+    )
   })
 
-  // CI render time varies; the assertions below bound parsing work independently of wall time.
-  it('re-parses only the tail while the live text is trimmed past the live cap', () => {
-    const text = Array.from({ length: 320 }, (_, i) => PARA(i)).join('\n\n')
-    const deltas = stream(text, 250)
+  it('keeps splitting a reply that only uses a reference nothing defines', () => {
+    const component = new StreamingMarkdown('', PAD, THEME)
 
-    expect(text.length).toBeGreaterThan(LIVE_RENDER_MAX_CHARS * 1.5)
+    component.setText('[label][ref] is literal here.\n\nSecond paragraph.\n\nThird.\n')
 
-    const streaming = render(live(''))
-    let buf = ''
+    expect(component.children.length).toBeGreaterThan(1)
+  })
 
-    for (const delta of deltas) {
-      buf += delta
-      streaming.rerender(live(boundedLiveRenderText(buf)))
+  it('holds a loose list open until a non-list line completes', () => {
+    const component = new StreamingMarkdown('', PAD, THEME)
+
+    component.setText('- one\n\n- two\n\n')
+    expect(component.children.length).toBe(1)
+
+    component.setText('- one\n\n- two\n\nNext.\n')
+    expect(component.children.length).toBe(2)
+  })
+
+  it('never rewrites a block it has already frozen', () => {
+    const component = new StreamingMarkdown('', PAD, THEME)
+
+    component.setText('- one\n\n- two\n\nNext.\n')
+
+    const frozen = component.children[0] as Markdown
+    const lines = frozen.render(WIDTH)
+
+    frozen.setText = () => {
+      throw new Error('a completed block was mutated')
     }
 
-    // Each paragraph is parsed once as a completed block, plus each delta
-    // re-parses the in-flight tail and, past the cap, the trimmed label block.
-    // Re-parsing the whole live window per delta would cost about
-    // deltas * LIVE_RENDER_MAX_CHARS characters (~40x the text length here).
-    expect(parseWork()).toBeLessThan(text.length * 4)
-    expect(vi.mocked(ensureEmojiPresentation).mock.calls.length).toBeLessThan(deltas.length * 6)
-  }, 20_000)
+    component.setText('- one\n\n- two\n\nNext.\nMore.')
 
-  it('highlights each streamed code line a bounded number of times', () => {
-    const lines = Array.from({ length: 120 }, (_, i) => `const value${i} = compute(${i}) + "s"`)
-    const streaming = render(live('```ts\n'))
-    let buf = '```ts\n'
+    expect(component.children[0]).toBe(frozen)
+    expect(frozen.render(WIDTH)).toEqual(lines)
+  })
+})
 
-    for (const line of lines) {
-      buf += `${line}\n`
-      streaming.rerender(live(buf))
+describe('StreamingMarkdown streams', () => {
+  for (const kind of ['default', 'fence', 'long'] as const) {
+    it(`matches a whole-text Markdown throughout the ${kind} benchmark stream`, () => {
+      const deltas = buildStream(kind)
+      const component = new StreamingMarkdown('', PAD, THEME)
+
+      let text = ''
+      let checkpoints = 0
+
+      for (let i = 0; i < deltas.length; i++) {
+        text += deltas[i]
+        component.setText(text)
+
+        if (i % 128 === 127 || i === deltas.length - 1) {
+          checkpoints++
+          expect(component.render(WIDTH)).toEqual(whole(text))
+        }
+      }
+
+      expect(checkpoints).toBeGreaterThan(8)
+
+      // `fence` is one unbroken code block: there is no boundary to split at,
+      // so it degrades to a single block. The other two split.
+      expect(component.children.length > 1).toBe(kind !== 'fence')
+    })
+  }
+})
+
+describe('StreamingMarkdown finish', () => {
+  it('freezes without re-parsing anything', () => {
+    const text = streamText('default')
+    const component = new StreamingMarkdown(text, PAD, THEME)
+    const before = component.render(WIDTH)
+    const children = [...component.children]
+
+    expect(children.length).toBeGreaterThan(1)
+
+    for (const child of children) {
+      ;(child as Markdown).setText = () => {
+        throw new Error('finish() re-parsed a block')
+      }
     }
 
-    streaming.rerender(live(`${buf}\`\`\`\n\ndone`))
+    component.finish()
+    component.finish()
 
-    // Without per-line memoization every delta re-highlights the whole open
-    // fence: about lines^2 / 2 calls.
-    expect(vi.mocked(highlightLine).mock.calls.length).toBeLessThan(lines.length * 4)
+    expect(component.children).toEqual(children)
+    expect(component.render(WIDTH)).toEqual(before)
+    expect(before).toEqual(whole(text))
+  })
+
+  it('rebuilds when the text is replaced after finishing', () => {
+    const component = new StreamingMarkdown('First.\n\nSecond.\n', PAD, THEME)
+
+    component.finish()
+    component.setText('Replacement.\n\nNext.\n')
+
+    expect(component.render(WIDTH)).toEqual(whole('Replacement.\n\nNext.\n'))
+
+    component.finish()
+    component.setText('Reused after finish.')
+
+    expect(component.render(WIDTH)).toEqual(whole('Reused after finish.'))
+  })
+
+  it('rebuilds when the new text is not an extension of the old', () => {
+    const component = new StreamingMarkdown('One.\n\nTwo.\n', PAD, THEME)
+
+    component.setText('Different.\n\nText.\n')
+
+    expect(component.render(WIDTH)).toEqual(whole('Different.\n\nText.\n'))
+  })
+})
+
+describe('StreamingMarkdown code highlighting', () => {
+  /** A highlighter whose answer for a line depends on the lines above it: a
+   *  block comment opened on one line runs until another closes it. Nothing
+   *  can decide that from a single line, which is why the theme's callback is
+   *  handed whole blocks, as pi hands them to it. */
+  function blockAware(): MarkdownTheme {
+    return {
+      ...THEME,
+      highlightCode: (code: string) => {
+        let inComment = false
+
+        return code.split('\n').map(line => {
+          const opens = line.includes('/*')
+          const closes = line.includes('*/')
+          const marked = inComment || opens ? `«${line}»` : line
+
+          inComment = (inComment || opens) && !closes
+
+          return marked
+        })
+      }
+    }
+  }
+
+  it('hands the highlighter whole blocks, so its state spans their lines', () => {
+    const theme = blockAware()
+
+    expect(mismatchesByCharacter('```ts\n/* one\ntwo\nthree */\nfour\n```\n\nAfter.\n', theme)).toEqual([])
+  })
+
+  it('passes the callback the theme supplied through rather than wrapping it', () => {
+    const seen: string[] = []
+    const theme: MarkdownTheme = {
+      ...THEME,
+      highlightCode: (code: string, lang?: string) => {
+        seen.push(`${lang}:${code}`)
+
+        return code.split('\n')
+      }
+    }
+    const component = new StreamingMarkdown('```ts\nconst x = 1\nconst y = 2\n```\n', PAD, theme)
+
+    component.render(WIDTH)
+
+    expect(seen).toContain('ts:const x = 1\nconst y = 2')
+  })
+
+  it('keeps no per-prefix cache while a long line is written', () => {
+    // Memoizing each growing prefix of the line being typed retained
+    // n(n+1)/2 characters and never released them, not even on finish().
+    const theme = blockAware()
+    const component = new StreamingMarkdown('', PAD, theme)
+    const line = 'x'.repeat(2_000)
+
+    for (let i = 1; i <= line.length; i++) {
+      component.setText(`\`\`\`ts\n${line.slice(0, i)}`)
+      component.render(WIDTH)
+    }
+
+    expect(retainedEntries(component)).toBe(0)
+
+    component.finish()
+
+    expect(retainedEntries(component)).toBe(0)
   })
 })

@@ -69,6 +69,18 @@ __pycache__/
 *.pyc
 *.pyo
 
+# The harness's own state inside the workspace. The agent did not write any of
+# it -- the journal writer did, while the turn was running -- so a snapshot that
+# tracks it reports the session transcript and the lock beside it as "files
+# modified last turn", and the next turn is told to go and verify its own
+# bookkeeping. Anchored to the workspace root where the name is ours to claim:
+# ``/sessions`` is the journal directory, and a project's own ``src/sessions``
+# is not. ``.lock`` is unanchored because the locked-append helper puts one
+# beside every file it serialises.
+/sessions/
+.lock/
+/user_memory/outbox.jsonl
+
 # Build / package artifacts
 dist/
 build/
@@ -126,6 +138,33 @@ _GC_EVERY_N_COMMITS = 50
 # "never break a turn" contract. Generous enough that normal cold-init
 # fits comfortably; tight enough to detect a real hang within one turn.
 _GIT_TIMEOUT_SECONDS = 30.0
+
+
+# One commit at a time per shadow repository. A commit is four git invocations
+# over one index (``add -A``, ``diff --cached``, ``commit``, ``rev-parse``), and
+# two turns finishing together -- two lanes of the same TUI, two loops sharing a
+# workspace -- interleave them: the second ``add`` collides with the first's
+# ``index.lock`` and the turn's snapshot silently degrades to nothing, or worse
+# stages half of it and attributes the other lane's files to this turn.
+#
+# Keyed by the resolved shadow path rather than held per instance, because the
+# index belongs to the repository and two services can be pointed at one.
+# The running loop is stored beside the lock: an ``asyncio.Lock`` binds to the
+# loop that first awaits it, and this registry outlives any single loop (a test
+# process runs one loop per test), so a lock from a loop that is gone is
+# replaced rather than raising.
+_COMMIT_LOCKS: dict[Path, tuple[asyncio.AbstractEventLoop, asyncio.Lock]] = {}
+
+
+def _commit_lock(git_dir: Path) -> asyncio.Lock:
+    """The lock that serialises commits against ``git_dir``, for this loop."""
+    loop = asyncio.get_running_loop()
+    held = _COMMIT_LOCKS.get(git_dir)
+    if held is not None and held[0] is loop:
+        return held[1]
+    lock = asyncio.Lock()
+    _COMMIT_LOCKS[git_dir] = (loop, lock)
+    return lock
 
 
 class CheckpointService:
@@ -255,7 +294,18 @@ class CheckpointService:
 
         Returns ``(checkpoint_id, changed_files)``. When nothing changed
         since the last turn, or on any git failure, returns ``(None, [])``.
+
+        Serialised per shadow repository: the four git invocations below share
+        one index, so a concurrent turn's snapshot would collide with this one's
+        ``index.lock``. The second caller waits and then finds its own changes
+        already staged by the first, which reports them as that turn's -- a
+        snapshot is the working tree, and the working tree is shared.
         """
+        async with _commit_lock(self._git_dir):
+            return await self._commit_turn(label)
+
+    async def _commit_turn(self, label: str) -> tuple[str | None, list[str]]:
+        """One snapshot, with the shadow repository's index already claimed."""
         if not await self._ensure_init():
             return None, []
         try:

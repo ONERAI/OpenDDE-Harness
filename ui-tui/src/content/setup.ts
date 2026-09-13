@@ -1,16 +1,6 @@
-import type { PanelSection } from '../types.js'
-
-export const SETUP_REQUIRED_TITLE = 'Setup Required'
-
-export const buildSetupRequiredSections = (): PanelSection[] => [
-  {
-    text: 'OpenDDE Harness needs a model provider before it can start a design session.'
-  },
-  {
-    rows: [
-      ['/model', 'configure provider + model in-place'],
-      ['Ctrl+C', 'exit and run `ddeharness onboard` in a terminal']
-    ],
-    title: 'Actions'
-  }
+/** Shown instead of a session when `setup.status` reports no provider. */
+export const SETUP_REQUIRED_LINES = [
+  'Setup required',
+  'OpenDDE Harness needs a model provider before it can start a design session.',
+  'Press Ctrl+C to exit, then run `ddeharness onboard`.'
 ]

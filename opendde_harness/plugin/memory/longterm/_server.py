@@ -88,6 +88,27 @@ def _lock_path() -> Path:
     return get_data_dir() / "memory-server.lock"
 
 
+#: What a start failure is actually about, when the words a library raised do
+#: not say. The key is what the wizard turns into a sentence and a fix; the
+#: value is what to look for in the error the server died with.
+START_FAILURE_CAUSES = {"inotify": ("inotify instance limit", "[Errno 24]")}
+
+
+def failure_cause(error: str) -> str | None:
+    """Which known cause this start failure is, or ``None``.
+
+    A traceback's last line is the library's words, not the operator's: an
+    OSError about inotify instances is a system limit with a one-line fix, and
+    nothing in the message says so. Naming the cause is what lets the caller
+    say what to do about it.
+    """
+    lowered = error.lower()
+    for cause, markers in START_FAILURE_CAUSES.items():
+        if all(marker.lower() in lowered for marker in markers):
+            return cause
+    return None
+
+
 def server_log_path() -> Path:
     """Where the detached server's stdout and stderr land.
 
@@ -119,22 +140,20 @@ class MemoryNotConfiguredError(RuntimeError):
 def _require_llm_configured() -> None:
     """Refuse to spawn a server that is guaranteed to die on startup.
 
-    The server treats the LLM as a hard requirement: its lifespan provider builds
-    the client eagerly and raises ``LLMNotConfiguredError`` when credentials are
-    missing, which fails FastAPI startup outright. Spawning anyway costs the
-    caller a full poll timeout waiting on a process that already exited, and
-    leaves the real reason only in the server log.
-
-    This is reachable out of the box, not just after a misconfiguration:
-    ``memory.backend`` defaults to the bundled backend in the schema while the
-    shipped config template has ``[llm]`` with an empty ``api_key``.
+    The server treats its ``[llm]`` section as a hard requirement: its lifespan
+    provider builds the client eagerly and raises when the section is empty,
+    which fails FastAPI startup outright. Spawning anyway costs the caller a
+    full poll timeout waiting on a process that already exited, and leaves the
+    real reason only in the server log. The section holds placeholders
+    (``settings.ensure_memory_home`` writes them); a root without them is one
+    the wizard never finished.
     """
-    from opendde_harness.config.update_memory import get_memory_config_path, memory_role_configured
+    from opendde_harness.plugin.memory.longterm.settings import get_memory_config_path, memory_ready
 
-    if memory_role_configured("llm"):
+    if memory_ready():
         return
     raise MemoryNotConfiguredError(
-        f"Long-term memory LLM is not configured: [llm] in {get_memory_config_path()} needs both model and api_key."
+        f"Long-term memory is not set up: {get_memory_config_path()} is missing its [llm] section. Run `ddeharness onboard`."
     )
 
 
@@ -151,7 +170,7 @@ def _memory_executable() -> str:
     opendde pins.
 
     POSIX only -- the memory path is gated off on native Windows by both
-    callers (``onboard_memory._step4_memory`` and ``LongTermMemoryBackend.start``).
+    callers (``onboard.step`` and ``LongTermMemoryBackend.start``).
     """
     sibling = Path(sys.executable).parent / EXECUTABLE
     if sibling.is_file() and os.access(sibling, os.X_OK):
@@ -563,7 +582,8 @@ def _start_server_if_unlocked(base_url: str) -> subprocess.Popen | None:
     the backend talked to another. Writing it makes the root self-describing, and
     both the child and any later reader agree by construction.
     """
-    from opendde_harness.config.update_memory import memory_root, set_memory_api
+    from opendde_harness.config.loader import get_config_path
+    from opendde_harness.plugin.memory.longterm.settings import memory_root, set_memory_api
 
     executable = _memory_executable()
     root = memory_root()
@@ -596,11 +616,12 @@ def _start_server_if_unlocked(base_url: str) -> subprocess.Popen | None:
             _require_written_port(root, want_port)
             log_path = server_log_path()
             log_path.parent.mkdir(parents=True, exist_ok=True)
-            # Start through OpenDDE Harness's tiny runner so the server can select
-            # Responses (default) or Chat Completions from [llm].api_mode without
-            # modifying the third-party package in site-packages.  Keep the
-            # server command-line marker in argv: process ownership and
-            # stale-lock diagnostics deliberately identify that marker.
+            # Start through OpenDDE Harness's tiny runner, which points the
+            # library's LLM seam at the model service before the server is
+            # built, without modifying the third-party package in
+            # site-packages. Keep the server command-line marker in argv:
+            # process ownership and stale-lock diagnostics deliberately
+            # identify that marker.
             python = Path(executable).with_name("python")
             if not python.is_file():
                 python = Path(sys.executable)
@@ -617,6 +638,11 @@ def _start_server_if_unlocked(base_url: str) -> subprocess.Popen | None:
                         *SERVER_CMDLINE.split(),
                         "--root",
                         str(root),
+                        # The config the server's model calls resolve their
+                        # model from: a ``--config`` given to this process is
+                        # in its memory, not its environment.
+                        "--config",
+                        str(get_config_path()),
                     ],
                     stdout=log_file,
                     stderr=subprocess.STDOUT,
@@ -726,6 +752,7 @@ __all__ = [
     "LockHolder",
     "StopOutcome",
     "ensure_memory_server",
+    "failure_cause",
     "lock_holder",
     "stop_pid",
 ]

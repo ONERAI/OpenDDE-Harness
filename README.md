@@ -41,7 +41,7 @@ Use a Linux or macOS client with Python 3.12 or newer. Native Windows is not
 currently supported. Use
 [`uv`](https://docs.astral.sh/uv/getting-started/installation/) to install the
 `opendde-harness` package and its `ddeharness` command in an isolated environment.
-Choose one of the following methods; no environment activation is needed.
+No environment activation is needed.
 
 ### Install from PyPI
 
@@ -57,27 +57,15 @@ To update a PyPI installation, close the TUI and run:
 uv tool upgrade opendde-harness
 ```
 
-### Install from source
-
-Install Git, uv, and Node.js 22 or newer with npm, then run:
-
-```bash
-git clone https://github.com/aurekaresearch/OpenDDE-Harness.git
-cd OpenDDE-Harness
-uv tool install --python 3.12 .
-```
-
-The package build compiles and includes the terminal UI automatically. To update,
-close the TUI, preserve any local edits, and run from the checkout:
-
-```bash
-git pull --ff-only
-uv tool install --python 3.12 --reinstall .
-```
+OpenDDE Harness checks PyPI once a day and says when a newer release is out:
+in the TUI's status bar and once in its transcript at launch, and in
+`ddeharness doctor`. `ddeharness upgrade` runs the update for your kind of
+install (`uv tool upgrade` or `pip install --upgrade`). Set
+`OPENDDE_HARNESS_NO_UPDATE_CHECK=1` to turn the check off.
 
 ### After installation
 
-After either installation, verify the client:
+After installation, verify the client:
 
 ```bash
 ddeharness --version
@@ -140,7 +128,9 @@ Then describe your task:
 
 > Design a VHH against human CRLF2. Verify the target and epitope, keep the framework fixed, and design CDRs. Show the plan and start only after I confirm.
 
-CLI-based design workflows are also supported. See the [CLI usage guide](docs/cli.md).
+See the [terminal UI guide](docs/tui.md) for the screen, commands and keys.
+CLI-based design workflows are also supported. See the
+[CLI usage guide](docs/cli.md).
 For YAML-based runs, see the [complete parameter reference](docs/protein-design-yaml.md)
 and the [CRLF2 staged example](docs/examples/crlf2_scheduled.yaml), which changes
 batch size, strategy weights, population capacity, and parent temperature by cycle interval.

@@ -1,28 +1,37 @@
-"""Curated "common models" shortlist per provider slug.
+"""What a provider can be offered as serving: the model service, then a shortlist.
 
-Hand-maintained on purpose. Provider ``/v1/models`` endpoints return the full
-catalog (OpenRouter alone ships 300+ models) with no "popular"/"common" flag,
-so a small, recognizable default set has to be curated rather than derived.
+The model service is the catalogue. It answers ``models`` with one row per
+model the configured set serves -- pi's own rows for a vendor it carries, the
+entry's own declared list for one it does not -- and that is the source the
+picker and the wizard both read, so the two cannot disagree about what a
+provider offers.
 
-The TUI ``/model`` picker shows this shortlist *after* whatever the user has
-configured in ``config.providers.<slug>.models``; users can always type any
-model id by hand (``model.add_model``), so this list only needs to cover the
-common case, not every model.
-
-Model ids drift as providers ship releases — update this list as needed.
-Providers not listed here fall back to their configured list.
+:data:`COMMON_MODELS` is the offline fallback and nothing else. When the
+service cannot be reached at all -- no Node, no built bundle, a configuration
+it refused -- a curated shortlist is better than an empty list, and it is the
+only thing left that can be answered from this process. A service that answers
+with no rows for a provider is not that case: it means the provider serves
+nothing, and saying so is the honest answer.
 """
 
 from __future__ import annotations
 
-from functools import lru_cache
+import asyncio
+from typing import TYPE_CHECKING, Any
+
+from loguru import logger
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from collections.abc import Sequence
+
+    from opendde_harness.config.schema import Config
 
 COMMON_MODELS: dict[str, list[str]] = {
-    # Carries the "openrouter/" prefix like this provider's default_model does.
-    # Bare OpenRouter ids start with the upstream vendor ("anthropic/...",
-    # "deepseek/..."), which auto-detection reads as a request for that vendor
-    # direct -- so a model picked from this list would quietly leave OpenRouter
-    # as soon as the user also held that vendor's key.
+    # Keyed by pi provider id, and every id carries that same prefix: a stored
+    # model id names its provider, and a shortlist entry is stored as written.
+    # Bare OpenRouter ids start with the upstream vendor ("anthropic/..."),
+    # which is the model id OpenRouter itself serves -- the prefix in front of
+    # it is the gateway.
     "openrouter": [
         "openrouter/anthropic/claude-opus-4.8",
         "openrouter/anthropic/claude-opus-4.7",
@@ -62,14 +71,14 @@ COMMON_MODELS: dict[str, list[str]] = {
         "anthropic/claude-haiku-4-5",
         "anthropic/claude-fable-5",
     ],
-    "gemini": [
-        "gemini/gemini-3.5-flash",
-        "gemini/gemini-2.5-pro",
-        "gemini/gemini-2.5-flash",
-        "gemini/gemini-2.5-flash-lite",
-        "gemini/gemini-3.1-pro-preview",
-        "gemini/gemini-3.1-flash-lite",
-        "gemini/gemini-3-flash-preview",
+    "google": [
+        "google/gemini-3.5-flash",
+        "google/gemini-2.5-pro",
+        "google/gemini-2.5-flash",
+        "google/gemini-2.5-flash-lite",
+        "google/gemini-3.1-pro-preview",
+        "google/gemini-3.1-flash-lite",
+        "google/gemini-3-flash-preview",
     ],
     "groq": [
         "groq/openai/gpt-oss-120b",
@@ -82,15 +91,19 @@ COMMON_MODELS: dict[str, list[str]] = {
         "deepseek/deepseek-v4-flash",
         "deepseek/deepseek-v4-pro",
     ],
-    "minimax_global": [
-        "minimax-global/MiniMax-M3",
-        "minimax-global/MiniMax-M2.7",
-        "minimax-global/MiniMax-M2.7-highspeed",
+    "minimax": [
+        "minimax/MiniMax-M3",
+        "minimax/MiniMax-M2.7",
+        "minimax/MiniMax-M2.7-highspeed",
     ],
-    "minimax_cn": [
+    "minimax-cn": [
         "minimax-cn/MiniMax-M3",
         "minimax-cn/MiniMax-M2.7",
         "minimax-cn/MiniMax-M2.7-highspeed",
+    ],
+    "moonshotai": [
+        "moonshotai/kimi-k2.6",
+        "moonshotai/kimi-k2.5",
     ],
     "zai": [
         "zai/glm-5.2",
@@ -103,144 +116,129 @@ COMMON_MODELS: dict[str, list[str]] = {
         "zai/glm-4.7-flash",
         "zai/glm-4.5-flash",
     ],
-    "dashscope": [
-        "dashscope/qwen-plus",
-        "dashscope/qwen-max",
-        "dashscope/qwen-flash",
-        "dashscope/qwen-turbo",
-        "dashscope/qwen3.5-plus",
-        "dashscope/qwen3.6-plus",
-        "dashscope/qwen3.7-max",
-        "dashscope/qwq-plus",
-        "dashscope/qwen3-coder-plus",
-        "dashscope/qwen3-coder-flash",
-        "dashscope/qwen3-vl-plus",
+    "xai": [
+        "xai/grok-4.3",
+        "xai/grok-4-fast",
     ],
 }
 
 
-def common_models_for(slug: str) -> list[str]:
-    """Return a copy of the curated common-model shortlist for ``slug``."""
-    return list(COMMON_MODELS.get(slug, []))
+def common_models_for(provider: str) -> list[str]:
+    """The curated shortlist for ``provider``, used only when the service is silent.
 
-
-def _is_priced_template(model: str) -> bool:
-    """Is this a price-book row rather than something callable?
-
-    The catalogue doubles as a price list, so it carries entries no request can
-    name: "ft:gpt-4o-..." states what a model fine-tuned from that base costs,
-    and "container" bills a code-interpreter session. Sorted alphabetically they
-    led OpenAI's candidates, so the first dozen rows a user saw were unusable.
+    Hand-maintained on purpose, and read only on the fallback path below: a
+    provider's own ``/v1/models`` returns its whole catalogue (OpenRouter alone
+    ships 300+ rows) with no "popular" flag, so a short recognizable set has to
+    be curated rather than derived. Model ids drift as vendors ship releases.
     """
-    bare = model.split("/", 1)[-1]
-    return bare.startswith("ft:") or bare == "container"
+    return list(COMMON_MODELS.get(provider, []))
 
 
-@lru_cache(maxsize=1)
-def _cached_chat_models_by_provider() -> dict[str, tuple[str, ...]]:
-    """LiteLLM's own catalogue, indexed by the provider it belongs to.
+async def service_rows(config: "Config") -> list[dict[str, Any]]:
+    """Every model the model service serves, pi's own rows, unconverted.
 
-    Built once and cached: reading it imports LiteLLM, which costs about two
-    seconds, so callers must be somewhere a user is already waiting.
-
-    Only ``mode == "chat"`` survives. The catalogue also carries embedding and
-    speech models, and offering those where a chat model is asked for produces a
-    selection that fails on first use.
+    One request for the whole set rather than one per provider: the picker asks
+    about forty-odd providers at once, and grouping the answer here is cheaper
+    than asking forty times. Raises whatever the service raised -- a caller
+    that has a fallback decides what a failure means.
     """
-    from collections import defaultdict
+    from opendde_harness.providers.pi_service import get_service
 
-    from opendde_harness.providers.litellm_setup import import_litellm
-
-    # Whatever table LiteLLM itself is using, deliberately. Forcing the packaged
-    # copy here looked like it bought determinism and did not: setting the
-    # environment variable has no effect once LiteLLM has been imported, so the
-    # answer still depended on import order -- and where it did take effect it
-    # pinned the whole process to a table that is 278 entries behind, which is
-    # how `claude-sonnet-5` (this project's own default) stopped having a known
-    # context window. Candidates now agree with what pricing and context-window
-    # lookups see, which matters more than agreeing across machines.
-    catalogue = import_litellm().model_cost
-
-    by_provider: dict[str, list[str]] = defaultdict(list)
-    for model, info in catalogue.items():
-        if not isinstance(info, dict) or info.get("mode") != "chat":
-            continue
-        if _is_priced_template(model):
-            continue
-        provider = info.get("litellm_provider")
-        if provider:
-            by_provider[provider].append(model)
-    return {provider: tuple(sorted(models)) for provider, models in by_provider.items()}
+    service = await get_service(config)
+    return list(await service.models())
 
 
-def _litellm_chat_models_by_provider() -> dict[str, tuple[str, ...]]:
-    """The cached index, except that an empty one is not what gets cached.
+async def refresh_models(
+    config: "Config", providers: "Sequence[str] | None" = None, *, force: bool = False
+) -> dict[str, str]:
+    """Ask the declared endpoints for their lists again, through the service.
 
-    `lru_cache` remembers whatever the call returned, so an empty result -- from a
-    LiteLLM whose table has not loaded -- would leave every provider without a
-    curated shortlist showing no models at all for the life of the process, with
-    no way to retry. A raised exception needs no such handling: `lru_cache` stores
-    only successful returns, so the next call re-runs on its own.
+    What ``/models`` publishes, fetched now rather than read from the service's
+    last answer. Returns the failures by provider id; the rows are read back
+    with :func:`service_rows`. Raises whatever the service raised.
     """
+    from opendde_harness.providers.pi_service import get_service
+
+    service = await get_service(config)
+    return await service.refresh(list(providers) if providers else None, force=force)
+
+
+async def provider_auth(config: "Config") -> list[dict[str, Any]]:
+    """How each provider signs in, as pi declares it. pi's rows, unconverted.
+
+    One request for the whole set, like :func:`service_rows`, and for the same
+    reason: the picker asks about every provider at once. Raises whatever the
+    service raised, so a caller with a fallback decides what a failure means.
+    """
+    from opendde_harness.providers.pi_service import get_service
+
+    service = await get_service(config)
+    return list(await service.providers())
+
+
+async def _rows_and_close(config: "Config") -> list[dict[str, Any]]:
+    """:func:`service_rows`, then end the service it started.
+
+    Only for :func:`models_for_provider`, which runs its own loop and then lets
+    that loop close. The service is process-wide and would outlive it: the child
+    keeps running with its pipes attached to a loop nobody can reach, the next
+    caller on a live loop has to signal it and start another, and the transport
+    is left to be finalised after its loop has closed -- which raises inside
+    ``__del__``, printing an "Event loop is closed" traceback about an object
+    nobody can still reach. A loop that starts a service closes it.
+    """
+    from opendde_harness.providers.pi_service import shutdown_service
+
     try:
-        index = _cached_chat_models_by_provider()
-    except Exception:
-        return {}
-    if not index:
-        _cached_chat_models_by_provider.cache_clear()
-    return index
+        return await service_rows(config)
+    finally:
+        await shutdown_service()
 
 
-def litellm_models_for(slug: str) -> list[str]:
-    """Chat models LiteLLM knows for this provider, as ids that actually route.
+def rows_for_provider(rows: "Sequence[dict[str, Any]]", provider: str) -> list[dict[str, Any]]:
+    """The rows of ``rows`` this provider serves.
 
-    Looked up by every name the provider answers to, not just its own: LiteLLM
-    files vLLM under "hosted_vllm" and Ollama under "ollama", so a lookup by the
-    section name alone finds nothing for exactly the providers whose curated
-    shortlist is empty.
+    Matched on the provider id outright: the config is keyed by pi's own ids,
+    and so are the service's rows, so there is nothing between the two.
 
-    Ids come back spelled the way LiteLLM would have to receive them. The
-    catalogue is inconsistent -- Moonshot's entries carry their prefix, VolcEngine's
-    do not -- and offering a bare id would route it by keyword rather than to the
-    provider the user picked.
+    The ids in these rows are bare: the service was configured with the id the
+    endpoint serves, so a caller that stores one must qualify it first
+    (``providers.model_id.join``).
     """
-    from opendde_harness.providers.registry import find_by_name, litellm_spelling
+    return [row for row in rows if row.get("provider") == provider]
 
-    spec = find_by_name(slug)
-    if spec is None:
-        # A vendor OpenDDE Harness carries no spec for still has rows in the catalogue --
-        # 51 for Mistral, 219 for Bedrock, 270 for Fireworks. Returning nothing
-        # left those providers with no candidates at all, which pushed the user
-        # into typing a bare id: the shape that gets routed to whoever a keyword
-        # matches.
-        #
-        # The rows are inconsistent about the prefix -- Mistral's carry it,
-        # Bedrock's do not -- so they are normalized here rather than trusted.
-        # Offering an unprefixed one would reintroduce the very thing this exists
-        # to avoid.
-        # The index is keyed by LiteLLM's own spelling, so it has to be read by
-        # that spelling too -- looking it up normalized found nothing for any
-        # vendor LiteLLM hyphenates.
-        index = _litellm_chat_models_by_provider()
-        prefix = litellm_spelling(slug)
-        out: list[str] = []
-        for model in index.get(prefix, ()):
-            bare = model[len(prefix) + 1 :] if model.startswith(f"{prefix}/") else model
-            out.append(f"{prefix}/{bare}")
-        return out
-    from opendde_harness.providers.wire import merge_key, stored_model_id
 
-    index = _litellm_chat_models_by_provider()
-    out: list[str] = []
-    seen: set[str] = set()
-    for route_name in sorted(spec.route_names):
-        for model in index.get(route_name, ()):
-            bare = model.split("/", 1)[1] if "/" in model else model
-            # One spelling for a candidate and for a stored pick, so choosing an
-            # offered model cannot write a second entry for one already listed.
-            full = stored_model_id(spec.name, bare)
-            key = merge_key(spec.name, full)
-            if key not in seen:
-                seen.add(key)
-                out.append(full)
-    return out
+def models_for_provider(config: "Config | None", provider: str) -> list[dict[str, Any]]:
+    """What this provider serves, asked of the service, from synchronous code.
+
+    The one answer the wizard's suggestions and the CLI's model list both read,
+    so neither offers a model the other would refuse. Rows are pi's own dicts;
+    ``id`` is the bare id the endpoint serves and ``name`` its display name.
+
+    Runs its own event loop, so it cannot be called from inside one -- the
+    picker is async and asks :func:`service_rows` directly -- and it ends the
+    service before that loop closes (:func:`_rows_and_close`). Where the
+    question cannot be put to the service at all (no config, a loop already
+    running, a service that will not start) the curated shortlist answers
+    instead, which is the only offline answer there is.
+    """
+
+    def fallback() -> list[dict[str, Any]]:
+        from opendde_harness.providers import model_id
+
+        return [{"id": model_id.bare(model)} for model in common_models_for(provider)]
+
+    if config is None:
+        return fallback()
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+    else:
+        logger.debug("models_for_provider: a loop is already running; answering {} offline", provider)
+        return fallback()
+    try:
+        return rows_for_provider(asyncio.run(_rows_and_close(config)), provider)
+    except Exception as exc:  # noqa: BLE001 - an unreachable service is a fallback, not a failure
+        logger.debug("models_for_provider: the model service could not answer for {} ({})", provider, exc)
+        return fallback()

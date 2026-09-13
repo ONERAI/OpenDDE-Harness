@@ -1,43 +1,26 @@
-"""``cli.dispatch`` RPC handler — in-process EC CLI command runner.
+"""``cli.dispatch`` RPC handler — runs an EC CLI command in-process.
 
-Design summary:
-1. **S1 / D7 contract**: ``argv: list[str]`` + ``width: int`` (required, 20..500)
-   + ``timeout_s: float`` (optional, default 30s). Result is
-   ``{stdout, stderr, exit_code}`` (with optional ``error_code`` only for the
-   in-band -32013 cli_command_failed case — the spec keeps -32013 out-of-band-free).
-2. **S2 dispatch-compat**: ``_is_dispatch_compatible`` reflects
-   ``opendde_harness.cli.commands.app`` (Typer 0.20+) — any registered command
-   that is NOT in ``_DISPATCH_BLACKLIST`` and NOT ``agent``-without-``-m``
-   is accepted. The v0.0.2 hardcoded ``_DISPATCH_WHITELIST`` was removed by
-   ``harness-command-catalog-dynamic`` so CLI rename / new-command churn
-   does not require TUI tuple updates. Interactive Rich widgets remain
-   blocked by the blacklist (``provider login``, the long-running
-   ``compute serve``) + recursive ``tui`` / ``onboard`` wizard.
-3. **S3 ``standalone_mode=False``**: Click library mode — suppresses
-   ``sys.exit()``, surfaces errors as exceptions. We still defensively catch
-   ``SystemExit`` (Typer's ``typer.Exit`` inherits from it).
-4. **S4 ANSI filter**: applied to ``stdout`` / ``stderr`` post-render so the
-   TUI Ink reconciler is never corrupted by cursor movement / clear-screen.
-5. **S5 truecolor**: ``Console(color_system="truecolor")`` prevents 256-color
-   downgrade in non-TTY ``force_terminal`` mode.
-
-Concurrency: a module-level ``asyncio.Lock`` serializes calls — without it,
-overlapping dispatches would race on the monkey-patched module-level
-``console`` references. v0.2 may revisit with per-call Console pools.
-
-Spec disambiguation (specs §4 wins over design.md §3 D7 skeleton):
-- ``-32013 cli_command_failed`` → NOT raised; signaled via ``exit_code != 0``
-  inside ``CliResult``.
-- ``-32014 cli_command_timeout`` and ``-32015 not_dispatch_compatible`` are
-  raised so the dispatcher emits JSON-RPC error frames. (The design.md
-  skeleton mixed both styles; specs §4 is canonical.)
+``argv`` + ``width`` + an optional ``timeout_s`` in, ``{stdout, stderr,
+exit_code}`` out: any command Typer registers that is not in
+``_DISPATCH_BLACKLIST`` is accepted, anything else is refused with -32015, and a
+non-zero exit is reported in ``exit_code`` rather than as an error frame. Click
+runs with ``standalone_mode=False`` so ``typer.Exit`` comes back as a return
+value, and output is rendered through a Rich ``Console`` at the caller's width
+then stripped of ANSI so the TUI's reconciler is not corrupted. Nothing can
+interrupt the Typer app once its thread is running, so ``_dispatch_lock`` and
+the stdout/console redirections belong to the command rather than to the
+awaiting call: a timeout fails the RPC at once but hands both to ``_reap``,
+which releases them only when the thread exits. A dispatch therefore waits for
+the lock no longer than its own ``timeout_s``.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import io
+import threading
 from typing import TYPE_CHECKING
 
 import click
@@ -92,12 +75,40 @@ _DISPATCH_BLACKLIST: set[tuple[str, ...]] = {
 }
 
 
+#: What a command needs instead of the default, where the default is not
+#: enough. Declared here, beside the blacklist, because both answer the same
+#: question -- what a dispatch can host -- and a client that decided this by
+#: name would have to be updated whenever the CLI changes.
+_DISPATCH_TIMEOUTS: dict[tuple[str, ...], float] = {
+    # A first run downloads model weights with parallel workers and checks out
+    # runtime source: minutes on a slow link, and a killed download leaves a
+    # half-prepared weights directory. A later run reads the state file and
+    # returns at once, which is why this is a timeout and not a blacklist.
+    ("compute", "prepare"): 1800.0,
+}
+
+
+def dispatch_timeout(argv: "list[str] | tuple[str, ...]") -> float | None:
+    """Seconds this command needs, or None to use the caller's default."""
+    argv = tuple(argv)
+    for prefix, seconds in _DISPATCH_TIMEOUTS.items():
+        plen = len(prefix)
+        if len(argv) >= plen and argv[:plen] == prefix:
+            return seconds
+    return None
+
+
 # Default timeout if caller did not override.
 _DEFAULT_TIMEOUT_S = 30.0
 
 # Serializes concurrent dispatches so the monkey-patched module-level
 # ``console`` references can't race.
 _dispatch_lock = asyncio.Lock()
+
+
+# asyncio holds only a weak reference to a task, so a reaper lives here until
+# it finishes and drops itself.
+_reapers: set[asyncio.Task] = set()
 
 
 def _is_dispatch_compatible(argv: list[str]) -> bool:
@@ -195,6 +206,67 @@ def _invoke_ec_cli(argv: list[str]) -> int:
     return int(result) if isinstance(result, int) else 0
 
 
+def _start_command_thread(argv: list[str]) -> "asyncio.Future[int]":
+    """Run ``_invoke_ec_cli(argv)`` on a daemon thread; resolve a future with it.
+
+    ``asyncio.to_thread`` would use the loop's default executor, which
+    ``asyncio.run`` joins on the way out, so a command still running at gateway
+    shutdown would hold the process open. The future is never cancelled by the
+    awaiting dispatch: only the thread can end the command, and the reaper still
+    needs its result.
+    """
+    loop = asyncio.get_running_loop()
+    future: "asyncio.Future[int]" = loop.create_future()
+    ctx = contextvars.copy_context()
+
+    def _settle(value: int | None, error: BaseException | None) -> None:
+        if future.done():
+            # Cancelled along with the loop at shutdown — nothing to deliver.
+            return
+        if error is not None:
+            future.set_exception(error)
+        else:
+            future.set_result(int(value or 0))
+
+    def _run() -> None:
+        try:
+            result = ctx.run(_invoke_ec_cli, argv)
+        except BaseException as exc:  # noqa: BLE001 — handed to the awaiter
+            value, error = None, exc
+        else:
+            value, error = result, None
+        try:
+            loop.call_soon_threadsafe(_settle, value, error)
+        except RuntimeError:
+            # Loop already closed (gateway shutdown): no one is left to tell.
+            pass
+
+    threading.Thread(target=_run, name="ec-cli-dispatch", daemon=True).start()
+    return future
+
+
+def _reap(argv: list[str], command: "asyncio.Future[int]", owned: contextlib.ExitStack) -> None:
+    """Hold a walked-away-from command's ownership until its thread exits.
+
+    ``owned`` carries the redirections and injections the command writes through
+    and ``_dispatch_lock`` is still held on entry; both are released once the
+    command is actually gone, so the next dispatch never shares the
+    process-global console patch with one the client already gave up on. A
+    gateway shutdown cancels the reaper and leaves them in place, which is
+    right: the daemon thread may still be writing.
+    """
+
+    async def _reaper() -> None:
+        await asyncio.wait({command})
+        logger.warning("tui_rpc.cli.dispatch: abandoned command finished argv={!r}", argv)
+        owned.close()
+        _dispatch_lock.release()
+
+    task = asyncio.ensure_future(_reaper())
+    _reapers.add(task)
+    task.add_done_callback(_reapers.discard)
+
+
 async def cli_dispatch(params: dict, *, confirm_broker: "ConfirmBroker | None" = None) -> dict:
     """Run an EC CLI command in-process; return ``CliResult``-shaped dict.
 
@@ -209,7 +281,9 @@ async def cli_dispatch(params: dict, *, confirm_broker: "ConfirmBroker | None" =
     Raises:
         ConfigValidationError (-32011): params shape / range invalid.
         NotDispatchCompatibleError (-32015): argv not in whitelist.
-        CliCommandTimeoutError (-32014): command exceeded ``timeout_s``.
+        CliCommandTimeoutError (-32014): command exceeded ``timeout_s``, or
+            never started because another command still holds the lock
+            (``data.started`` tells the two apart).
     """
     # ----- Param validation (Pydantic enforces 20 ≤ width ≤ 500) -----------
     try:
@@ -266,53 +340,91 @@ async def cli_dispatch(params: dict, *, confirm_broker: "ConfirmBroker | None" =
         effective_timeout = timeout_s
 
     # ----- Lock + redirect + inject + invoke -------------------------------
-    async with _dispatch_lock:
-        try:
-            with (
-                contextlib.redirect_stdout(stdout_buf),
-                contextlib.redirect_stderr(stderr_buf),
-                inject_consoles(out_console),
-                confirm_ctx,
-            ):
-                try:
-                    # _invoke_ec_cli returns the command exit code. Click
-                    # under standalone_mode=False catches typer.Exit /
-                    # click.exceptions.Exit and returns the exit_code from
-                    # ``app()`` (not as raised exception). Critical for B1:
-                    # without capturing this return value, all typer.Exit(N)
-                    # paths silently report exit_code=0 to the TUI.
-                    exit_code = await asyncio.wait_for(
-                        asyncio.to_thread(_invoke_ec_cli, argv),
-                        timeout=effective_timeout,
-                    )
-                except click.exceptions.UsageError as exc:
-                    err_console.print(f"[red]Usage:[/] {exc.format_message()}")
-                    exit_code = 2
-                except click.exceptions.Abort:
-                    # C1: a confirm hit the EOF dispatch stdin (no round-trip
-                    # available). Abort is a RuntimeError subclass, NOT a
-                    # ClickException, so without this it falls to the broad
-                    # catch below as a useless "Internal error: Abort".
-                    err_console.print("[yellow]This command needs confirmation; re-run with --yes.[/]")
-                    exit_code = 1
-                except click.exceptions.ClickException as exc:
-                    err_console.print(f"[red]Error:[/] {exc.format_message()}")
-                    exit_code = 1
-        except asyncio.TimeoutError as exc:
-            logger.warning("tui_rpc.cli.dispatch: timeout after {}s argv={!r}", timeout_s, argv)
+    # The lock and the contexts below belong to the command, not to this await:
+    # on timeout or cancellation they are handed to ``_reap`` instead of being
+    # unwound under a thread that is still writing through them. ``owned`` is
+    # that hand-off unit, entered in the same order the old nested ``with``
+    # used. An abandoned command can hold the lock for as long as it keeps
+    # running, so the wait for it gets this caller's own timeout: a queued
+    # command must not outlive the deadline its caller declared.
+    try:
+        await asyncio.wait_for(_dispatch_lock.acquire(), timeout_s)
+    except TimeoutError:  # asyncio.TimeoutError is this same class on 3.11+
+        raise CliCommandTimeoutError(
+            "another command is still running; try again when it finishes",
+            data={"argv": argv, "timeout_s": timeout_s, "started": False},
+        ) from None
+
+    owned = contextlib.ExitStack()
+    command: "asyncio.Future[int] | None" = None
+    handed_off = False
+    try:
+        owned.enter_context(contextlib.redirect_stdout(stdout_buf))
+        owned.enter_context(contextlib.redirect_stderr(stderr_buf))
+        owned.enter_context(inject_consoles(out_console))
+        owned.enter_context(confirm_ctx)
+        command = _start_command_thread(argv)
+        # ``asyncio.wait`` rather than ``wait_for``: a timeout must not cancel
+        # the future, because the reaper still needs its result.
+        done, _pending = await asyncio.wait({command}, timeout=effective_timeout)
+        if not done:
+            logger.warning(
+                "tui_rpc.cli.dispatch: timeout after {}s argv={!r}; command still running, "
+                "holding the dispatch lock and output capture until it exits",
+                timeout_s,
+                argv,
+            )
+            _reap(argv, command, owned)
+            handed_off = True
             raise CliCommandTimeoutError(
                 f"command exceeded {timeout_s}s timeout",
-                data={"argv": argv, "timeout_s": timeout_s},
-            ) from exc
-        except (CliCommandTimeoutError, NotDispatchCompatibleError, ConfigValidationError):
-            # Re-raise RPC errors unchanged (timeout above is the main path
-            # here; the others can't actually be raised inside this block,
-            # but defensively preserve them).
-            raise
-        except Exception as exc:  # noqa: BLE001 — last-resort catch
-            logger.exception("tui_rpc.cli.dispatch: unexpected error in argv={!r}", argv)
-            err_console.print(f"[red]Internal error:[/] {type(exc).__name__}: {exc}")
+                data={"argv": argv, "timeout_s": timeout_s, "started": True},
+            )
+        try:
+            # _invoke_ec_cli returns the command exit code. Click
+            # under standalone_mode=False catches typer.Exit /
+            # click.exceptions.Exit and returns the exit_code from
+            # ``app()`` (not as raised exception). Critical for B1:
+            # without capturing this return value, all typer.Exit(N)
+            # paths silently report exit_code=0 to the TUI.
+            exit_code = command.result()
+        except click.exceptions.UsageError as exc:
+            err_console.print(f"[red]Usage:[/] {exc.format_message()}")
+            exit_code = 2
+        except click.exceptions.Abort:
+            # C1: a confirm hit the EOF dispatch stdin (no round-trip
+            # available). Abort is a RuntimeError subclass, NOT a
+            # ClickException, so without this it falls to the broad
+            # catch below as a useless "Internal error: Abort".
+            err_console.print("[yellow]This command needs confirmation; re-run with --yes.[/]")
             exit_code = 1
+        except click.exceptions.ClickException as exc:
+            err_console.print(f"[red]Error:[/] {exc.format_message()}")
+            exit_code = 1
+    except asyncio.CancelledError:
+        # The caller went away (client disconnect / server teardown). Same rule
+        # as the timeout: the command owns the contexts until its thread ends.
+        if command is not None and not command.done():
+            logger.warning(
+                "tui_rpc.cli.dispatch: cancelled with the command still running argv={!r}",
+                argv,
+            )
+            _reap(argv, command, owned)
+            handed_off = True
+        raise
+    except (CliCommandTimeoutError, NotDispatchCompatibleError, ConfigValidationError):
+        # Re-raise RPC errors unchanged (timeout above is the main path
+        # here; the others can't actually be raised inside this block,
+        # but defensively preserve them).
+        raise
+    except Exception as exc:  # noqa: BLE001 — last-resort catch
+        logger.exception("tui_rpc.cli.dispatch: unexpected error in argv={!r}", argv)
+        err_console.print(f"[red]Internal error:[/] {type(exc).__name__}: {exc}")
+        exit_code = 1
+    finally:
+        if not handed_off:
+            owned.close()
+            _dispatch_lock.release()
 
     # ----- Apply ANSI filter and return ------------------------------------
     return {

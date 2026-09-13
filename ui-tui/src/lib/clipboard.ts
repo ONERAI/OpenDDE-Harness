@@ -1,155 +1,55 @@
 // SPDX-License-Identifier: MIT
 // Portions Copyright (c) 2025 Nous Research (hermes-agent, MIT).
 // Modifications Copyright (c) 2026 EverMind.
-// See NOTICES.md and LICENSES/MIT-hermes-agent.txt.
+// See LICENSES/README.md and LICENSES/MIT-hermes-agent.txt.
+//
+// Writing to the system clipboard. Native helpers first, OSC 52 as the fallback
+// that also works over ssh.
 
-import { execFile, spawn } from 'node:child_process'
-import { promisify } from 'node:util'
+import type { spawn as SpawnFn } from 'node:child_process'
 
-const execFileAsync = promisify(execFile)
-const CLIPBOARD_MAX_BUFFER = 4 * 1024 * 1024
-const POWERSHELL_ARGS = ['-NoProfile', '-NonInteractive', '-Command', 'Get-Clipboard -Raw'] as const
+import { spawn } from 'node:child_process'
 
-type ClipboardRun = typeof execFileAsync
-
-export function isUsableClipboardText(text: null | string): text is string {
-  if (!text || !/[^\s]/.test(text)) {
-    return false
-  }
-
-  if (text.includes('\u0000')) {
-    return false
-  }
-
-  let suspicious = 0
-
-  for (const ch of text) {
-    const code = ch.charCodeAt(0)
-    const isControl = code < 0x20 && ch !== '\n' && ch !== '\r' && ch !== '\t'
-
-    if (isControl || ch === '\ufffd') {
-      suspicious += 1
-    }
-  }
-
-  return suspicious <= Math.max(2, Math.floor(text.length * 0.02))
+interface ClipboardCommand {
+  args: readonly string[]
+  cmd: string
 }
 
-function readClipboardCommands(
-  platform: NodeJS.Platform,
-  env: NodeJS.ProcessEnv
-): Array<{ args: readonly string[]; cmd: string }> {
+const SET_CLIPBOARD = ['-NoProfile', '-NonInteractive', '-Command', 'Set-Clipboard -Value $input'] as const
+
+function writers(platform: NodeJS.Platform, env: NodeJS.ProcessEnv): ClipboardCommand[] {
   if (platform === 'darwin') {
-    return [{ cmd: 'pbpaste', args: [] }]
+    return [{ args: [], cmd: 'pbcopy' }]
   }
 
   if (platform === 'win32') {
-    return [{ cmd: 'powershell', args: POWERSHELL_ARGS }]
+    return [{ args: SET_CLIPBOARD, cmd: 'powershell' }]
   }
 
-  const attempts: Array<{ args: readonly string[]; cmd: string }> = []
+  const attempts: ClipboardCommand[] = []
 
   if (env.WSL_INTEROP || env.WSL_DISTRO_NAME) {
-    attempts.push({ cmd: 'powershell.exe', args: POWERSHELL_ARGS })
+    attempts.push({ args: SET_CLIPBOARD, cmd: 'powershell.exe' })
   }
 
   if (env.WAYLAND_DISPLAY) {
-    attempts.push({ cmd: 'wl-paste', args: ['--type', 'text'] })
+    attempts.push({ args: ['--type', 'text/plain'], cmd: 'wl-copy' })
   }
 
-  attempts.push({ cmd: 'xclip', args: ['-selection', 'clipboard', '-out'] })
+  attempts.push({ args: ['-selection', 'clipboard', '-in'], cmd: 'xclip' })
+  attempts.push({ args: ['--clipboard', '--input'], cmd: 'xsel' })
 
   return attempts
 }
 
-/**
- * Read plain text from the system clipboard.
- *
- * Uses native platform tools in fallback order:
- * - macOS: pbpaste
- * - Windows: PowerShell Get-Clipboard -Raw
- * - WSL: powershell.exe Get-Clipboard -Raw
- * - Linux Wayland: wl-paste --type text
- * - Linux X11: xclip -selection clipboard -out
- */
-export async function readClipboardText(
-  platform: NodeJS.Platform = process.platform,
-  run: ClipboardRun = execFileAsync,
-  env: NodeJS.ProcessEnv = process.env
-): Promise<string | null> {
-  for (const attempt of readClipboardCommands(platform, env)) {
-    try {
-      const result = await run(attempt.cmd, [...attempt.args], {
-        encoding: 'utf8',
-        maxBuffer: CLIPBOARD_MAX_BUFFER,
-        windowsHide: true
-      })
-
-      if (typeof result.stdout === 'string') {
-        return result.stdout
-      }
-    } catch {
-      // Fall through to the next clipboard backend.
-    }
-  }
-
-  return null
-}
-
-function writeClipboardCommands(
-  platform: NodeJS.Platform,
-  env: NodeJS.ProcessEnv
-): Array<{ args: readonly string[]; cmd: string }> {
-  if (platform === 'darwin') {
-    return [{ cmd: 'pbcopy', args: [] }]
-  }
-
-  if (platform === 'win32') {
-    return [{ cmd: 'powershell', args: ['-NoProfile', '-NonInteractive', '-Command', 'Set-Clipboard -Value $input'] }]
-  }
-
-  const attempts: Array<{ args: readonly string[]; cmd: string }> = []
-
-  if (env.WSL_INTEROP || env.WSL_DISTRO_NAME) {
-    attempts.push({
-      cmd: 'powershell.exe',
-      args: ['-NoProfile', '-NonInteractive', '-Command', 'Set-Clipboard -Value $input']
-    })
-  }
-
-  if (env.WAYLAND_DISPLAY) {
-    attempts.push({ cmd: 'wl-copy', args: ['--type', 'text/plain'] })
-  }
-
-  attempts.push({ cmd: 'xclip', args: ['-selection', 'clipboard', '-in'] })
-  attempts.push({ cmd: 'xsel', args: ['--clipboard', '--input'] })
-
-  return attempts
-}
-
-/**
- * Write plain text to the system clipboard.
- *
- * Tries native platform tools in fallback order:
- * - macOS: pbcopy
- * - Windows: PowerShell Set-Clipboard
- * - WSL: powershell.exe Set-Clipboard
- * - Linux Wayland: wl-copy --type text/plain
- * - Linux X11: xclip -selection clipboard -in
- * - Linux X11 alt: xsel --clipboard --input
- *
- * Returns true if at least one backend succeeded, false otherwise
- * (callers should fall back to OSC52 on false).
- */
+/** True when a native clipboard tool took the text. Callers fall back to OSC 52. */
 export async function writeClipboardText(
   text: string,
   platform: NodeJS.Platform = process.platform,
-  start: typeof spawn = spawn,
+  start: typeof SpawnFn = spawn,
   env: NodeJS.ProcessEnv = process.env
 ): Promise<boolean> {
-  const candidates = writeClipboardCommands(platform, env)
-
-  for (const { cmd, args } of candidates) {
+  for (const { args, cmd } of writers(platform, env)) {
     try {
       const ok = await new Promise<boolean>(resolve => {
         const child = start(cmd, [...args], { stdio: ['pipe', 'ignore', 'ignore'], windowsHide: true })
@@ -163,9 +63,134 @@ export async function writeClipboardText(
         return true
       }
     } catch {
-      // Fall through to the next clipboard backend.
+      // Try the next backend.
     }
   }
 
   return false
+}
+
+function readers(platform: NodeJS.Platform, env: NodeJS.ProcessEnv): ClipboardCommand[] {
+  if (platform === 'darwin') {
+    return [{ args: [], cmd: 'pbpaste' }]
+  }
+
+  if (platform === 'win32') {
+    return [{ args: ['-NoProfile', '-NonInteractive', '-Command', 'Get-Clipboard'], cmd: 'powershell' }]
+  }
+
+  const attempts: ClipboardCommand[] = []
+
+  if (env.WSL_INTEROP || env.WSL_DISTRO_NAME) {
+    attempts.push({ args: ['-NoProfile', '-NonInteractive', '-Command', 'Get-Clipboard'], cmd: 'powershell.exe' })
+  }
+
+  if (env.WAYLAND_DISPLAY) {
+    attempts.push({ args: ['--no-newline'], cmd: 'wl-paste' })
+  }
+
+  attempts.push({ args: ['-selection', 'clipboard', '-out'], cmd: 'xclip' })
+  attempts.push({ args: ['--clipboard', '--output'], cmd: 'xsel' })
+
+  return attempts
+}
+
+/**
+ * How long one clipboard helper gets to answer.
+ *
+ * `xclip` in particular is famous for hanging: it can start, own the X
+ * selection and never exit, in which case it emits neither `error` nor
+ * `close`. Paste is a keystroke, so a helper that has not answered by now has
+ * already failed as far as the user is concerned.
+ */
+export const NATIVE_CLIPBOARD_TIMEOUT_MS = 600
+
+/**
+ * What a native clipboard tool holds, or null when none of them answered.
+ *
+ * Null is the normal answer over ssh with no forwarded display: the clipboard
+ * the user copied into belongs to their terminal, not to this host. That is
+ * what the OSC 52 read is for, and it is the reason every attempt here is on a
+ * deadline — a helper that hangs would otherwise take the fallback down with
+ * it and paste would simply do nothing, forever.
+ */
+export async function readClipboardText(
+  platform: NodeJS.Platform = process.platform,
+  start: typeof SpawnFn = spawn,
+  env: NodeJS.ProcessEnv = process.env,
+  timeoutMs: number = NATIVE_CLIPBOARD_TIMEOUT_MS
+): Promise<null | string> {
+  for (const { args, cmd } of readers(platform, env)) {
+    try {
+      const text = await new Promise<null | string>(resolve => {
+        const child = start(cmd, [...args], { stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true })
+        let out = ''
+        let done = false
+
+        const settle = (value: null | string) => {
+          if (done) {
+            return
+          }
+
+          done = true
+          clearTimeout(timer)
+          resolve(value)
+        }
+
+        const timer = setTimeout(() => {
+          // Take the listeners off before killing it: the `close` this
+          // provokes belongs to a read nobody is waiting for any more.
+          child.stdout?.removeAllListeners('data')
+          child.removeAllListeners('error')
+          child.removeAllListeners('close')
+          child.once('error', () => {})
+
+          try {
+            child.kill('SIGKILL')
+          } catch {
+            // It is already gone, which is the outcome we wanted.
+          }
+
+          settle(null)
+        }, timeoutMs)
+
+        timer.unref?.()
+
+        child.stdout?.setEncoding('utf8')
+        child.stdout?.on('data', (chunk: string) => {
+          out += chunk
+        })
+        child.once('error', () => settle(null))
+        child.once('close', code => settle(code === 0 ? out : null))
+      })
+
+      if (text !== null && text !== '') {
+        return text
+      }
+    } catch {
+      // Try the next backend.
+    }
+  }
+
+  return null
+}
+
+/** The OSC 52 copy sequence, wrapped for tmux/screen when we are inside one. */
+export function osc52Sequence(text: string, env: NodeJS.ProcessEnv = process.env): string {
+  const sequence = `\x1b]52;c;${Buffer.from(text, 'utf8').toString('base64')}\x07`
+
+  if (env.TMUX) {
+    return `\x1bPtmux;${sequence.split('\x1b').join('\x1b\x1b')}\x1b\\`
+  }
+
+  if (env.STY) {
+    return `\x1bP${sequence}\x1b\\`
+  }
+
+  return sequence
+}
+
+/** Ask the terminal itself to hold the text. Works over ssh; not every terminal obeys. */
+export function writeOsc52Clipboard(text: string, out: { write(data: string): unknown } = process.stdout): void {
+  out.write(osc52Sequence(text))
 }

@@ -10,7 +10,7 @@ if TYPE_CHECKING:
 __all__ = ["AgentLoop", "ContextBuilder", "MemoryStore"]
 
 # Lazy re-exports (PEP 562): importing a ``opendde_harness.agent`` submodule must not
-# eagerly construct ``AgentLoop`` -> litellm, which dominates CLI cold start.
+# eagerly construct ``AgentLoop`` and everything the provider layer pulls in.
 _LAZY_EXPORTS = {
     "ContextBuilder": "opendde_harness.agent.context",
     "AgentLoop": "opendde_harness.agent.loop",

@@ -9,16 +9,20 @@ Two policies the router enforces (not its sources):
   cross-source merge candidate even if it would never be a top-3 by
   itself. Default factor is 2 — twice the requested ``k``.
 
-- **Single-source failure isolation.** A source that raises (network
-  blip on Mass HTTP, memory service HTTP down) is caught inside
-  :meth:`_safe_search` and turns into an empty list for that round.
-  The other sources still feed RRF so the router never produces a
-  whole-pipeline failure because of one transient.
+- **Single-source failure isolation.** A source that raises (memory
+  service HTTP down) is caught inside :meth:`_safe_search` and turns
+  into an empty list for that round. The other sources still feed RRF so
+  the router never produces a whole-pipeline failure because of one
+  transient.
+
+:meth:`select` is the narrowing path, used when the catalogue is too
+large to advertise whole; :meth:`full_catalogue` is the other, and it
+runs no query at all.
 
 The router's source list is **fixed at construction**. Per the design
-decision, sources are internal and hardcoded (Local + Mass + Memory
-arrive in SR-3 / SR-4); third-party skill retrieval extension goes
-through :class:`MemoryBackend` rather than through new SkillSource
+decision, sources are internal and hardcoded (Local + Memory);
+third-party skill retrieval extension goes through
+:class:`MemoryBackend` rather than through new SkillSource
 implementations.
 """
 
@@ -70,6 +74,24 @@ class SkillForgeRouter:
             dedup_by=self._dedup_by,
             rrf_k=self._rrf_k,
         )
+
+    def full_catalogue(self, limit: int) -> list[RouterHit] | None:
+        """The whole catalogue when it is small enough to advertise whole.
+
+        Only a local-only router can answer this: a memory source is a
+        remote recall, not an enumerable pool, so with one wired there is
+        no complete catalogue to list and :meth:`select` narrows instead.
+        ``None`` means "too large, or not enumerable" — never "empty".
+        """
+        from opendde_harness.memory_engine.skill_forge.local_source import LocalSkillSource
+
+        if len(self._sources) != 1 or not isinstance(self._sources[0], LocalSkillSource):
+            return None
+        try:
+            return self._sources[0].full_catalogue(limit)
+        except Exception:
+            logger.warning("local skill catalogue unavailable; narrowing by retrieval instead", exc_info=True)
+            return None
 
     async def _safe_search(
         self,

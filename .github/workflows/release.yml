@@ -72,10 +72,11 @@ jobs:
           whl = sorted(glob.glob("release/packages/*.whl"))[-1]
           archive = zipfile.ZipFile(whl)
           names = archive.namelist()
-          assert "opendde_harness/ui-tui/dist/entry.js" in names, "entry.js missing from wheel"
+          bundles = ["entry.js", "model-service.js"]  # BUNDLES in hatch_build.py
+          shipped = [f"opendde_harness/ui-tui/dist/{b}" for b in bundles]
           assert not any("node_modules" in n for n in names), "node_modules leaked into wheel"
-          ui = [n for n in names if "ui-tui/" in n]
-          assert ui == ["opendde_harness/ui-tui/dist/entry.js"], f"unexpected ui-tui entries: {ui}"
+          ui = sorted(n for n in names if "ui-tui/" in n)
+          assert ui == sorted(shipped), f"unexpected ui-tui entries: {ui}"
           entries = next(n for n in names if n.endswith(".dist-info/entry_points.txt"))
           config = configparser.ConfigParser()
           config.read_string(archive.read(entries).decode())
@@ -86,8 +87,13 @@ jobs:
           assert not any(n.startswith(("external/opendde/", "external/ligandmpnn/", "external/plip/", "external/foldmason/")) for n in names), "upstream checkout leaked into wheel"
           assert not any(n.endswith((".pt", ".ckpt", ".safetensors")) for n in names), "model weights leaked into wheel"
           with tarfile.open(glob.glob("release/packages/*.tar.gz")[0]) as sdist:
-              assert any(n.count("/") == 1 and n.endswith("/CHANGELOG.md") for n in sdist.getnames()), "CHANGELOG.md missing from sdist"
-          print(f"OK: {whl} ships only entry.js under ui-tui/, no node_modules; sdist includes CHANGELOG.md")
+              sdist_names = sdist.getnames()
+          assert any(n.count("/") == 1 and n.endswith("/CHANGELOG.md") for n in sdist_names), "CHANGELOG.md missing from sdist"
+          # uv builds the wheel from the sdist: a bundle missing here is missing
+          # from the wheel a `pip install <sdist>` produces.
+          for bundle in bundles:
+              assert any(n.endswith(f"/ui-tui/dist/{bundle}") for n in sdist_names), f"{bundle} missing from sdist"
+          print(f"OK: {whl} ships {', '.join(bundles)} and no node_modules; the sdist carries them and CHANGELOG.md")
           PY
 
       - name: Export locked constraints and checksums

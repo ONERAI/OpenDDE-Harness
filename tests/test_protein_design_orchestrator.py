@@ -444,8 +444,10 @@ class ToolCall:
         self.arguments = arguments
         self.id = call_id
 
-    def to_openai_tool_call(self) -> dict[str, Any]:
-        return {"id": self.id, "function": {"name": self.name, "arguments": "{}"}}
+    def to_pi_tool_call(self) -> dict[str, Any]:
+        from opendde_harness.providers.messages import tool_call_block
+
+        return tool_call_block(self.id, self.name, self.arguments)
 
 
 class Response:
@@ -453,6 +455,9 @@ class Response:
         self.content = content
         self.tool_calls = tool_calls or []
         self.finish_reason = "stop"
+        # A double, not the model service: no pi message to replay, so the
+        # session builds the assistant turn from the fields beside it.
+        self.pi_message = None
 
 
 class SkillLoopProvider:
@@ -543,8 +548,10 @@ def test_structured_session_widens_the_budget_when_the_model_runs_out_of_tokens(
     class TruncatedThenAnswer:
         def __init__(self) -> None:
             self.budgets: list[int] = []
+            self.requests: list[dict[str, Any]] = []
 
         async def chat_with_retry(self, **kwargs: Any) -> Response:
+            self.requests.append(kwargs)
             self.budgets.append(int(kwargs["max_tokens"]))
             if len(self.budgets) == 1:
                 response = Response(content="")
@@ -557,7 +564,14 @@ def test_structured_session_widens_the_budget_when_the_model_runs_out_of_tokens(
     result = asyncio.run(session.run(AGENT_PROFILES[AgentRole.ANALYZE], "prompt"))
 
     assert result.report == "ok"
-    assert provider.budgets == [8192, 16384]
+    assert provider.budgets == [16384, 32768]
+    # And no sampling temperature on either request. The agent profile carried
+    # one and sent it on every call, so a design task launched from a Codex
+    # conversation died on "Unsupported parameter: temperature". A temperature
+    # is declared on the model's own row and read by the provider; no caller
+    # names one.
+    assert provider.requests, "the session called the provider"
+    assert all("temperature" not in request for request in provider.requests), provider.requests
 
 
 # --- config loading -------------------------------------------------------------------
@@ -576,6 +590,65 @@ def test_bundled_example_configs_still_normalize() -> None:
         assert config.target
         assert config.binder_chains
         assert math.isfinite(float(config.seed))
+
+
+def test_a_yaml_llm_temperature_reaches_no_request(tmp_path) -> None:
+    """`llm.temperature` in a task file is not a setting any more.
+
+    It was read into ``WorkflowConfig.llm_temperature``, travelled as tool
+    metadata and became a ``temperature=`` on every design call -- including
+    calls to a Codex model, which answers "Unsupported parameter: temperature"
+    and fails the turn. The key still loads so an existing file is not rejected,
+    and nothing reads it: a sampling temperature belongs to the model's row in
+    the harness config.
+    """
+    import json as json_module
+    from pathlib import Path
+
+    import yaml
+
+    from opendde_harness.plugin.protein_design.agents.phases import ProteinDesignPhases
+    from opendde_harness.plugin.protein_design.agents.profiles import AGENT_PROFILES, AgentRole
+    from opendde_harness.plugin.protein_design.agents.session import OpenDDEHarnessStructuredSession
+    from opendde_harness.plugin.protein_design.core.runtime import WorkflowConfigLoader
+    from opendde_harness.plugin.protein_design.tools.agent import ToolContext
+
+    source = Path("docs/examples") / "crlf2_quickstart.yaml"
+    if not source.is_file():
+        pytest.skip(f"{source} is not present")
+    data = yaml.safe_load(source.read_text())
+    data["llm"] = {"model_name": "openai-codex/gpt-5.6-luna", "temperature": 0.7}
+    task_file = tmp_path / "task.yaml"
+    task_file.write_text(yaml.safe_dump(data), encoding="utf-8")
+
+    config = WorkflowConfigLoader.config_from_path(str(task_file))
+
+    assert config.llm_model == "openai-codex/gpt-5.6-luna", "the model is still a task setting"
+    assert not hasattr(config, "llm_temperature"), "the field is gone, not merely unused"
+    metadata = ProteinDesignPhases._tool_metadata(config)
+    assert "llm_temperature" not in metadata
+
+    class Recorder:
+        def __init__(self) -> None:
+            self.requests: list[dict[str, Any]] = []
+
+        async def chat_with_retry(self, **kwargs: Any) -> Response:
+            self.requests.append(kwargs)
+            return Response(content=json_module.dumps({"downstream_header": "epitope", "report": "ok"}))
+
+    provider = Recorder()
+    session = OpenDDEHarnessStructuredSession(provider, "fallback-model", max_attempts=1)
+    result = asyncio.run(
+        session.run(
+            AGENT_PROFILES[AgentRole.ANALYZE],
+            "prompt",
+            tool_context=ToolContext(metadata=metadata),
+        )
+    )
+
+    assert result.report == "ok"
+    assert provider.requests[0]["model"] == "openai-codex/gpt-5.6-luna"
+    assert "temperature" not in provider.requests[0], provider.requests[0]
 
 
 # --- optional external services ---------------------------------------------------------
@@ -688,8 +761,10 @@ def test_design_agent_returns_its_reasoning_with_the_tool_turn() -> None:
     result = asyncio.run(session.run(AGENT_PROFILES[AgentRole.ANALYZE], "prompt", skills=skills))
 
     assert result.report == "ok"
+    from opendde_harness.providers.messages import thinking_of
+
     assistant = [message for message in sent[-1] if message["role"] == "assistant"]
-    assert assistant and assistant[0]["reasoning_content"] == "deciding which skill to load"
+    assert assistant and thinking_of(assistant[0]) == "deciding which skill to load"
 
 
 @pytest.mark.parametrize("gate_passed", [True, False])

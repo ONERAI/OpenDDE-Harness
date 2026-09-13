@@ -14,10 +14,9 @@ from opendde_harness.plugin.protein_design.tools import control
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_SKILLS = REPO_ROOT / "opendde_harness" / "plugin" / "protein_design" / "skills"
-EXEC_DESCRIPTION = (
-    "Execute a shell command on the Harness client host and return its output. "
-    "Protein Design models run through their configured compute service; this shell does not enter that container. "
-    "Use protein_design_context and the Protein Design tools for model execution."
+PLUGIN_NOTE = (
+    "Protein Design models run through their configured compute service; this shell does not enter "
+    "that container. Use protein_design_context and the Protein Design tools for model execution."
 )
 CONTROL_TOOLS = (
     "protein_design_context",
@@ -38,8 +37,7 @@ def test_plugin_is_active_with_its_data_contributions():
     assert [plugin_id for plugin_id, _ in registry.readiness_checks()] == ["protein-design"]
 
 
-def test_identity_prompt_keeps_the_antibody_block_in_place(tmp_path, monkeypatch):
-    monkeypatch.setattr(render, "_language_directive", lambda: "")
+def test_identity_prompt_keeps_the_antibody_block_in_place(tmp_path):
     text = render.identity_text(tmp_path, model="openai/gpt-x")
     head = "# OpenDDE Harness ϒ\n\nYou are OpenDDE Harness, an antibody design assistant.\n\n## Scope\n"
     assert text.startswith(head)
@@ -63,49 +61,36 @@ def test_scope_only_names_tools_the_plugin_registers():
     assert set(re.findall(r"protein_design_\w+", antibody_scope())) <= registered
 
 
-def test_language_directive_sits_between_identity_and_scope(tmp_path, monkeypatch):
-    monkeypatch.setattr(render, "_language_directive", lambda: "\nAlways respond in Simplified Chinese.\n")
-    text = render.identity_text(tmp_path, model="openai/gpt-x")
-    assert "antibody design assistant.\n\nAlways respond in Simplified Chinese.\n\n## Scope" in text
+def test_language_directive_sits_between_identity_and_scope(tmp_path):
+    text = render.identity_text(tmp_path, model="openai/gpt-x", language="zh")
+    assert "antibody design assistant.\n\nAlways respond in Simplified Chinese (简体中文)" in text
+    assert "another language.\n\n## Scope" in text
+    assert "简体中文" not in render.identity_text(tmp_path, model="openai/gpt-x")
 
 
-def test_workspace_block_lists_memory_files_only_when_memory_is_enabled(tmp_path, monkeypatch):
-    monkeypatch.setattr(render, "_language_directive", lambda: "")
+def test_workspace_block_lists_memory_files_only_when_memory_is_enabled(tmp_path):
     skills_line = f"- Custom skills: {tmp_path}/skills/{{skill-name}}/SKILL.md"
 
-    monkeypatch.setattr(render, "_long_term_memory_enabled", lambda: False)
-    off = render.identity_text(tmp_path, model="openai/gpt-x")
+    off = render.identity_text(tmp_path, model="openai/gpt-x", long_term_memory=False)
     assert f"## Workspace\nYour workspace is at: {tmp_path}\n{skills_line}\n\n" in off
     assert "user_memory" not in off
 
-    monkeypatch.setattr(render, "_long_term_memory_enabled", lambda: True)
-    on = render.identity_text(tmp_path, model="openai/gpt-x")
+    on = render.identity_text(tmp_path, model="openai/gpt-x", long_term_memory=True)
     assert f"- User profile: {tmp_path}/user_memory/profile/user.md" in on
     assert f"- Episodic log: {tmp_path}/user_memory/episodic/episodes.md" in on
     assert "(grep-searchable; entries start with [YYYY-MM-DD HH:MM])" in on
 
 
-def test_memory_enablement_follows_the_configured_backend(monkeypatch):
-    import opendde_harness.config.loader as loader
-
-    class _Config:
-        def __init__(self, backend):
-            self.memory = type("M", (), {"backend": backend})()
-
-    monkeypatch.setattr(loader, "load_config", lambda *a, **k: _Config(None))
-    assert render._long_term_memory_enabled() is False
-    monkeypatch.setattr(loader, "load_config", lambda *a, **k: _Config("longterm"))
-    assert render._long_term_memory_enabled() is True
-
-    def _boom(*a, **k):
-        raise RuntimeError("no config")
-
-    monkeypatch.setattr(loader, "load_config", _boom)
-    assert render._long_term_memory_enabled() is False
+def test_the_model_line_is_omitted_when_the_turn_names_no_model(tmp_path):
+    """The turn hands in the id the request reaches. Rendering used to read the
+    configured id from config, which is not the routed one."""
+    assert "running on model" not in render.identity_text(tmp_path)
+    assert "You are running on model: openai/gpt-x." in render.identity_text(tmp_path, model="openai/gpt-x")
 
 
-def test_exec_description_carries_the_plugin_note():
-    assert ExecTool().description == EXEC_DESCRIPTION
+def test_bash_description_carries_the_plugin_note():
+    """The note is keyed on the tool's advertised name, which is now ``bash``."""
+    assert ExecTool().description.endswith(PLUGIN_NOTE)
 
 
 def test_skills_are_discovered_from_the_plugin_directory(tmp_path):

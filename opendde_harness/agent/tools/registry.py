@@ -66,10 +66,9 @@ class ToolRegistry:
 
         # Refused before dispatch, not after validation: a truncated call whose
         # required fields happen to have arrived still validates, and running it
-        # executes an intent that was never fully transmitted. For write_file
-        # that is not merely an incomplete write -- `mode` is optional, so a cut
-        # before it arrives falls back to "overwrite" and silently replaces
-        # everything an earlier append had written, then reports success.
+        # executes an intent that was never fully transmitted. For ``write`` that
+        # is not merely an incomplete write -- the file is replaced by whatever
+        # part of the content did arrive, and the call reports success.
         #
         # The cost of being wrong here is one retry: a turn can end with a
         # complete tool call and be cut in prose that follows it, which the

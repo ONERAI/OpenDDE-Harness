@@ -1,8 +1,11 @@
-"""Search tools: grep (content search) and find (file lookup).
+"""Search tools: ``grep`` (content search) and ``find`` (file lookup).
+
+Both carry pi's names and parameter schemas, camelCase included, so a prompt or
+habit written for pi's built-ins calls them unchanged.
 
 Both run host-side and reuse ``_FsTool``'s workspace/allowed_dir resolution so
-they share the exact same path boundary as read_file/write_file/list_dir — never
-the SandboxExecutor (avoids shuttling large result sets across a VM edge).
+they share the exact same path boundary as read/write/ls — never the
+SandboxExecutor (avoids shuttling large result sets across a VM edge).
 
 ``grep`` prefers the ``rg`` (ripgrep) binary when present on PATH for speed and
 .gitignore awareness, and falls back to a pure-Python scan otherwise so opendde
@@ -70,7 +73,13 @@ def _denied_traversal_root(base: Path) -> bool:
 
 
 class GrepTool(_FsTool):
-    """Search file contents by regex, ripgrep-backed with a pure-Python fallback."""
+    """Search file contents by regex, ripgrep-backed with a pure-Python fallback.
+
+    pi's schema exactly, which drops our ``output_mode``: a file list and a
+    per-file count were two more shapes of the same answer, and ``limit`` plus a
+    narrower ``glob`` reaches the same place through one output format the model
+    already knows how to read.
+    """
 
     _MAX_CHARS = 30_000
     _DEFAULT_LIMIT = 100
@@ -83,11 +92,11 @@ class GrepTool(_FsTool):
     @property
     def description(self) -> str:
         return (
-            "Search file contents by regular expression. Prefer this over running "
-            "grep/rg through exec — results are paginated, capped, and .gitignore-aware. "
-            "output_mode 'content' returns matching lines with path:line numbers, "
-            "'files_with_matches' lists only file paths, 'count' shows match counts per file. "
-            "Use glob to restrict to file types (e.g. '*.py')."
+            "Search file contents for a pattern. Returns matching lines with file paths and line "
+            "numbers. Respects .gitignore. Output is truncated to "
+            f"{self._DEFAULT_LIMIT} matches or {self._MAX_CHARS // 1000}KB (whichever is hit first). "
+            "Prefer this over running grep or rg through bash, and use glob to restrict to file "
+            "types (e.g. '*.py'). Searching is confined to the permitted directory."
         )
 
     @property
@@ -95,33 +104,32 @@ class GrepTool(_FsTool):
         return {
             "type": "object",
             "properties": {
-                "pattern": {"type": "string", "description": "Regular expression to search for"},
+                "pattern": {"type": "string", "description": "Search pattern (regex or literal string)"},
                 "path": {
                     "type": "string",
-                    "description": "File or directory to search in (default: workspace root)",
+                    "description": "Directory or file to search (default: current directory)",
                 },
                 "glob": {
                     "type": "string",
-                    "description": "Only search files matching this glob (e.g. '*.py', '*.{ts,tsx}')",
+                    "description": "Filter files by glob pattern, e.g. '*.ts' or '**/*.spec.ts'",
                 },
-                "output_mode": {
-                    "type": "string",
-                    "enum": ["content", "files_with_matches", "count"],
-                    "description": "Output format (default: content)",
-                },
-                "case_insensitive": {
+                "ignoreCase": {
                     "type": "boolean",
-                    "description": "Case-insensitive matching (default false)",
+                    "description": "Case-insensitive search (default: false)",
+                },
+                "literal": {
+                    "type": "boolean",
+                    "description": "Treat pattern as literal string instead of regex (default: false)",
                 },
                 "context": {
                     "type": "integer",
-                    "description": "Lines of context before and after each match, content mode only (default 0)",
+                    "description": "Number of lines to show before and after each match (default: 0)",
                     "minimum": 0,
                     "maximum": 20,
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Max matching lines (content) or files (other modes) to return (default 100)",
+                    "description": f"Maximum number of matches to return (default: {self._DEFAULT_LIMIT})",
                     "minimum": 1,
                 },
             },
@@ -133,17 +141,18 @@ class GrepTool(_FsTool):
         pattern: str,
         path: str = ".",
         glob: str | None = None,
-        output_mode: str = "content",
-        case_insensitive: bool = False,
+        ignoreCase: bool = False,  # noqa: N803 — pi's parameter name, verbatim
+        literal: bool = False,
         context: int = 0,
         limit: int | None = None,
         **kwargs: Any,
     ) -> str:
         cap = limit or self._DEFAULT_LIMIT
-        try:
-            re.compile(pattern)
-        except re.error as e:
-            return f"Error: invalid regular expression: {e}"
+        if not literal:
+            try:
+                re.compile(pattern)
+            except re.error as e:
+                return f"Error: invalid regular expression: {e}"
         try:
             base = self._resolve(path)
         except PermissionError as e:
@@ -160,8 +169,8 @@ class GrepTool(_FsTool):
         rg = shutil.which("rg")
         try:
             if rg:
-                return await self._run_rg(rg, pattern, base, glob, output_mode, case_insensitive, context, cap)
-            return self._run_python(pattern, base, glob, output_mode, case_insensitive, context, cap)
+                return await self._run_rg(rg, pattern, base, glob, ignoreCase, literal, context, cap)
+            return self._run_python(pattern, base, glob, ignoreCase, literal, context, cap)
         except Exception as e:
             return f"Error running grep: {e}"
 
@@ -173,14 +182,16 @@ class GrepTool(_FsTool):
         pattern: str,
         base: Path,
         glob: str | None,
-        output_mode: str,
-        case_insensitive: bool,
+        ignore_case: bool,
+        literal: bool,
         context: int,
         cap: int,
     ) -> str:
         args = [rg, "--color=never"]
-        if case_insensitive:
+        if ignore_case:
             args.append("-i")
+        if literal:
+            args.append("--fixed-strings")
         if glob:
             args += ["-g", glob]
         # rg only skips noise dirs when a .gitignore says so; add explicit excludes
@@ -189,14 +200,9 @@ class GrepTool(_FsTool):
         for d in _IGNORE_DIRS:
             args += ["-g", f"!{d}"]
 
-        if output_mode == "files_with_matches":
-            args.append("-l")
-        elif output_mode == "count":
-            args.append("-c")
-        else:
-            args += ["--line-number", "--no-heading", "--with-filename"]
-            if context:
-                args += ["-C", str(context)]
+        args += ["--line-number", "--no-heading", "--with-filename"]
+        if context:
+            args += ["-C", str(context)]
         # Force forward-slash separators in rg's output paths on every platform
         # so results read the same on Windows as POSIX (only affects path fields,
         # not matched content).
@@ -228,8 +234,7 @@ class GrepTool(_FsTool):
         if not lines:
             return "No matches found."
 
-        unit = "matching lines" if output_mode == "content" else "files"
-        return self._format_lines(lines, cap, unit)
+        return self._format_lines(lines, cap)
 
     # ── pure-Python fallback ────────────────────────────────────────────
 
@@ -238,18 +243,16 @@ class GrepTool(_FsTool):
         pattern: str,
         base: Path,
         glob: str | None,
-        output_mode: str,
-        case_insensitive: bool,
+        ignore_case: bool,
+        literal: bool,
         context: int,
         cap: int,
     ) -> str:
-        flags = re.IGNORECASE if case_insensitive else 0
-        rx = re.compile(pattern, flags)
+        flags = re.IGNORECASE if ignore_case else 0
+        rx = re.compile(re.escape(pattern) if literal else pattern, flags)
         files = self._iter_files(base, glob)
 
         content_lines: list[str] = []
-        match_files: list[str] = []
-        counts: list[tuple[str, int]] = []
 
         for fp in files:
             rel = self._relpath(fp, base)
@@ -265,19 +268,9 @@ class GrepTool(_FsTool):
             if not hits:
                 continue
 
-            if output_mode == "files_with_matches":
-                match_files.append(rel)
-            elif output_mode == "count":
-                counts.append((rel, len(hits)))
-            else:
-                self._collect_content(content_lines, rel, text_lines, hits, context)
+            self._collect_content(content_lines, rel, text_lines, hits, context)
 
-        if output_mode == "files_with_matches":
-            return self._format_lines(match_files, cap, "files") if match_files else "No matches found."
-        if output_mode == "count":
-            rendered = [f"{rel}:{n}" for rel, n in counts]
-            return self._format_lines(rendered, cap, "files") if rendered else "No matches found."
-        return self._format_lines(content_lines, cap, "matching lines") if content_lines else "No matches found."
+        return self._format_lines(content_lines, cap) if content_lines else "No matches found."
 
     @staticmethod
     def _collect_content(
@@ -320,25 +313,25 @@ class GrepTool(_FsTool):
         except ValueError:
             return fp.as_posix()
 
-    def _format_lines(self, lines: list[str], cap: int, unit: str) -> str:
+    def _format_lines(self, lines: list[str], cap: int) -> str:
         total = len(lines)
         shown = lines[:cap]
         result = "\n".join(shown)
         notes = []
         if total > cap:
             notes.append(
-                f"showing first {cap} of {total} {unit} — {total - cap} more not shown; "
-                "this is a PARTIAL result, do not treat it as the complete set or count "
-                "from it. Use output_mode='count' for exact totals, or a narrower pattern/glob."
+                f"showing first {cap} of {total} matching lines — {total - cap} more not shown; "
+                "this is a PARTIAL result, do not treat it as the complete set or count from it. "
+                "Narrow the pattern or the glob, or raise limit, to see the rest"
             )
         if len(result) > self._MAX_CHARS:
             result = result[: self._MAX_CHARS]
             notes.append(
-                f"output truncated to {self._MAX_CHARS} chars — narrow the pattern/glob or "
-                "use output_mode='count' to get exact totals instead of eyeballing this view"
+                f"output truncated to {self._MAX_CHARS} chars — narrow the pattern or the glob "
+                "rather than counting from this view"
             )
         if notes:
-            result += f"\n\n(⚠️ {'; '.join(notes)})"
+            result += f"\n\n(warning: {'; '.join(notes)})"
         return result
 
 
@@ -359,10 +352,10 @@ class FindTool(_FsTool):
     @property
     def description(self) -> str:
         return (
-            "Find files by glob pattern (e.g. '*.py', 'src/**/*.ts'). Prefer this over "
-            "running find/ls through exec. Returns paths relative to the search root, "
-            "most-recently-modified first. Noise directories (.git, node_modules, etc.) "
-            "are skipped."
+            "Search for files by glob pattern. Returns matching file paths relative to the search "
+            f"directory, most-recently-modified first. Respects .gitignore. Output is truncated to "
+            f"{self._DEFAULT_LIMIT} results. Prefer this over running find or ls through bash. "
+            "Searching is confined to the permitted directory."
         )
 
     @property
@@ -372,15 +365,15 @@ class FindTool(_FsTool):
             "properties": {
                 "pattern": {
                     "type": "string",
-                    "description": "Glob pattern, e.g. '*.py' or 'src/**/*.ts'",
+                    "description": "Glob pattern to match files, e.g. '*.ts', '**/*.json', or 'src/**/*.spec.ts'",
                 },
                 "path": {
                     "type": "string",
-                    "description": "Directory to search in (default: workspace root)",
+                    "description": "Directory to search in (default: current directory)",
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Maximum results to return (default 1000)",
+                    "description": f"Maximum number of results (default: {self._DEFAULT_LIMIT})",
                     "minimum": 1,
                 },
             },

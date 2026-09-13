@@ -2,12 +2,48 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import typer
 from rich.console import Console
 
 from opendde_harness import __logo__
 
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from opendde_harness.config.schema import ProviderEntry
+    from opendde_harness.providers.auth import CredentialStatus
+
 console = Console()
+
+
+def _credential_line(status: CredentialStatus, entry: ProviderEntry) -> str:
+    """What answers for this provider, as the green half of its status line.
+
+    ``source`` is the part worth saying out loud: a key in the config, a key in
+    the vendor's own environment variable and a sign-in in pi's credential store
+    are all "configured", and somebody reading this to work out why a provider
+    answers -- or why it answers with the wrong account -- needs to know which of
+    them it was.
+    """
+    from opendde_harness.providers.auth import KIND_AMBIENT, KIND_DEVICE_FLOW
+
+    if status.kind == KIND_DEVICE_FLOW:
+        # Checked before the address, because an entry can carry both and the
+        # sign-in is what reaches the vendor.
+        return "[green]✓ (OAuth)[/green]"
+    if status.kind == KIND_AMBIENT:
+        # The credential is a whole environment chain (the AWS one, Google ADC);
+        # there is no key to have a source.
+        return "[green]✓ (the environment's own credentials)[/green]"
+    if status.source == "declared":
+        # For a provider this config declares, the address IS what makes it
+        # reachable -- and the one field most worth seeing spelled out.
+        return f"[green]✓ {entry.base_url}[/green]"
+    if status.source == "environment":
+        return "[green]✓ (key from the environment)[/green]"
+    if status.source == "store":
+        return "[green]✓ (key from the credential store)[/green]"
+    return "[green]✓[/green]"
 
 
 def register(app: typer.Typer) -> None:
@@ -45,51 +81,41 @@ def register(app: typer.Typer) -> None:
         console.print(f"Workspace: {workspace} {'[green]✓[/green]' if workspace.exists() else '[red]✗[/red]'}")
 
         if config_path.exists():
-            from opendde_harness.config.update_providers import list_providers
+            from opendde_harness.providers import pi_ids
+            from opendde_harness.providers.auth import credential_status
 
             console.print(f"Model: {config.agents.defaults.model}")
 
-            # Names from the listing, values from the loaded config. The listing
-            # covers vendors OpenDDE Harness carries no spec for -- reached by name alone,
-            # and a registry walk reports a working setup as unconfigured -- while
-            # the loaded config is the only view that includes credentials
-            # supplied by environment variable, which the file on disk does not
-            # hold. Reading either one alone shows a configured provider as unset.
-            # Only configured providers get a row; the rest fold into one count
+            # The loaded config is the whole source: its `providers` section is
+            # the configured set -- an entry is there because somebody wrote it --
+            # and `credential_status` is what adds the material the file does not
+            # hold, a key in the vendor's own environment variable or a sign-in in
+            # pi's credential store. Reading the file alone reported both of those
+            # as unset; deciding it here instead of asking `providers.auth` is what
+            # once called Azure configured with a key and no address.
+            # Only providers that answer get a row; the rest fold into one count,
             # so a single-provider setup is not buried under 20 'not set' rows.
             unconfigured = 0
-            for info in list_providers():
-                label = info["display_name"] or info["name"]
-                section = config.providers.get(info["name"])
-                if info["is_oauth"]:
-                    # The token lives in a file, so the listing is the only source.
-                    if not info["configured"]:
-                        unconfigured += 1
-                        continue
-                    state = "[green]✓ (OAuth)[/green]"
-                elif info["is_local"]:
-                    # Local deployments show api_base instead of api_key
-                    api_base = (section.api_base if section else None) or info["api_base"]
-                    if not api_base:
-                        unconfigured += 1
-                        continue
-                    state = f"[green]✓ {api_base}[/green]"
-                else:
-                    # `providers.auth`, like every other gate. Reading `api_key`
-                    # here made this the one place that called Azure configured
-                    # with a key and no address, and missed a Gemini section
-                    # holding only `api_key_list`.
-                    from opendde_harness.providers.auth import credential_status
-
-                    if not credential_status(info["name"], section, include_external=True).ok:
-                        unconfigured += 1
-                        continue
-                    state = "[green]✓[/green]"
-                console.print(f"{label}: {state}")
+            for provider, entry in config.providers.items():
+                status_of = credential_status(provider, entry, include_external=True)
+                if not status_of.ok:
+                    unconfigured += 1
+                    continue
+                label = pi_ids.display_name(provider, entry.name)
+                console.print(f"{label}: {_credential_line(status_of, entry)}")
             if unconfigured:
                 console.print(
                     f"[dim]{unconfigured} providers not configured (ddeharness provider list to see all)[/dim]"
                 )
+            from opendde_harness.agent.tools.web import brave_key
+
+            # One short row like the ones above it: the engine, and for the
+            # keyless one where a key goes. Which providers search through
+            # their own service is the troubleshooting guide's to explain.
+            if brave_key(config.tools.web.brave_api_key):
+                console.print("Web search: Brave Search API")
+            else:
+                console.print("Web search: DuckDuckGo [dim](no key; ddeharness onboard adds Brave)[/dim]")
 
 
 __all__ = ["register"]

@@ -82,6 +82,9 @@ class WorkflowConfigLoader:
             "target",
         }
     )
+    # ``temperature`` is accepted and not read: a sampling temperature is a
+    # property of the model's row in the harness config, and the request path
+    # reads it from there. Listed here so a file that still names it loads.
     _LLM_FIELDS = frozenset({"max_tokens", "model_name", "temperature"})
     _FOLD_FIELDS = frozenset(
         {
@@ -253,7 +256,6 @@ class WorkflowConfigLoader:
             quality_check_enabled=bool(design.get("enable_quality_check", True)),
             quality_check_threshold=float(design.get("quality_check_threshold", 0.7)),
             llm_model=llm.get("model_name"),
-            llm_temperature=(float(llm["temperature"]) if llm.get("temperature") is not None else None),
             llm_max_tokens=(int(llm["max_tokens"]) if llm.get("max_tokens") is not None else None),
             bootstrap_full_redesign_cycles=int(design.get("bootstrap_full_redesign_cycles", 0)),
             stagnation_full_redesign_threshold=int(design.get("stagnation_full_redesign_threshold", 0)),

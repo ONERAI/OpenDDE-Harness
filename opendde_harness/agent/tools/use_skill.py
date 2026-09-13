@@ -30,7 +30,7 @@ def _split_qualified_id(skill_id: str) -> tuple[str, str]:
 
 
 class UseSkillTool(Tool):
-    """Resolve a skill's SKILL.md and bundled scripts for ``exec``."""
+    """Resolve a skill's SKILL.md and bundled scripts for ``bash``."""
 
     def __init__(
         self,

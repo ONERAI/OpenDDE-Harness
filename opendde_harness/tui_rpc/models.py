@@ -1,13 +1,8 @@
-"""Pydantic v2 models for the tui-ipc-bridge JSON-RPC contract.
+"""Pydantic DTOs used by the TUI RPC handlers and Python clients.
 
-These models are the Python-side mirror of ``ui-tui/rpc-schema/openrpc.json``.
-Each public type defined in ``specs/tui-ipc.md`` §3.12 has a corresponding
-:class:`pydantic.BaseModel`, and each RPC method has a ``<Method>Params`` and
-``<Method>Result`` model.
-
-Drift between this module and the OpenRPC schema is caught in CI by
-``tests/test_rpc_schema_match.py``.  Any change here MUST be mirrored in the
-schema (or vice versa) within the same commit.
+The registered handlers are authoritative. ``tests/test_tui_rpc_schema.py``
+validates their actual results and notifications against OpenRPC; comparing
+these DTOs alone cannot detect drift in a handler that returns plain dicts.
 """
 
 from __future__ import annotations
@@ -41,26 +36,27 @@ class _Strict(BaseModel):
 JsonValue = Any
 
 
-class SessionInfo(_Strict):
-    """A single session record as exposed by the RPC layer."""
-
-    session_key: str = Field(..., description="<channel>:<chat_id> composite key.")
-    channel: str
-    chat_id: str
-    created_at: str = Field(..., description="ISO-8601 timestamp.")
-    updated_at: str = Field(..., description="ISO-8601 timestamp.")
-    message_count: int
-    metadata: dict[str, JsonValue]
-
-
-class SessionMessage(_Strict):
-    """A single message inside a session's history."""
-
-    index: int = Field(..., description="0-based position within session.messages.")
-    role: Literal["user", "assistant", "system", "tool"]
-    content: str
-    timestamp: str = Field(..., description="ISO-8601 timestamp.")
-    metadata: dict[str, JsonValue] | None = None
+class SessionUsage(_Strict):
+    #: The session's own totals as the banner opens on them. Zero for a session
+    #: with no history; for a resumed one, what its stored records say its
+    #: earlier turns moved and cost, so the footer and ``/status`` open on the
+    #: real figure rather than on $0 (see ``session._history_usage``).
+    input: int
+    output: int
+    cost_usd: float | None
+    #: The same spend at the vendor's published price, whoever is billing. This
+    #: is the figure the footer shows: on a plan ``cost_usd`` is None, and
+    #: ``$0.000`` beside ``(sub)`` reads as free rather than as covered.
+    list_cost_usd: float | None = None
+    calls: int
+    context_max: int
+    context_source: str
+    #: None when nothing measures the window: a compaction marker the session's
+    #: own backend replays stands in front of the history, so the next call
+    #: sends that marker rather than the messages it replaced, and their size
+    #: says nothing about what the window will hold.
+    context_used: int | None
+    context_percent: int | None
 
 
 class McpServerInfo(_Strict):
@@ -70,6 +66,57 @@ class McpServerInfo(_Strict):
     transport: Literal["stdio", "sse", "streamableHttp"]
     connected: bool
     tool_count: int
+
+
+class ProjectInstructionFile(_Strict):
+    """One AGENTS.md / ODH.md the session found. Never its contents."""
+
+    path: str = Field(..., description="Absolute path, which is what /memory on|off names.")
+    display: str = Field(..., description="How it is shown: repo-relative, ~/... for the user scope.")
+    size: int = Field(..., description="Size on disk in bytes, which is not the size sent when truncated.")
+    truncated: bool = Field(..., description="Larger than the 32 KiB per-file cap; only the head is sent.")
+    skipped: bool = Field(..., description="Found but not sent: the 128 KiB total was already spent.")
+    enabled: bool = Field(..., description="False when /memory off switched it off for this session.")
+    changed: bool = Field(..., description="Its content differs from what this session first saw in it.")
+
+
+class SessionInfo(_Strict):
+    """Init bundle returned by session.create and session.resume."""
+
+    model: str
+    model_id: str
+    provider: str
+    reasoning_effort: str | None
+    context_window: int
+    lazy: bool
+    skills: dict[str, list[str]]
+    tools: dict[str, list[str]]
+    usage: SessionUsage
+    version: str
+    # When this version shipped, from the changelog the package carries. None
+    # when the install has none to read.
+    release_date: str | None
+    cwd: str
+    #: The instruction files this session sends, listed but never quoted.
+    project_instructions: list[ProjectInstructionFile]
+    mcp_servers: list[McpServerInfo]
+    #: The model is billed by plan, so no per-call price describes it. Read from
+    #: the provider entry the model id names: a sign-in is a plan, a key is
+    #: metered, and nothing is guessed from the provider's name.
+    subscription: bool
+    #: Something compacts this session before its window runs out.
+    auto_compact: bool
+    update_available: str | None = None
+    update_command: str | None = None
+
+
+class SessionMessage(_Strict):
+    """Stored messages mapped to the resume wire shape."""
+
+    role: str
+    text: str | None = None
+    context: JsonValue = None
+    name: JsonValue = None
 
 
 class McpToolInfo(_Strict):
@@ -96,13 +143,39 @@ class UsageSnapshot(_Strict):
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
+    # Share of the last call's prompt served from the provider's cache, 0-100;
+    # None when the call sent no prompt.
+    cache_hit_percent: int | None = None
     cost_usd: float | None = None
+    #: What this call is worth at the vendor's published price, whoever is
+    #: billing. On a plan ``cost_usd`` is None -- the subscription is the price
+    #: -- and this is the figure a status line can show beside a `(sub)`.
+    list_cost_usd: float | None = None
     context_used: int | None = None
     context_max: int | None = None
     context_percent: int | None = None
     # Which tier sized context_max (providers/rates SOURCE_*); "unknown" with
     # a zero context_max means no table lists the model, not that it is small.
     context_source: str | None = None
+    #: The conversation was compacted after this call. ``context_used`` above
+    #: measured a prompt that no longer exists, and nothing measures the one
+    #: that replaced it until the next call reports: a status line that keeps
+    #: showing the old percentage is stating a fact about a deleted
+    #: conversation. None where no compaction ran, which is every ordinary turn.
+    context_compacted: bool | None = None
+    # -- the session, beside the turn ---------------------------------------
+    #: Everything above describes this turn (its costs) or its last call (the
+    #: token and context figures). These five describe the session: the totals
+    #: from the tracker ``/status`` reads, so a footer showing the session's
+    #: spend and a ``/status`` line reporting it cannot disagree. Absent only
+    #: from a completion no turn runner filled in.
+    session_input_tokens: int | None = None
+    session_output_tokens: int | None = None
+    #: None on a plan-billed provider, which states no per-token price.
+    session_cost_usd: float | None = None
+    #: None when no model used has a published price. Never zero for unknown.
+    session_list_cost_usd: float | None = None
+    session_calls: int | None = None
 
 
 class CliResult(_Strict):
@@ -177,6 +250,18 @@ class TurnRetryEvent(_Strict):
     payload: TurnRetryPayload
 
 
+class TurnNoticePayload(_Strict):
+    """A line the turn shows the user that is not part of the reply."""
+
+    kind: Literal["model_fallback", "delivery_failed"]
+    text: str
+
+
+class TurnNoticeEvent(_Strict):
+    type: Literal["turn.notice"]
+    payload: TurnNoticePayload
+
+
 class TokenDeltaPayload(_Strict):
     text: str
 
@@ -229,7 +314,7 @@ class ToolCompleteEvent(_Strict):
 
 
 class MessageCompletePayload(_Strict):
-    turn_id: str
+    turn_id: str | None
     usage: UsageSnapshot
 
 
@@ -278,12 +363,37 @@ class CronMissedEvent(_Strict):
     payload: CronMissedPayload
 
 
+class ProteinDesignProgressPayload(_Strict):
+    event_id: str
+    task_id: str
+    timestamp: str
+    event_type: Literal["task", "cycle", "phase", "agent", "skill", "tool", "fold", "gate", "memory"]
+    status: Literal["started", "progress", "completed", "failed"]
+    cycle: int | None
+    total_cycles: int | None
+    phase: str
+    actor: str
+    skill: str | None
+    tool: str | None
+    summary: str
+    duration_ms: float | None
+    candidate_count: int | None
+    error: str | None
+    has_details: bool
+
+
+class ProteinDesignProgressEvent(_Strict):
+    type: Literal["protein_design.progress"]
+    payload: ProteinDesignProgressPayload
+
+
 TurnEvent = Annotated[
     Union[
         MessageStartEvent,
         EpisodeStartEvent,
         TurnRetryEvent,
         TurnUsageEvent,
+        TurnNoticeEvent,
         TokenDeltaEvent,
         ThinkingDeltaEvent,
         ToolStartEvent,
@@ -293,6 +403,7 @@ TurnEvent = Annotated[
         ErrorEvent,
         CronDeliveredEvent,
         CronMissedEvent,
+        ProteinDesignProgressEvent,
     ],
     Field(discriminator="type"),
 ]
@@ -309,7 +420,7 @@ class SessionListItem(_Strict):
     id: str = Field(..., description="Full session_key: <channel>:<chat_id>.")
     message_count: int
     preview: str
-    source: str | None = None
+    source: str
     started_at: float = Field(..., description="Unix timestamp from created_at.")
     title: str
 
@@ -331,31 +442,31 @@ class SessionGetResult(_Strict):
 
 
 class SessionCreateParams(_Strict):
-    channel: str
-    chat_id: str
-    metadata: dict[str, JsonValue] | None = None
+    pass
 
 
 class SessionCreateResult(_Strict):
-    session: SessionInfo
+    session_id: str
+    info: SessionInfo
 
 
 class SessionResumeParams(_Strict):
-    session_key: str
+    session_id: str | None = None
 
 
 class SessionResumeResult(_Strict):
-    session: SessionInfo
-    last_messages: list[SessionMessage]
+    session_id: str
+    info: SessionInfo
+    messages: list[SessionMessage]
 
 
 class SessionDeleteParams(_Strict):
-    session_id: str = Field(..., description="Full session_key as sent by the UI.")
+    session_id: str = Field("", description="Full session_key as sent by the UI.")
 
 
 class SessionDeleteResult(_Strict):
     deleted: str | None = Field(
-        default=None,
+        ...,
         description=(
             "The session_id that was deleted (matches the request param); null when no such session file existed."
         ),
@@ -367,21 +478,13 @@ class SessionMostRecentParams(_Strict):
 
 
 class SessionMostRecentResult(_Strict):
-    """Response shape per gatewayTypes.ts:147 SessionMostRecentResponse."""
-
-    session_id: str | None = Field(
-        default=None,
-        description="Full tui:<chat_id> key, or null when no sessions exist.",
-    )
-    source: str | None = None
-    started_at: float | None = None
-    title: str | None = None
+    session_id: str | None
 
 
 class SessionTitleParams(_Strict):
     """Params per slash/commands/core.ts:201,218 — session_id + optional title."""
 
-    session_id: str = Field(..., description="Full session_key.")
+    session_id: str = Field("", description="Full session_key.")
     title: str | None = None
 
 
@@ -392,7 +495,7 @@ class SessionTitleResult(_Strict):
     session and lands with the session's first save.
     """
 
-    title: str | None = None
+    title: str | None
     session_key: str
     pending: bool
 
@@ -400,7 +503,7 @@ class SessionTitleResult(_Strict):
 class SessionClearParams(_Strict):
     """Params for session.clear — wipe messages in place, keep the sid."""
 
-    session_id: str = Field(..., description="Full session_key to clear.")
+    session_id: str = Field("", description="Full session_key to clear.")
 
 
 class SessionClearResult(_Strict):
@@ -411,12 +514,19 @@ class SessionClearResult(_Strict):
 class SessionUndoParams(_Strict):
     """Params for session.undo — drop the last n turns (default 1)."""
 
-    session_id: str = Field(..., description="Full session_key to undo.")
+    session_id: str = Field("", description="Full session_key to undo.")
     n: int = Field(1, description="Trailing turns to drop (role==user boundary).")
 
 
 class SessionUndoResult(_Strict):
     removed: int = Field(..., description="Messages dropped (0 = nothing to undo).")
+    #: What the conversation holds now the exchange is gone, so a status line
+    #: can stop reporting a window that has not been that full since. Absent
+    #: when nothing was removed, and null where nothing measures the window --
+    #: the same answer session.info gives for that session, from the same
+    #: policy. Estimated offline otherwise, and 0 rather than an error when
+    #: nothing can size it.
+    context_used: int | None = None
 
 
 class SessionExportParams(_Strict):
@@ -424,7 +534,7 @@ class SessionExportParams(_Strict):
 
     session_id: str | None = Field(
         default=None,
-        description="Session id / prefix / full key to export; current session when omitted.",
+        description="Session id / prefix / full key to export; not_found when omitted.",
     )
 
 
@@ -441,21 +551,28 @@ class SessionExportResult(_Strict):
     )
 
 
-class SessionHistoryParams(_Strict):
-    session_key: str
-    max_messages: int | None = Field(
-        default=None,
-        description="Maximum number of messages to return; default 500 to match Session.get_history.",
+class SessionInstructionsParams(_Strict):
+    """Params for session.instructions — list the files, or switch one."""
+
+    action: Literal["list", "on", "off"] = Field(
+        default="list",
+        description="list (default) reports; on / off switch one file for this session only.",
     )
-    before_index: int | None = Field(
+    path: str | None = Field(
         default=None,
-        description="Return messages with index < before_index. Used for pagination.",
+        description="Which file to switch: its path, its shown name, or its unambiguous basename.",
+    )
+    session_id: str | None = Field(
+        default=None,
+        description="Whose view this is; on / off apply to that conversation alone.",
     )
 
 
-class SessionHistoryResult(_Strict):
-    messages: list[SessionMessage]
-    total: int
+class SessionInstructionsResult(_Strict):
+    cwd: str = Field(..., description="The directory the search ran from.")
+    files: list[ProjectInstructionFile] = Field(..., description="Every file found, outermost first.")
+    changed: str | None = Field(..., description="The shown name of the file just switched, else null.")
+    error: str | None = Field(..., description="Why nothing was switched, in one line, else null.")
 
 
 # ---------------------------------------------------------------------------
@@ -579,9 +696,11 @@ class SkillUnpinResult(_Strict):
 class ModelLabel(_Strict):
     """How a model reads to a person, for the ids in ``models``.
 
-    Present only for models a catalogue describes; one released since the
-    bundled snapshot, or served by a local deployment, has no entry and the
-    picker shows its id.
+    One per offered id. ``label`` is the name the model's own declared row
+    gives it, else the one the model service reports, else the id with its
+    provider prefix dropped -- the ids in ``models`` are qualified, and
+    repeating the provider on every row of that provider's own list reads as
+    noise.
     """
 
     label: str
@@ -589,41 +708,88 @@ class ModelLabel(_Strict):
 
 
 class ModelOptionProvider(_Strict):
-    """One provider row in the ``/model`` picker."""
+    """One provider row in the ``/model`` picker.
+
+    ``slug`` is a pi provider id, which is also the key of the ``providers``
+    entry it describes and the prefix of every model id in ``models``.
+    """
 
     slug: str
     name: str
     authenticated: bool
     is_current: bool
-    auth_type: str
-    key_env: str | None = None
+    #: How this provider is reached: a sign-in, an address this config declares,
+    #: or a key. ``providers.auth``'s three shapes, and the only three.
+    auth_type: Literal["oauth", "endpoint", "key"]
+    #: The environment variable that already supplies this provider's key, or
+    #: null when none does. Reported, never sent: pi resolves the environment
+    #: itself.
+    key_env: str | None
     models: list[str]
-    model_labels: dict[str, ModelLabel] | None = None
+    models_loaded: bool
+    model_labels: dict[str, ModelLabel]
     total_models: int
-    needs_api_base: bool
+    #: Every way in pi offers for this provider, in pi's own order: a sign-in, a
+    #: key, or both. Read from the model service, which reads pi's own provider
+    #: objects. Empty when it could not be asked -- a picker that does not know
+    #: offers no choice.
+    auth_methods: list[Literal["oauth", "key"]] = Field(default_factory=list)
+    #: pi's own label for the sign-in option ("Sign in with SuperGrok or X
+    #: Premium"), or null where pi carries none and its generic sentence applies.
+    login_label: str | None = None
+    #: pi's own name for this provider's key ("Anthropic API key").
+    key_label: str | None = None
+    #: A key must be typed before this provider can serve anything.
+    needs_api_key: bool
+    #: This provider is one the config declares, so the form must ask for the
+    #: address it lives at and the wire it speaks -- both, never one.
+    needs_base_url: bool
+    #: The declared address and wire as configured, for a form that prefills
+    #: them; null for one of pi's own, which carries its own.
+    base_url: str | None
+    api: str | None
     warning: str
-    # The wire this provider's endpoint is configured for, offered for the
-    # picker to switch; absent when the provider's driver has only one wire.
-    wire: Literal["responses", "chat"] | None = None
 
 
 class ModelOptionsParams(_Strict):
     session_id: str | None = None
+    slug: str | None = None
+    # True by default, as ``openrpc.json`` declares and both clients rely on:
+    # the picker opens with an explicit ``false`` for a cheap first screen and
+    # then omits the field when it expands one provider, so a default of false
+    # answered that expansion with the same short list and the client read it
+    # as "failed to load more models". Either way the answer is local: the
+    # catalogue is two bundled files, and no provider is asked what it serves.
+    include_catalog: bool = True
+    #: Ask the declared endpoints what they serve before answering: their
+    #: ``/models``, fetched now. Off by default; the picker asks once, in the
+    #: background, after it has painted the last known list.
+    refresh: bool = False
 
 
 class ModelOptionsResult(_Strict):
     model: str
     provider: str
+    #: ``agents.defaults.model``: what new sessions start on, so the picker can
+    #: mark its row the way pi marks its default.
+    default_model: str = ""
     providers: list[ModelOptionProvider]
+    #: By provider id, the endpoints a ``refresh`` could not ask, with the
+    #: sentence each failed with. Empty when nothing was asked or all answered.
+    refresh_errors: dict[str, str] = Field(default_factory=dict)
 
 
 class ModelSaveKeyParams(_Strict):
     slug: str
-    # Empty for a local deployment, which is reached by address and has no key.
-    # The handler rejects an empty one for every other credential shape.
+    # Empty for a provider reached without one: a self-hosted endpoint that
+    # wants no key, or a built-in whose key is already in the environment. The
+    # handler rejects an empty one wherever a key is what reaches the vendor.
     api_key: str = ""
-    api_base: str | None = None
-    wire: Literal["responses", "chat"] | None = None
+    # A provider this config declares: where it lives, and the wire it speaks.
+    # Required together (the schema refuses either alone) and both meaningless
+    # for one of pi's own, which carries its address and its protocol.
+    base_url: str | None = None
+    api: str | None = None
     session_id: str | None = None
 
 
@@ -631,39 +797,108 @@ class ModelSaveKeyResult(_Strict):
     provider: ModelOptionProvider
 
 
-class ModelDisconnectParams(_Strict):
+class ModelDeclareProviderParams(_Strict):
+    """Declare a provider this config does not hold yet, in one submission.
+
+    The three things such a provider needs and nothing else: the id it is filed
+    under, the address it lives at, and a key if it wants one. What it serves is
+    read from the endpoint itself (its ``/models``), the way pi treats
+    OpenRouter; ``model`` names ids by hand only for an endpoint that publishes
+    no list, comma-separated.
+
+    The wire is not among them. This declares an OpenAI-compatible endpoint,
+    which is what a relay or a self-hosted server implements, so ``api`` is
+    ``openai-completions`` and there is nothing for the form to choose. A
+    provider that speaks another wire is written by ``ddeharness provider set``,
+    which takes every field the entry has.
+    """
+
+    provider: str
+    base_url: str
+    #: Optional: ids typed by hand, comma-separated, for an endpoint that
+    #: publishes no list. Otherwise the list is discovered.
+    model: str = ""
+    #: Empty for the common case: a self-hosted server usually wants no key.
+    api_key: str = ""
+    session_id: str | None = None
+
+
+class ModelDeclareProviderResult(_Strict):
+    provider: ModelOptionProvider
+    #: How many models the endpoint published when asked just now.
+    discovered: int
+
+
+class ModelLogoutParams(_Strict):
+    """pi's ``/logout``: forget a provider's credential and keep its declaration."""
+
     slug: str
     session_id: str | None = None
 
 
-class ModelDisconnectResult(_Strict):
-    disconnected: bool
+class ModelLogoutResult(_Strict):
+    #: False when there was nothing stored to forget.
+    forgotten: bool
 
 
-class ModelAddModelParams(_Strict):
-    slug: str
-    model: str
+class ModelScopeParams(_Strict):
+    """pi's scoped models: read the saved scope, or write it when ``write`` is set."""
+
+    #: The ``<provider>/<model>`` ids of the scope; ``None`` is every model.
+    models: list[str] | None = None
+    write: bool = False
     session_id: str | None = None
 
 
-class ModelAddModelResult(_Strict):
+class ModelScopeResult(_Strict):
+    models: list[str] | None
+
+
+class ModelLoginParams(_Strict):
+    """Start a provider's sign-in. The steps arrive as ``login.step`` pushes."""
+
+    provider: str
+    #: The id the pushed steps will carry, chosen by the client so it knows its
+    #: own flow's steps before the first one arrives. Minted by the gateway
+    #: when absent.
+    login_id: str | None = Field(default=None, min_length=1, max_length=64)
+    session_id: str | None = None
+
+
+class ModelLoginResult(_Strict):
+    #: The id the pushed steps carried, so a client can tell which flow ended.
+    login_id: str
     provider: ModelOptionProvider
 
 
-class ModelRemoveModelParams(_Strict):
-    slug: str
-    model: str
-    session_id: str | None = None
+class ModelLoginAnswerParams(_Strict):
+    """What the sign-in asked for: an option id, or a pasted code."""
+
+    login_id: str
+    answer: str
 
 
-class ModelRemoveModelResult(_Strict):
-    provider: ModelOptionProvider
+class ModelLoginAnswerResult(_Strict):
+    #: False when nothing was waiting: the login ended, or the callback won.
+    answered: bool
+
+
+class ModelLoginCancelParams(_Strict):
+    login_id: str
+
+
+class ModelLoginCancelResult(_Strict):
+    cancelled: bool
 
 
 class ModelOverlayParams(_Strict):
-    """One overlay field of the current model. ``field`` is reasoning_effort
-    (pi's off/minimal/low/medium/high/xhigh/max), context_window_tokens or
-    max_output_tokens (a count, ``128k`` allowed); ``default`` clears it."""
+    """One field of the current model's declared row (``providers.<id>.models``).
+
+    ``field`` is one of the row's own: name, description, api, catalog_model,
+    context_window, max_tokens (a count, ``128k`` allowed), reasoning (on/off),
+    reasoning_effort (pi's off/minimal/low/medium/high/xhigh/max) or
+    temperature. ``default`` clears whichever is named.
+    """
 
     field: str
     value: str
@@ -673,49 +908,9 @@ class ModelOverlayParams(_Strict):
 class ModelOverlayResult(_Strict):
     model: str
     field: str
-    value: str | int | None = None
+    value: str | int | float | bool | None
     #: The window the loop runs with after the change, for a size field.
-    context_window_tokens: int | None = None
-
-
-class ProviderEndpointInfo(_Strict):
-    """One of a provider section's endpoints, as the picker shows it."""
-
-    label: str
-    api_key: str = Field(..., description="Redacted for display: `****set****` or `(empty)`.")
-    api_base: str | None = None
-    extra_headers: dict[str, str] | None = None
-
-
-class ModelEndpointsParams(_Strict):
-    slug: str
-    session_id: str | None = None
-
-
-class ModelEndpointsResult(_Strict):
-    endpoints: list[ProviderEndpointInfo]
-
-
-class ModelAddEndpointParams(_Strict):
-    slug: str
-    label: str = Field(..., description="Idempotency key: an existing entry with this label is replaced wholesale.")
-    api_key: str = ""
-    api_base: str | None = None
-    session_id: str | None = None
-
-
-class ModelAddEndpointResult(_Strict):
-    endpoints: list[ProviderEndpointInfo]
-
-
-class ModelRemoveEndpointParams(_Strict):
-    slug: str
-    label: str
-    session_id: str | None = None
-
-
-class ModelRemoveEndpointResult(_Strict):
-    endpoints: list[ProviderEndpointInfo]
+    context_window: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -737,15 +932,28 @@ class ConfigGetResult(_Strict):
 class ConfigSetParams(_Strict):
     key: str
     value: JsonValue
+    # Model-switch extras. ``scope`` decides the reach of a ``key="model"``
+    # switch: this conversation, or the default a new one starts on. There is no
+    # provider beside it: a model id names its provider, and a second field
+    # saying so again is what sent one vendor's model to another vendor's key.
+    session_id: str | None = None
+    scope: Literal["session", "default"] | None = None
 
 
 class ConfigSetResult(_Strict):
     applied: bool
     # ``previous`` is a *required* field whose value may legitimately be
     # ``null``.  We type it as ``JsonValue`` (``Any``) because ``JsonValue``
-    # already includes ``null``; the schema's redundant ``oneOf: [JsonValue,
-    # null]`` collapses to the same canonical "any" form.
+    # already includes ``null``; a oneOf with a second null branch rejects it.
     previous: JsonValue = Field(...)
+    # Present on a model switch: what was applied, and where it reached.
+    value: str | None = None
+    scope: Literal["session", "default"] | None = None
+    session_id: str | None = None
+    # Does the asking conversation now run this model? A default-scoped switch
+    # moves the sessions that never chose one, so scope alone cannot answer it
+    # and a client that guesses shows a model the conversation is not on.
+    applies_to_session: bool | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -831,8 +1039,8 @@ class ReloadMcpParams(_Strict):
 
 class ReloadMcpResult(_Strict):
     ok: bool
-    reloaded: int | None = None
-    tools_changed: bool | None = None
+    reloaded: int
+    tools_changed: bool
 
 
 # ---------------------------------------------------------------------------
@@ -844,26 +1052,45 @@ class CommandsCatalogParams(_Strict):
     pass
 
 
+class CatalogCommand(_Strict):
+    """One reflected CLI command, as a slash popup shows it."""
+
+    name: str = Field(..., description='Space-separated argv without the leading slash, e.g. "provider list".')
+    description: str = Field(..., description="One line from the command's own Typer help or docstring.")
+    argument_hint: str | None = Field(
+        default=None,
+        description="Positional arguments, <required> and [optional]. None when the command takes none.",
+    )
+    timeout_s: float | None = Field(
+        default=None,
+        gt=0,
+        description="Seconds this command is allowed where the ordinary slash timeout is not enough; None otherwise.",
+    )
+
+
 class CommandsCatalogResponse(_Strict):
     """Slash-command catalog reflected from opendde_harness.cli.commands.app.
 
-    Shape consumed by ui-tui createSlashHandler.ts:53-79 (alias / prefix-1 /
-    multi-match) and createGatewayEventHandler.ts:198 (gating on non-empty
-    pairs). v0.1 emits alias=canonical 1:1; TS-side prefix-1-match handles
-    partials.
+    The TUI gates on non-empty ``pairs`` (createGatewayEventHandler.ts) and
+    renders ``categories`` / ``skill_count`` in ``/help``. Every typed slash
+    is sent to ``slash.exec`` verbatim: the TUI resolves no aliases, so the
+    catalog carries none.
     """
 
-    canon: dict[str, str] = Field(
-        ...,
-        description=(
-            "alias (with leading /) -> canonical mapping. Group + subcommand space-separated (e.g. '/provider list')."
-        ),
-    )
     pairs: list[tuple[str, str]] = Field(
         ...,
-        description=("Ordered (alias, canonical) tuples. Empty pairs -> TS degrades catalog setup; gating field."),
+        description=(
+            "RETIRED WITH THE INK FRONT-END. Group heads only; read `commands` instead. Kept because the Ink "
+            "client gates on non-empty pairs. Remove with that client at the cut-over."
+        ),
     )
-    sub: dict[str, list[str]] = Field(..., description="group -> [subcommand]; blacklisted entries filtered out.")
+    commands: list[CatalogCommand] = Field(
+        ...,
+        description=(
+            "Every command the gateway will run for a slash, with its own help text. Exactly what "
+            "cli.dispatch accepts, so a bare group head is absent."
+        ),
+    )
     categories: list[str] = Field(
         ...,
         description="'(top-level)' first then alphabetical group names.",
@@ -956,15 +1183,13 @@ ToolsConfigureResult = StubResult
 
 
 # ---------------------------------------------------------------------------
-# Method registry — used by tests/test_rpc_schema_match.py to walk every
-# method and compare its Pydantic Params/Result models against the OpenRPC
-# schema.  Keys MUST match the ``method.name`` strings in openrpc.json.
+# Method DTO registry. The dispatcher, not this subset of typed handlers,
+# defines the registered surface; tests exercise it through actual requests.
 # ---------------------------------------------------------------------------
 
 METHOD_MODELS: dict[str, tuple[type[BaseModel], type[BaseModel]]] = {
     # session.*
     "session.list": (SessionListParams, SessionListResult),
-    "session.get": (SessionGetParams, SessionGetResult),
     "session.create": (SessionCreateParams, SessionCreateResult),
     "session.resume": (SessionResumeParams, SessionResumeResult),
     "session.delete": (SessionDeleteParams, SessionDeleteResult),
@@ -973,30 +1198,21 @@ METHOD_MODELS: dict[str, tuple[type[BaseModel], type[BaseModel]]] = {
     "session.clear": (SessionClearParams, SessionClearResult),
     "session.undo": (SessionUndoParams, SessionUndoResult),
     "session.export": (SessionExportParams, SessionExportResult),
-    "session.history": (SessionHistoryParams, SessionHistoryResult),
+    "session.instructions": (SessionInstructionsParams, SessionInstructionsResult),
     # turn.*
     "turn.send": (TurnSendParams, TurnSendResult),
     "turn.subscribe": (TurnSubscribeParams, TurnSubscribeResult),
     "turn.unsubscribe": (TurnUnsubscribeParams, TurnUnsubscribeResult),
     "turn.cancel": (TurnCancelParams, TurnCancelResult),
-    # mcp.*
-    "mcp.list": (McpListParams, McpListResult),
-    "mcp.test": (McpTestParams, McpTestResult),
-    "mcp.tools": (McpToolsParams, McpToolsResult),
-    # skill.*
-    "skill.list": (SkillListParams, SkillListResult),
-    "skill.pin": (SkillPinParams, SkillPinResult),
-    "skill.unpin": (SkillUnpinParams, SkillUnpinResult),
     # model.*
     "model.options": (ModelOptionsParams, ModelOptionsResult),
     "model.save_key": (ModelSaveKeyParams, ModelSaveKeyResult),
-    "model.disconnect": (ModelDisconnectParams, ModelDisconnectResult),
-    "model.add_model": (ModelAddModelParams, ModelAddModelResult),
-    "model.remove_model": (ModelRemoveModelParams, ModelRemoveModelResult),
+    "model.declare_provider": (ModelDeclareProviderParams, ModelDeclareProviderResult),
+    "model.scope": (ModelScopeParams, ModelScopeResult),
     "model.overlay": (ModelOverlayParams, ModelOverlayResult),
-    "model.endpoints": (ModelEndpointsParams, ModelEndpointsResult),
-    "model.add_endpoint": (ModelAddEndpointParams, ModelAddEndpointResult),
-    "model.remove_endpoint": (ModelRemoveEndpointParams, ModelRemoveEndpointResult),
+    "model.login": (ModelLoginParams, ModelLoginResult),
+    "model.login_answer": (ModelLoginAnswerParams, ModelLoginAnswerResult),
+    "model.login_cancel": (ModelLoginCancelParams, ModelLoginCancelResult),
     # config.*
     "config.get": (ConfigGetParams, ConfigGetResult),
     "config.set": (ConfigSetParams, ConfigSetResult),
@@ -1009,29 +1225,20 @@ METHOD_MODELS: dict[str, tuple[type[BaseModel], type[BaseModel]]] = {
     "setup.status": (SetupStatusParams, SetupStatusResult),
     "reload.mcp": (ReloadMcpParams, ReloadMcpResult),
     "commands.catalog": (CommandsCatalogParams, CommandsCatalogResponse),
-    # hermes-only stubs
-    "voice.toggle": (VoiceToggleParams, StubResult),
-    "browser.manage": (BrowserManageParams, StubResult),
-    "spawn_tree.save": (SpawnTreeSaveParams, StubResult),
-    "spawn_tree.list": (SpawnTreeListParams, StubResult),
-    "spawn_tree.load": (SpawnTreeLoadParams, StubResult),
-    "process.stop": (ProcessStopParams, StubResult),
-    "rollback.list": (RollbackListParams, StubResult),
-    "rollback.diff": (RollbackDiffParams, StubResult),
-    "rollback.restore": (RollbackRestoreParams, StubResult),
-    "tools.configure": (ToolsConfigureParams, StubResult),
 }
 
 __all__ = [
     # public types
     "SessionInfo",
+    "ProjectInstructionFile",
+    "SessionUsage",
+    "ProteinDesignProgressEvent",
     "SessionListItem",
     "SessionMessage",
     "McpServerInfo",
     "McpToolInfo",
     "SkillInfo",
     "ModelOptionProvider",
-    "ProviderEndpointInfo",
     "UsageSnapshot",
     "CliResult",
     "StubResult",
@@ -1039,6 +1246,8 @@ __all__ = [
     "TurnEvent",
     "SessionMostRecentParams",
     "SessionMostRecentResult",
+    "SessionInstructionsParams",
+    "SessionInstructionsResult",
     "SessionTitleParams",
     "SessionTitleResult",
     "SessionClearParams",
@@ -1051,6 +1260,7 @@ __all__ = [
     "EpisodeStartEvent",
     "TurnRetryEvent",
     "TurnUsageEvent",
+    "TurnNoticeEvent",
     "TokenDeltaEvent",
     "ThinkingDeltaEvent",
     "ToolStartEvent",

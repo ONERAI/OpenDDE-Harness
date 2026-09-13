@@ -4,21 +4,11 @@ Each module corresponds to a domain (system / setup / reload / config /
 cli_dispatch / session / terminal / …) and exposes a
 ``register_<domain>_methods()`` helper that the server loop calls at startup.
 
-The umbrella :func:`register_aligned_methods` registers every handler that
-the ui-tui frontend currently calls:
-
-* ``system.*`` (3) — handshake / ping / version
-* ``cli.dispatch`` (1) — in-process EC CLI runner
-* ``setup.status`` (1) — provider detect
-* ``reload.mcp`` (1) — hermes 5s poll no-op
-* ``config.get`` / ``config.set`` (2) — hot-changeable config
-* ``session.{create, close, resume}`` (3) — Wave 6.5 lifecycle return-shape
-  stubs (real SessionManager wiring deferred)
-* ``terminal.resize`` (1) — Wave 6.5 SIGWINCH no-op + cols record
-
-Domains that are NOT yet aligned (turn.* / skill.* / model.* / mcp.*) are
-deliberately omitted from the umbrella — they wait for the frontend/backend
-alignment audit before being wired in.
+The umbrella registers the production system, CLI, setup, reload, config,
+session, terminal, model, command-catalog and slash-routing methods. Turn
+subscriptions and approval/confirm/question responses require their respective
+emitter or broker. The registered surface is declared in ``openrpc.json`` and
+checked against real responses by ``tests/test_tui_rpc_schema.py``.
 """
 
 from __future__ import annotations
@@ -30,6 +20,7 @@ from opendde_harness.tui_rpc.methods.cli_dispatch import register_cli_methods
 from opendde_harness.tui_rpc.methods.commands import register_commands_methods
 from opendde_harness.tui_rpc.methods.config import register_config_methods
 from opendde_harness.tui_rpc.methods.confirm import register_confirm_methods
+from opendde_harness.tui_rpc.methods.instructions import register_instructions_methods
 from opendde_harness.tui_rpc.methods.model import register_model_methods
 from opendde_harness.tui_rpc.methods.question import register_question_methods
 from opendde_harness.tui_rpc.methods.reload import register_reload_methods
@@ -41,6 +32,9 @@ from opendde_harness.tui_rpc.methods.terminal import register_terminal_methods
 from opendde_harness.tui_rpc.methods.turn import register_turn_methods
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+    from typing import Any
+
     from opendde_harness.spine.scheduler import Scheduler
     from opendde_harness.tui_rpc.approval_broker import ApprovalBroker
     from opendde_harness.tui_rpc.confirm_broker import ConfirmBroker
@@ -49,6 +43,8 @@ if TYPE_CHECKING:
     from opendde_harness.tui_rpc.methods.session import AgentLoopFactory
     from opendde_harness.tui_rpc.question_broker import QuestionBroker
     from opendde_harness.tui_rpc.subscriptions import SubscriptionEmitter
+
+    SendFrame = Callable[[dict[str, Any]], Awaitable[None]]
 
 
 def register_aligned_methods(
@@ -62,6 +58,7 @@ def register_aligned_methods(
     scheduler: "Scheduler | None" = None,
     turn_ids: "dict[str, str] | None" = None,
     build_error: "RpcError | None" = None,
+    send_frame: "SendFrame | None" = None,
 ) -> None:
     """Register every aligned RPC handler on a dispatcher.
 
@@ -77,6 +74,9 @@ def register_aligned_methods(
     ``confirm_broker`` is forwarded to :func:`register_confirm_methods`;
     ``approval_broker`` gates the shell approval response surface so callers
     without an interactive broker do not expose an unusable approval method.
+    ``send_frame`` is the notification sink, and it gates the ``model.login``
+    group for the same reason: a sign-in that cannot push its steps shows the
+    user nothing.
     """
     register_system_methods(dispatcher)
     register_aligned_methods_except_system(
@@ -89,6 +89,7 @@ def register_aligned_methods(
         scheduler=scheduler,
         turn_ids=turn_ids,
         build_error=build_error,
+        send_frame=send_frame,
     )
 
 
@@ -103,6 +104,7 @@ def register_aligned_methods_except_system(
     scheduler: "Scheduler | None" = None,
     turn_ids: "dict[str, str] | None" = None,
     build_error: "RpcError | None" = None,
+    send_frame: "SendFrame | None" = None,
 ) -> None:
     """Register every aligned RPC handler EXCEPT system.* on a dispatcher.
 
@@ -120,10 +122,11 @@ def register_aligned_methods_except_system(
     register_reload_methods(dispatcher)
     register_config_methods(dispatcher, agent_loop_factory=agent_loop_factory)
     register_session_methods(dispatcher, agent_loop_factory=agent_loop_factory)
+    register_instructions_methods(dispatcher)
     register_terminal_methods(dispatcher)
-    register_model_methods(dispatcher, agent_loop_factory=agent_loop_factory)
+    register_model_methods(dispatcher, agent_loop_factory=agent_loop_factory, send_frame=send_frame)
     register_commands_methods(dispatcher)
-    register_slash_routing_methods(dispatcher, confirm_broker=confirm_broker)
+    register_slash_routing_methods(dispatcher, confirm_broker=confirm_broker, agent_loop_factory=agent_loop_factory)
     # Unlike generic stubs, approval.respond is a capability-bearing endpoint.
     # Register it only when this gateway owns an interactive approval broker.
     if approval_broker is not None:

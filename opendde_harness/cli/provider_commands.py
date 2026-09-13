@@ -1,35 +1,32 @@
 """Provider subcommands — owns the ``provider_app`` Typer instance.
 
+A provider is named by its pi provider id, exactly as ``config.json`` files it:
+``anthropic``, ``openai-codex``, ``azure-openai-responses``, or a name this
+config declared for a provider of its own. An id has one spelling, so there is
+nothing here that normalises a name or resolves an alias.
+
 Lifecycle commands:
 
-- ``provider login <name>`` — interactive OAuth login for OAuth-based
-  providers (OpenAI Codex, GitHub Copilot, MiniMax Global/CN)
+- ``provider login <id>`` — pi-ai's own OAuth sign-in, run inside the model
+  service (OpenAI Codex today). The grant lands in the service's credential
+  store, which is the same file it refreshes the token in.
 
 Config subcommands:
 
-- ``provider list``                 — overview of every provider's status
-- ``provider get <name>``           — current config (secrets redacted)
-- ``provider set <name> [...]``     — patch fields (--api-key, --api-base, ...)
-- ``provider test <name>``          — verify creds via free ``GET /v1/models``
-- ``provider reset <name>``         — restore schema defaults; OAuth providers
-                                      also lose their token file
-- ``provider show <name>``          — reflect available ``--flag`` fields
+- ``provider list``                 — the providers this config configures
+- ``provider get <id>``             — current entry (secrets redacted)
+- ``provider set <id> [...]``       — patch fields (--api-key, --base-url, --api, ...)
+- ``provider use <id>/<model>``     — make one model the agent's default
+- ``provider test <id>``            — ask the model a few tokens through the
+                                      model service, the way a turn would
+- ``provider reset <id>``           — remove the entry; a stored sign-in goes with it
+- ``provider show <id>``            — reflect available ``--flag`` fields
 
-Endpoint subcommands (``provider endpoint ...``) manage a plain API-key
-provider's ``endpoints`` list -- several full key/base/header groups under one
-section, for a vendor reachable by more than one account or region. OAuth
-providers and Azure OpenAI / OpenAI Codex reject this at startup; only vendors
-reached through the plain LiteLLM client accept it:
+Model subcommands (``provider model ...``) write one row of an entry's
+``models`` list -- what the user knows about a model that no catalogue does:
+the api it is served on, its context window and output ceiling, a name, a price:
 
-- ``provider endpoint add <name> --label X --api-key ... [--api-base ...]``
-- ``provider endpoint remove <name> --label X``
-- ``provider endpoint list <name>``
-
-Model subcommands (``provider model ...``) write one model's ``modelOverlay``
-entry -- what the user knows about a model that no catalogue does: the wire
-it is served on, its context window and output ceiling, a label:
-
-- ``provider model set <name> <model> [--wire chat|responses] [--context-window N] ...``
+- ``provider model set <id> <model> [--api openai-responses] [--context-window N] ...``
 
 Architecture: write operations go ONLY through
 :mod:`opendde_harness.config.update_providers`. Command bodies do not import
@@ -41,85 +38,70 @@ Architecture: write operations go ONLY through
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import sys
 from typing import Any
 
 import typer
+from loguru import logger
 from rich.console import Console
 from rich.table import Table
 
 from opendde_harness import __logo__
 
+# Eagerly, unlike every other import in this file: pi's id tables are pure data
+# with no imports of their own, and the ``--api`` flag's help names the wires it
+# accepts -- which is decided when the command is defined, not when it runs.
+from opendde_harness.providers import pi_ids
+
 console = Console()
-
-# Where GitHub's device-code response sends the user; LiteLLM prints it but does
-# not open it.
-_GITHUB_DEVICE_URL = "https://github.com/login/device"
-
 
 provider_app = typer.Typer(help="Manage providers")
 
 
-_LOGIN_HANDLERS: dict[str, callable] = {}
+# ---------------------------------------------------------------------------
+# Signing in
+# ---------------------------------------------------------------------------
+#
+# The flow itself is pi-ai's and runs inside the model service: it is the
+# process that holds the credential store and refreshes the token afterwards,
+# so it is the one that has to write the grant. What is left on this side is
+# the terminal -- printing each step the service reports, and opening a browser,
+# which a child process with no display cannot do.
 
 
-def _register_login(name: str):
-    def decorator(fn):
-        _LOGIN_HANDLERS[name] = fn
-        return fn
+class ConsoleInteraction:
+    """How a sign-in reaches the person who asked for it, on a terminal.
 
-    return decorator
-
-
-@provider_app.command("login")
-def provider_login(
-    provider: str = typer.Argument(..., help="OAuth provider (e.g. 'openai-codex', 'minimax-global')"),
-):
-    """Authenticate with an OAuth provider."""
-    from opendde_harness.providers.registry import PROVIDERS
-
-    key = provider.replace("-", "_")
-    spec = next((s for s in PROVIDERS if s.name == key and s.is_oauth), None)
-    if not spec:
-        names = ", ".join(s.name.replace("_", "-") for s in PROVIDERS if s.is_oauth)
-        console.print(f"[red]Unknown OAuth provider: {provider}[/red]  Supported: {names}")
-        raise typer.Exit(1)
-
-    handler = _LOGIN_HANDLERS.get(spec.name)
-    if not handler:
-        console.print(f"[red]Login not implemented for {spec.label}[/red]")
-        raise typer.Exit(1)
-
-    console.print(f"{__logo__} OAuth Login - {spec.label}\n")
-    handler()
-
-    # Here rather than in each handler: two of the three drivers that write these
-    # files are LiteLLM's and create them under the process umask, and a family
-    # added later would be the third place to forget. What a sign-in can leave
-    # behind is already answered once, for disconnect.
-    from opendde_harness.config.paths import restrict_to_owner
-    from opendde_harness.config.update_providers import oauth_credential_files
-
-    restrict_to_owner(*oauth_credential_files(spec.name))
-
-
-def _open_device_page(url: str) -> None:
-    """Hand the user a browser on the page their device code goes into.
-
-    The drivers that own these flows print the URL and stop there, so this is the
-    only reason the login commands differ from just calling them.
+    Two things, because two things are all the service cannot do for itself:
+    print a line, and hand the user a browser. The prompts pi's flow asks are
+    answered inside the service (the login-method menu) or left to the browser
+    callback (the paste-the-code fallback), so nothing here reads input.
     """
-    if not _can_open_browser():
-        return
 
-    import webbrowser
+    def __init__(self, *, open_browser: bool = True) -> None:
+        self._open_browser = open_browser and _can_open_browser()
 
-    if webbrowser.open(url):
-        console.print(f"[dim]opened {url}[/dim]")
-    else:
-        console.print(f"visit {url} and enter the code below")
+    def notify(self, message: str) -> None:
+        console.print(message)
+
+    def open_url(self, url: str) -> bool:
+        """Hand the user a browser, or say there is none to hand them.
+
+        The vendors that own these flows print a URL and stop there, which is
+        the only reason the sign-in commands do anything beyond running them.
+        """
+        if not self._open_browser or not url:
+            return False
+
+        import webbrowser
+
+        try:
+            return bool(webbrowser.open(url))
+        except Exception:  # noqa: BLE001 - a missing browser is not an error here
+            return False
 
 
 def _can_open_browser() -> bool:
@@ -133,110 +115,162 @@ def _can_open_browser() -> bool:
     return True
 
 
-@_register_login("openai_codex")
-def _login_openai_codex() -> None:
-    # LiteLLM's driver owns this flow: it requests the device code, prints the
-    # page and the code, polls, and writes the credential where the request path
-    # will look for it. Asking it for a token is the whole login.
-    from opendde_harness.providers.litellm_setup import import_litellm
+def _show_login_event(event: dict[str, Any], interaction: ConsoleInteraction) -> None:
+    """One step of pi's flow, as the line or two a terminal should show.
 
-    import_litellm()
-    from litellm.llms.chatgpt.authenticator import Authenticator
-    from litellm.llms.chatgpt.common_utils import CHATGPT_DEVICE_VERIFY_URL
-
-    from opendde_harness.providers.chatgpt_token import access_token_and_account, clear_abandoned_device_code
-
-    # Asked whether a credential is stored, this said yes for a revoked one -- and
-    # the error that sends the user here is raised by the same revocation, so the
-    # two answers pointed at each other. Ask whether one still works instead;
-    # that call refreshes but cannot start a login, so a dead credential falls
-    # through to the flow the user came for.
-    try:
-        access_token_and_account()
-    except Exception:
-        pass
-    else:
-        console.print("[green]Already signed in to OpenAI Codex.[/green]")
-        console.print("[dim]To sign in as someone else: ddeharness provider reset openai-codex[/dim]")
+    pi notifies four shapes (``AuthEvent``): a device code and where to type it,
+    a sign-in URL, an informational line, a progress line. A prompt arrives as
+    ``ask`` and is reported rather than answered -- the service settles the
+    login-method menu itself and leaves the paste-the-code prompt to its own
+    callback -- so the only one worth saying anything about is the wait.
+    """
+    notify = event.get("notify")
+    if isinstance(notify, dict):
+        kind = notify.get("type")
+        if kind == "device_code":
+            uri = str(notify.get("verificationUri") or "")
+            code = str(notify.get("userCode") or "")
+            interaction.notify(f"Open [cyan]{uri}[/cyan] and enter the code [bold]{code}[/bold]")
+            if interaction.open_url(uri):
+                interaction.notify("[dim]Opened in your browser. This waits until you are done.[/dim]")
+            else:
+                interaction.notify("[dim]This waits until you are done.[/dim]")
+            return
+        if kind == "auth_url":
+            url = str(notify.get("url") or "")
+            if interaction.open_url(url):
+                interaction.notify(f"[dim]Opened {url}[/dim]")
+            else:
+                interaction.notify(f"Sign in at [cyan]{url}[/cyan]")
+            interaction.notify(f"[dim]{notify.get('instructions') or 'Finish there, then come back here.'}[/dim]")
+            return
+        message = str(notify.get("message") or "")
+        if message:
+            interaction.notify(f"[dim]{message}[/dim]")
+        for link in notify.get("links") or ():
+            if isinstance(link, dict) and link.get("url"):
+                interaction.notify(f"  [dim]{link.get('label') or 'See'}: {link['url']}[/dim]")
         return
+    ask = event.get("ask")
+    if isinstance(ask, dict) and ask.get("type") == "manual_code":
+        interaction.notify("[dim]Waiting for the browser to come back…[/dim]")
 
-    # Otherwise the driver would wait for the earlier attempt to land rather than
-    # start this one, silently, for as long as five minutes.
-    if clear_abandoned_device_code():
-        console.print("[dim]Discarded an unfinished sign-in from an earlier attempt.[/dim]")
 
-    console.print("[cyan]Starting ChatGPT device flow...[/cyan]\n")
-    _open_device_page(CHATGPT_DEVICE_VERIFY_URL)
+#: What ``--method`` accepts, and the mode the service's ``login`` takes for it.
+_LOGIN_MODES = {"browser": "browser", "device": "device_code", "device_code": "device_code"}
 
+#: The default, and why it is not the browser: device code completes on any
+#: machine and binds no port, while browser login finishes on the service's own
+#: localhost callback -- and when that port is taken, pi falls back to asking
+#: for the code to be pasted, which nothing on this side of the pipe can answer.
+_DEFAULT_LOGIN_MODE = "device_code"
+
+
+@provider_app.command("login")
+def provider_login(
+    provider: str = typer.Argument(..., help="Provider that signs in (e.g. 'openai-codex')"),
+    method: str = typer.Option(
+        "",
+        "--method",
+        help="'device' (default: a code to type, works headless) or 'browser' (a localhost callback)",
+    ),
+    no_browser: bool = typer.Option(False, "--no-browser", help="Print the sign-in URL instead of opening it"),
+):
+    """Sign in to a provider that is reached by OAuth."""
+    name = provider.strip()
+    _refuse_unnameable(name)
+
+    # pi owns the set that signs in, so the answer for anything else is the key
+    # path rather than a device flow that no vendor here would honour.
+    if name not in pi_ids.OAUTH:
+        signs_in = ", ".join(sorted(pi_ids.OAUTH))
+        console.print(f"[red]{name} is not signed in to[/red]  The ones that are: {signs_in}")
+        console.print(f"  [dim]A key goes in with `ddeharness provider set {name} --api-key <key>`.[/dim]")
+        raise typer.Exit(1)
+
+    # Before anything talks to a vendor: an option this command does not accept
+    # used to be swallowed by a handler's catch-all, so a command rejected on
+    # its own terms still started a device flow and printed a code.
+    mode = _LOGIN_MODES.get((method or _DEFAULT_LOGIN_MODE).lower())
+    if mode is None:
+        console.print(f"[red]Unknown sign-in method: {method}[/red]  Supported: browser, device")
+        raise typer.Exit(1)
+
+    label = _display_name(name)
+    console.print(f"{__logo__} OAuth Login - {label}\n")
+    run_login(name, label, mode=mode, open_browser=not no_browser)
+
+
+def run_login(provider: str, label: str, *, mode: str = _DEFAULT_LOGIN_MODE, open_browser: bool = True) -> None:
+    """Run this provider's sign-in through the model service and report it.
+
+    Success means a credential was stored, not that a model answered: proving a
+    sign-in by asking a model for one token conflates holding a credential with
+    being entitled to that model, and bills the user to find out.
+
+    Called by the command above and by the onboarding wizard, so both end in one
+    flow and one store. The wizard wants a boolean rather than an exit, which is
+    why it catches ``typer.Exit`` instead of this raising something of its own.
+    """
+    from opendde_harness.providers.model_service import ModelServiceError
+
+    interaction = ConsoleInteraction(open_browser=open_browser)
     try:
-        token = Authenticator().get_access_token()
-    except Exception as exc:
-        console.print(f"[red]Authentication error: {exc}[/red]")
+        result = asyncio.run(_login_through_the_service(provider, mode=mode, interaction=interaction))
+    except KeyboardInterrupt:
+        console.print("[yellow]Sign-in cancelled.[/yellow]")
+        raise typer.Exit(1)
+    except ModelServiceError as exc:
+        # The code is ours -- "login_failed", "no_node", "no_bundle" -- and says
+        # which of the three went wrong. The message is pi's or a vendor's, and
+        # a failed token exchange can quote what it was given, so it goes to the
+        # debug log rather than to the screen.
+        console.print(f"[red]Sign-in failed ({exc.code}).[/red]")
+        if exc.code == "login_failed":
+            console.print("  [dim]Try again, or run with --method browser.[/dim]")
+        logger.debug("provider login: {} failed: {}", provider, exc)
+        raise typer.Exit(1)
+    except Exception:  # noqa: BLE001 - reported, not raised
+        console.print("[red]Sign-in failed.[/red]  [dim]Try again, or run with --method browser.[/dim]")
+        logger.debug("provider login: {} failed", provider, exc_info=True)
         raise typer.Exit(1)
 
-    if not token:
-        console.print("[red]✗ Authentication failed[/red]")
-        raise typer.Exit(1)
-
-    console.print("[green]✓ Authenticated with OpenAI Codex[/green]")
-
-
-@_register_login("github_copilot")
-def _login_github_copilot() -> None:
-    import asyncio
-
-    console.print("[cyan]Starting GitHub Copilot device flow...[/cyan]\n")
-
-    # The page is the same URL GitHub's device-code response returns, and the code
-    # has to be typed into it either way -- opening it before the code appears
-    # costs the user nothing.
-    _open_device_page(_GITHUB_DEVICE_URL)
-
-    async def _trigger():
-        from opendde_harness.providers.litellm_setup import import_litellm
-
-        litellm = import_litellm()
-        await litellm.acompletion(
-            model="github_copilot/gpt-4o",
-            messages=[{"role": "user", "content": "hi"}],
-            max_tokens=1,
-        )
-
-    try:
-        asyncio.run(_trigger())
-        console.print("[green]✓ Authenticated with GitHub Copilot[/green]")
-    except Exception as e:
-        console.print(f"[red]Authentication error: {e}[/red]")
-        raise typer.Exit(1)
-
-
-def _login_minimax(region: str, label: str) -> None:
-    from opendde_harness.providers.minimax_oauth import login
-
-    console.print("[cyan]Starting MiniMax device flow...[/cyan]\n")
-    try:
-        token = login(
-            region,
-            print_fn=lambda message: console.print(message),
-            open_browser=_can_open_browser(),
-        )
-    except Exception as exc:
-        console.print(f"[red]Authentication error: {exc}[/red]")
-        raise typer.Exit(1)
-    if not token.access:
-        console.print("[red]Authentication failed[/red]")
+    if result.get("type") != "oauth":
+        # pi answers with the credential's own type. Anything but a grant means
+        # the flow completed as something this command did not ask for.
+        console.print(f"[red]Sign-in did not produce a grant for {label}.[/red]")
         raise typer.Exit(1)
     console.print(f"[green]Authenticated with {label}[/green]")
 
 
-@_register_login("minimax_global")
-def _login_minimax_global() -> None:
-    _login_minimax("global", "MiniMax Global")
+async def _login_through_the_service(provider: str, *, mode: str, interaction: ConsoleInteraction) -> dict[str, Any]:
+    """pi's own flow, run in the model service, its steps printed as they arrive.
 
+    The service is configured first, from this config: that is what hands it the
+    credential store the grant has to land in, and it is the only way a sign-in
+    survives the command that made it.
 
-@_register_login("minimax_cn")
-def _login_minimax_cn() -> None:
-    _login_minimax("cn", "MiniMax CN")
+    The provider goes over as it was typed. It is a pi provider id on both sides
+    of the pipe -- the config files it under that id and pi's own auth map is
+    keyed by it -- so the translation step this used to make was a chance for the
+    two to disagree and nothing else.
+    """
+    from opendde_harness.config.loader import load_config
+    from opendde_harness.providers.pi_service import get_service, shutdown_service
+
+    try:
+        service = await get_service(load_config())
+        result: dict[str, Any] = {}
+        async for step in service.login(provider, mode=mode):
+            if step.get("type") == "login_prompt":
+                _show_login_event(step, interaction)
+            else:
+                result = step
+        return result
+    finally:
+        # This command owns the process, so the child goes with it rather than
+        # being left for the atexit signal.
+        await shutdown_service()
 
 
 def _help_requested(extra_args: list[str]) -> bool:
@@ -244,19 +278,129 @@ def _help_requested(extra_args: list[str]) -> bool:
     return any(t in ("--help", "-h") or t.startswith("--help=") for t in extra_args)
 
 
-def _print_schema_table(name: str) -> None:
-    """Render a provider's field-spec table.
+def _refuse_unnameable(provider: str) -> None:
+    """Stop on a name that cannot be a providers key, before anything is shown.
 
-    Shared by ``show``, ``set --help`` interception, and the empty-flag
-    fallback in ``set``.
+    Two cases, each worth its own sentence. A product this project removed is
+    gone whatever is written for it. A near-miss for a pi id would be read as a
+    provider this config declares and then refused for having no address, which
+    is a true sentence about the wrong problem.
+
+    The write paths refuse both as well; this is here because the read-only
+    surfaces -- ``show``, ``set --help`` -- describe one entry schema for every
+    provider, so without it they would answer a question about a provider that
+    does not exist.
     """
-    from opendde_harness.config.update_providers import provider_field_specs
+    removed = pi_ids.removed_message(provider)
+    if removed:
+        console.print(f"[red]✗[/red] {removed}")
+        raise typer.Exit(1)
+    meant = pi_ids.suggestion(provider)
+    if meant:
+        console.print(f"[red]✗[/red] {provider!r} is not a pi provider id -- {meant!r} is the one that reaches it.")
+        console.print(f"  [dim]Run the same command with [cyan]{meant}[/cyan].[/dim]")
+        raise typer.Exit(1)
+
+
+def _reason(exc: Exception) -> str:
+    """The sentence a refusal was raised with, without the exception's own quotes.
+
+    The write paths raise ``KeyError`` for a name or a field no entry can hold,
+    and its message is a whole sentence -- which ``str()`` then wraps in quotes,
+    because a ``KeyError``'s argument is normally a key. Printed that way the
+    user reads a quoted fragment rather than the sentence.
+    """
+    return str(exc.args[0]) if exc.args else str(exc)
+
+
+def _rejection(exc: Exception) -> str:
+    """Why a write was refused, as lines that name keys and never values.
+
+    A ``ValidationError``'s readable form renders an ``input_value=`` for every
+    error, and the rejected input here is a providers entry holding the user's
+    key. So the errors are formatted from their own location and message, and
+    anything else -- the ``ValueError`` the write path raises when a write would
+    leave the section unloadable, a ``KeyError`` naming a field -- prints its
+    sentence.
+    """
+    from pydantic import ValidationError
+
+    if isinstance(exc, ValidationError):
+        return "\n".join(
+            f"  {'.'.join(str(part) for part in error.get('loc') or ()) or 'providers'}: "
+            f"{str(error.get('msg') or '').removeprefix('Value error, ')}"
+            for error in exc.errors()
+        )
+    return _reason(exc)
+
+
+def _display_name(provider: str) -> str:
+    """What to call this provider on screen: its own name, else pi's, else the id.
+
+    The entry's ``name`` is the only part of this that is not pi's to answer,
+    and a provider being signed in to may have no entry yet -- so a missing or
+    unreadable config leaves pi's name rather than failing a report.
+    """
+    declared = ""
+    try:
+        from opendde_harness.config.update_providers import get_provider_config
+
+        declared = str(get_provider_config(provider).get("name") or "")
+    except Exception:  # noqa: BLE001 - a report never fails on the config it reports about
+        declared = ""
+    return pi_ids.display_name(provider, declared)
+
+
+def _credential_store_path() -> str:
+    """Where stored sign-ins live, for a message about a damaged one.
+
+    Named rather than described: the file a person has to move aside is one they
+    have never had a reason to know the location of, and "your credential file"
+    is not a path. One file holds every provider's -- pi's credential store.
+    """
+    try:
+        from opendde_harness.providers.pi_service import credential_store_path
+
+        return str(credential_store_path())
+    except Exception:
+        # A report never fails on the thing it is reporting about.
+        return ""
+
+
+def _has_entry(provider: str) -> bool:
+    """Does the config hold an entry for this provider at all?
+
+    ``list_providers`` is the configured set, so membership in it is the
+    question. Asked where the difference matters: an entry schema reads the same
+    whether or not one was ever written, and "removed" is a false report about a
+    provider that was never there.
+    """
+    from opendde_harness.config.update_providers import list_providers
 
     try:
-        specs = provider_field_specs(name)
-    except KeyError as exc:
-        console.print(f"[red]✗[/red] {exc}")
-        raise typer.Exit(1)
+        return any(row["name"] == provider for row in list_providers())
+    except Exception:  # noqa: BLE001 - an unreadable config simply holds no entry we can name
+        return False
+
+
+def _print_schema_table(name: str) -> None:
+    """Render the provider entry's field-spec table.
+
+    Shared by ``show``, ``set --help`` interception, and the empty-flag
+    fallback in ``set``. One schema serves every provider now, so what differs
+    between two of them is only which fields their route reads -- which is why
+    the name is still asked for.
+    """
+    from opendde_harness.config.update_providers import provider_field_specs, unread_fields
+
+    _refuse_unnameable(name)
+    specs = provider_field_specs()
+
+    # A flag this provider's route never reads is not a flag. Listed, they read
+    # as the way to configure a family that is configured by signing in, or as
+    # an invitation to override an address pi already carries.
+    unread = {path: why for path, why in unread_fields(name).items() if path in specs}
+    specs = {path: spec for path, spec in specs.items() if path not in unread}
 
     table = Table(title=f"Provider: {name}")
     table.add_column("Flag", style="cyan", no_wrap=True)
@@ -276,36 +420,40 @@ def _print_schema_table(name: str) -> None:
             spec.get("description", "") or "",
         )
     console.print(table)
+    for path, why in unread.items():
+        console.print(f"[dim]--{path.replace('_', '-')} is not read for this provider: {why}.[/dim]")
 
 
 def _parse_provider_flags(extra_args: list[str], provider_name: str) -> dict[str, Any]:
-    """Parse arbitrary ``--flag value`` pairs against a provider's Pydantic schema.
+    """Parse arbitrary ``--flag value`` pairs against the provider entry schema.
 
     Mirrors ``_parse_channel_flags`` (opendde_harness/cli/channel_commands.py:109) — the
     same six forms supported there work here:
 
     - ``--api-key abc``     -> ``{"api_key": "abc"}``
     - ``--api-key=abc``     -> ``{"api_key": "abc"}``
-    - ``--api-base X``      -> ``{"api_base": "X"}``     (kebab -> snake)
+    - ``--base-url X``      -> ``{"base_url": "X"}``     (kebab -> snake)
     - ``--<flag> true``     -> ``{"<flag>": "true"}``     (string; the schema coerces)
     - ``--no-<flag>``       -> ``{"<flag>": False}``      (bool negative)
     - ``--<flag>`` alone    -> ``{"<flag>": True}``       (bool positive)
 
     Values come back as written; only the two valueless forms produce a bool
     here, and the schema coerces the rest on validation. The bool forms are
-    named generically because no provider declares a bool field today -- the one
-    that did (Gemini's ``vertex``) described a mechanism that never existed and
-    was removed. They stay, matching ``_parse_channel_flags``, so a provider
-    gaining one needs no parser change.
+    named generically because no field of a provider entry is a bool today --
+    the one that was (Gemini's ``vertex``) described a mechanism that never
+    existed and was removed. They stay, matching ``_parse_channel_flags``, so a
+    field gaining one needs no parser change.
+
+    The flags ARE the entry's fields: one reflected schema for every provider,
+    so ``--api-key``, ``--base-url``, ``--api``, ``--headers``, ``--models``,
+    ``--login`` and ``--name`` are here because ``ProviderEntry`` declares them
+    and for no other reason.
 
     Unknown fields raise ``typer.BadParameter`` pointing at ``provider show``.
     """
     from opendde_harness.config.update_providers import provider_field_specs
 
-    try:
-        specs = provider_field_specs(provider_name)
-    except KeyError as exc:
-        raise typer.BadParameter(str(exc))
+    specs = provider_field_specs()
 
     def _normalize(flag: str) -> str:
         return ".".join(seg.replace("-", "_") for seg in flag.split("."))
@@ -357,40 +505,10 @@ def _parse_provider_flags(extra_args: list[str], provider_name: str) -> dict[str
     return out
 
 
-def _load_section(name: str) -> dict | None:
-    """This provider's stored fields, or None when it has no section yet."""
-    from opendde_harness.config.update_providers import get_provider_config
-
-    try:
-        return get_provider_config(name, redact_secrets=False)
-    except KeyError:
-        return None
-
-
-def _ineffective_because(provider: str, model: str) -> list[str]:
-    """Reasons this model will not actually be used, despite being written.
-
-    A stale ``agents.defaults.provider`` used to be the other one, and the note
-    for it told the user to edit a field no command wrote. Both surfaces that
-    change a model now write it by the same rule, so the note would be advice
-    about a state neither of them produces.
-    """
-    from opendde_harness.config.loader import load_config
-
-    try:
-        config = load_config()
-    except Exception:
-        return []
-
-    notes: list[str] = []
-    section = config.providers.get(provider)
-    deployment = getattr(section, "deployment", "") if section else ""
-    if deployment:
-        notes.append(
-            f"providers.{provider}.deployment is set to {deployment!r}, which decides the "
-            f"deployment regardless of the model id."
-        )
-    return notes
+#: A few of pi's built-in ids, for somebody who has nothing configured yet. The
+#: full set is forty entries long and choosing from it is what the wizard is
+#: for, so these are the handful people arrive already holding a key for.
+_SAMPLE_BUILTINS = ("anthropic", "openai", "openai-codex", "google", "openrouter", "deepseek")
 
 
 def _register_config_commands(app: typer.Typer) -> None:
@@ -399,43 +517,84 @@ def _register_config_commands(app: typer.Typer) -> None:
 
     @app.command("list")
     def provider_list_cmd():
-        """Show status of every LLM provider declared on ``ProvidersConfig``."""
+        """Show every provider this config configures, and whether it is usable."""
         from opendde_harness.config.update_providers import list_providers
+
+        rows = list_providers()
+        if not rows:
+            # Empty is the normal state of a fresh install, not a fault: the
+            # listing is the configured set, and pi's built-in ids are offered by
+            # the wizard rather than printed here -- forty rows of "not set" is
+            # not a status report.
+            console.print("[yellow]No providers are configured yet.[/yellow]")
+            console.print(
+                "  Run [cyan]ddeharness onboard[/cyan] to pick one -- that is where pi's built-in providers "
+                "are offered."
+            )
+            console.print(
+                f"  [dim]Already have a key? [cyan]ddeharness provider set <id> --api-key <key>[/cyan] "
+                f"-- ids such as {', '.join(_SAMPLE_BUILTINS)}.[/dim]"
+            )
+            return
 
         table = Table(title="LLM Providers")
         table.add_column("Name", style="cyan", no_wrap=True)
         table.add_column("Display", style="dim", overflow="fold")
         table.add_column("Type", no_wrap=True)
         table.add_column("Status", no_wrap=True)
-        table.add_column("API Base", overflow="fold")
-        for p in list_providers():
+        table.add_column("Base URL", overflow="fold")
+        damaged: list[str] = []
+        for p in rows:
             if p["is_oauth"]:
                 type_str = "OAuth"
-            elif p["is_local"]:
-                type_str = "Local"
-            elif p["is_gateway"]:
-                type_str = "Gateway"
+            elif p["base_url"]:
+                # An address is what makes an entry a declaration, whether or not
+                # pi ships the id: an Azure resource declared under a built-in id
+                # carries its own deployment names and replaces pi's own for it.
+                type_str = "Declared"
+            elif p["is_builtin"]:
+                type_str = "API key"
             else:
-                type_str = "API Key"
-            status = "[green]✓ configured[/green]" if p["configured"] else "[dim]not set[/dim]"
+                # A key pi does not ship can only have been meant as a
+                # declaration; the Status column says what it still needs.
+                type_str = "Declared"
+            if p["configured"]:
+                status = "[green]✓ configured[/green]"
+            elif p.get("credential_state") == "invalid":
+                # Present and unreadable is not signed out, and the two are
+                # fixed differently: one is a sign-in, the other needs the file
+                # moved aside first.
+                damaged.append(p["name"])
+                status = "[red]✗ unreadable[/red]"
+            else:
+                status = "[dim]not set[/dim]"
             table.add_row(
                 p["name"],
                 p["display_name"],
                 type_str,
                 status,
-                p.get("api_base") or "",
+                p.get("base_url") or "",
             )
         console.print(table)
+        if damaged:
+            path = _credential_store_path()
+            for name in damaged:
+                console.print(
+                    f"[yellow]{name}[/yellow]: the stored credential cannot be read"
+                    + (f" ({path})" if path else "")
+                    + f" -- move it aside, then run [cyan]ddeharness provider login {name}[/cyan]."
+                )
         console.print()
         console.print(
             "[dim]Use the [cyan]Name[/cyan] column with "
-            "'provider show/set/get <name>'. "
-            "Run 'provider show <name>' to see configurable fields.[/dim]"
+            "'provider show/set/get <id>'. "
+            "Run 'provider show <id>' to see configurable fields, or "
+            "'ddeharness onboard' to add another provider.[/dim]"
         )
 
     @app.command("get")
     def provider_get_cmd(
-        name: str = typer.Argument(..., help="Provider name (e.g. openrouter)"),
+        name: str = typer.Argument(..., help="Provider id (e.g. openrouter)"),
         show_secrets: bool = typer.Option(False, "--show-secrets", help="Show secret values in plaintext (dangerous)"),
     ):
         """Print current configuration for a provider. Secrets redacted by default."""
@@ -444,7 +603,7 @@ def _register_config_commands(app: typer.Typer) -> None:
         try:
             cfg = get_provider_config(name, redact_secrets=not show_secrets)
         except KeyError as exc:
-            console.print(f"[red]✗[/red] {exc}")
+            console.print(f"[red]✗[/red] {_reason(exc)}")
             raise typer.Exit(1)
 
         table = Table(title=f"Provider: {name}")
@@ -465,21 +624,27 @@ def _register_config_commands(app: typer.Typer) -> None:
     )
     def provider_set_cmd(
         ctx: typer.Context,
-        name: str = typer.Argument(..., help="Provider name"),
+        name: str = typer.Argument(..., help="Provider id"),
     ):
         """Patch provider fields using ``--flag value`` syntax.
+
+        The flags are the entry's own fields -- ``--api-key``, ``--base-url``,
+        ``--api``, ``--headers``, ``--models``, ``--login``, ``--name`` -- and
+        writing one is how a provider is configured: there is no empty block
+        waiting to be filled in. ``--base-url`` and ``--api`` go together, since
+        an address needs the protocol it serves and a protocol is only
+        meaningful for an address.
 
         Examples:
 
             ddeharness provider set openrouter --api-key sk-or-v1-...
-            ddeharness provider set azure-openai --api-key X --api-base https://...
-            ddeharness provider set gemini --api-key-list k1,k2
+            ddeharness provider set my-vllm --base-url http://host:8000/v1 --api openai-completions
+            ddeharness provider set my-vllm --models qwen3-32b,qwen3-8b
+            ddeharness provider set relay --headers '{"X-Tenant": "acme"}'
         """
         if _help_requested(ctx.args):
             _print_schema_table(name)
             raise typer.Exit(0)
-
-        from pydantic import ValidationError
 
         from opendde_harness.config.update_providers import set_provider_fields
 
@@ -491,14 +656,15 @@ def _register_config_commands(app: typer.Typer) -> None:
 
         try:
             prev = set_provider_fields(name, fields)
-        except KeyError as exc:
-            console.print(f"[red]✗[/red] {exc}")
+        except (KeyError, RuntimeError) as exc:
+            console.print(f"[red]✗[/red] {_reason(exc)}")
             raise typer.Exit(1)
-        except RuntimeError as exc:
-            console.print(f"[red]✗[/red] {exc}")
-            raise typer.Exit(1)
-        except ValidationError as exc:
-            console.print(f"[red]✗ Validation failed:[/red]\n{exc}")
+        except ValueError as exc:
+            # ``ValidationError`` is a ``ValueError``, and so is the refusal the
+            # write path raises when an entry would leave the whole section
+            # unloadable -- the sentence naming the missing baseUrl and api.
+            # Both are the same answer to the user and neither reaches the file.
+            console.print(f"[red]✗ Refused:[/red]\n{_rejection(exc)}")
             raise typer.Exit(1)
 
         console.print(f"[green]✓[/green] {name} updated: {', '.join(prev)}")
@@ -506,50 +672,44 @@ def _register_config_commands(app: typer.Typer) -> None:
 
     @app.command("test")
     def provider_test_cmd(
-        name: str = typer.Argument(..., help="Provider name"),
-        timeout: int = typer.Option(10, "--timeout", "-t", help="Timeout seconds"),
+        name: str = typer.Argument(..., help="Provider id"),
+        timeout: int = typer.Option(60, "--timeout", "-t", help="Timeout seconds"),
     ):
-        """Verify a provider's credentials via a free ``GET /v1/models`` call.
+        """Ask this provider for a few tokens, the way a turn would.
 
-        Does NOT consume inference quota — hits the provider's models metadata
-        endpoint, which is free, fast, and tells you whether the key is valid,
-        has credit, and isn't rate-limited.
+        Two questions, both through the model service: whether it resolves a
+        credential for the entry at all, then whether one of the models it serves
+        answers. It costs a handful of tokens. The free metadata ping it replaces
+        was cheaper and answered a different question -- seven vendors publish no
+        such route, Azure serves it elsewhere, and none of them says whether the
+        model will run.
         """
         from opendde_harness.config.update_providers import test_provider as probe
 
-        console.print(f"[dim]Pinging {name}/v1/models ...[/dim]")
-        try:
-            result = probe(name, timeout_s=timeout)
-        except KeyError as exc:
-            console.print(f"[red]✗[/red] {exc}")
-            raise typer.Exit(1)
+        console.print(f"[dim]Asking {name} for a few tokens ...[/dim]")
+        result = probe(name, timeout_s=timeout)
 
         if result["ok"]:
             console.print(
-                f"[green]✓[/green] {name} OK "
-                f"([dim]{result['models_count']} models available, "
-                f"responded in {result['elapsed_ms']}ms[/dim])"
+                f"[green]✓[/green] {name} OK ([dim]{result['model']} answered in {result['elapsed_ms']}ms[/dim])"
             )
             return
 
         hints = {
             "not_configured": f"Run: ddeharness provider set {name} --api-key <KEY>",
-            "invalid_key": f"Run: ddeharness provider set {name} --api-key <NEW-KEY>",
-            "no_credits": "Fund your account at the provider's billing page",
-            "rate_limited": "Wait a few minutes and retry, or switch provider",
-            "oauth_token_missing": (f"Run: ddeharness provider login {name.replace('_', '-')}"),
-            "network_error": "Check network / firewall / VPN settings",
+            "not_served": f"Run: ddeharness provider show {name} to see what the entry still needs",
+            "no_model": f"Run: ddeharness provider set {name} --models <model-id>",
+            "auth": f"The credential was refused. Run: ddeharness provider set {name} --api-key <NEW-KEY>",
+            "oauth": f"The stored sign-in could not be renewed. Run: ddeharness provider login {name}",
+            "model_not_found": "The service does not serve that model for this provider",
+            "timeout": "No answer in time -- check network / firewall / VPN, or raise --timeout",
+            "no_node": "The model service needs Node. Run: ddeharness doctor",
+            "no_bundle": "The model service is not built. Run: npm run build in ui-tui/",
+            "unknown_provider": "Run: ddeharness provider list to see the ids this config holds",
+            "config_unreadable": "Run: ddeharness doctor to see what the config file is refused for",
         }
-        if result["status"] == "no_probe_endpoint":
-            # Not a failure: this probe pings `/models`, and these vendors do not
-            # publish one at an address we hold. Saying "failed" here told seven
-            # correctly configured providers they were broken.
-            console.print(f"[yellow]?[/yellow] {name} not probed: {result['error']}")
-            console.print("  [dim]Credentials are set; run a turn to exercise them.[/dim]")
-            return
-
-        hint = hints.get(result["status"], "")
         console.print(f"[red]✗[/red] {name} failed: {result['status']}")
+        hint = hints.get(result["status"], "")
         if hint:
             console.print(f"  [dim]{hint}[/dim]")
         if result.get("error"):
@@ -567,39 +727,50 @@ def _register_config_commands(app: typer.Typer) -> None:
         onboarding could both switch models and the CLI could not, so a user on a
         headless box had six setup steps to walk to change one field.
 
-        The id is stored the way every other surface stores it -- naming its
-        provider -- so the three cannot disagree about what was chosen.
+        The id is stored qualified -- ``<provider>/<model>`` -- because that
+        prefix is the only thing that names the provider serving it. There is no
+        separate field to pin one any more, so nothing can disagree with the id
+        about what was chosen.
         """
         from opendde_harness.config.loader import load_config
         from opendde_harness.config.update import set_default_model
-        from opendde_harness.providers import pin
+        from opendde_harness.providers import model_id
         from opendde_harness.providers.auth import credential_status
-        from opendde_harness.providers.catalog import describe
-        from opendde_harness.providers.wire import stored_model_id
 
-        try:
-            pinned = load_config().agents.defaults.provider or ""
-        except Exception:
-            pinned = ""
-        # One rule for both entry points: the picker writes this field, and the
-        # CLI used to tell the user to hand-edit it instead.
-        resolved = pin.resolve(model, provider=provider, pinned=pinned)
-        if resolved is None:
+        named = model_id.provider_of(model)
+        asked = provider.strip()
+        chosen = asked or named
+        if not chosen:
             console.print(f"[red]✗[/red] cannot tell which provider serves {model!r}.")
             console.print(f"  [dim]Write it as <provider>/{model}, or pass --provider.[/dim]")
             raise typer.Exit(1)
+        if named and asked and named != asked:
+            # Two answers to one question. Picking either would write a default
+            # whose prefix sends the model to the other one's credential, so
+            # neither is written and the user says which they meant.
+            console.print(f"[red]✗[/red] {model!r} names {named}, but --provider says {asked}.")
+            console.print("  [dim]Drop one of the two.[/dim]")
+            raise typer.Exit(1)
+        _refuse_unnameable(chosen)
 
-        name = provider or (resolved if resolved != pin.AUTO else "")
-        if not name:
-            from opendde_harness.providers.registry import split_model_id
+        previous = set_default_model(model, provider=chosen)
+        stored = model_id.join(chosen, model)
 
-            name = split_model_id(model)[0]
+        # Read back rather than trust the write: the row that names this model
+        # and the credential that has to serve it both live in the file this
+        # command has just changed.
+        try:
+            config = load_config()
+        except Exception:  # noqa: BLE001 - the write happened; this is only the report
+            config = None
 
-        stored = stored_model_id(name, model) if name else model
-        previous = set_default_model(stored, provider=resolved)
-
-        row = describe(name, stored)
-        label = f"{row.label} ([dim]{stored}[/dim])" if row.described else stored
+        # The entry's own row is the only thing that names a model: the bundled
+        # catalogue that used to supply labels went with the Python routes, and
+        # the model service answers for a configured model, not for one being
+        # configured. Unlabelled, the id says it.
+        row = model_id.row_for(config.providers, stored) if config is not None else None
+        declared = (row.name if row else "") or ""
+        label = f"{declared} ([dim]{stored}[/dim])" if declared else stored
         console.print(f"[green]✓[/green] default model: {label}")
         if previous and previous != stored:
             console.print(f"  [dim]was {previous}[/dim]")
@@ -607,99 +778,87 @@ def _register_config_commands(app: typer.Typer) -> None:
         # Reported rather than refused: choosing a model before configuring its
         # provider is a normal order to do things in, and the startup gate says
         # the same thing again if it is still missing then.
-        status = credential_status(name, _load_section(name), include_external=True)
-        if not status.ok:
-            console.print(f"  [yellow]![/yellow] {status.summary}")
-            if resolved == pin.AUTO:
-                # "buy a key from this vendor" is the wrong advice for someone
-                # already paying a gateway to serve that vendor's models. Routing
-                # is left on auto precisely so the gateway can answer.
-                console.print(
-                    f"  [dim]Routing stays on auto, so a configured gateway can serve it. "
-                    f"To pin the gateway instead, write it as <gateway>/{stored}.[/dim]"
-                )
-
-        # An Azure deployment can still make this write have no effect, and it
-        # fails silently otherwise: the command reports success, the file
-        # changes, and requests keep going where they went before. The stale-pin
-        # case used to be the other one; this command now writes the pin itself.
-        for note in _ineffective_because(name, stored):
-            console.print(f"  [yellow]![/yellow] {note}")
+        if config is not None:
+            status = credential_status(chosen, config.providers.get(chosen), include_external=True)
+            if not status.ok:
+                console.print(f"  [yellow]![/yellow] {status.summary}")
 
     @app.command("reset")
     def provider_reset_cmd(
-        name: str = typer.Argument(..., help="Provider name"),
+        name: str = typer.Argument(..., help="Provider id"),
         yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
     ):
-        """Restore a provider to schema defaults. Key preserved, values reset.
+        """Remove a provider's entry from the config.
 
-        For OAuth providers the credential files under ``~/.opendde_harness/oauth`` are
-        deleted too, so the user is effectively logged out and must re-run
-        ``provider login`` to use it.
+        Removal rather than a rewrite to defaults: an entry exists because
+        somebody wrote it, and one emptied of its address and key is not a
+        provider with nothing configured -- for a declared provider it is not
+        even a valid entry. When the entry named a sign-in, the stored grant goes
+        with it, so the provider is signed out as well.
         """
         from opendde_harness.config.update_providers import (
             get_provider_config,
             reset_provider,
+            serves_default_model,
         )
+        from opendde_harness.providers.auth import CRED_ENDPOINT, CRED_OAUTH, credential_kind
 
         try:
             current = get_provider_config(name, redact_secrets=False)
         except KeyError as exc:
-            console.print(f"[red]✗[/red] {exc}")
+            console.print(f"[red]✗[/red] {_reason(exc)}")
             raise typer.Exit(1)
 
-        non_default = [k for k, v in current.items() if v not in (False, "", None, [], {})]
+        # An entry schema reads the same whether or not one was ever written, so
+        # without this the command would report having removed a provider the
+        # config never held.
+        if not _has_entry(name):
+            console.print(f"[yellow]{name} has no entry to remove.[/yellow]")
+            console.print("  [dim]`ddeharness provider list` shows the providers this config holds.[/dim]")
+            raise typer.Exit(1)
 
-        from opendde_harness.config.update_providers import serves_default_model
-        from opendde_harness.providers.registry import (
-            CRED_ENDPOINT,
-            CRED_LOCAL,
-            CRED_OAUTH,
-            credential_kind,
-        )
+        set_values = [k for k, v in current.items() if v not in (False, "", None, [], {})]
+        # Asked of the entry while it is still there: after the removal there is
+        # nothing left to say which kind it was, and the way back differs per
+        # kind. `provider login` exits 1 for anyone who is not a sign-in family,
+        # and a declared provider has an address to give rather than a key.
+        kind = credential_kind(name, current)
 
         # Asked before the confirmation, because it is the part worth confirming:
-        # the model id survives the reset and still names this provider, so the
+        # the model id survives the removal and still names this provider, so the
         # next command finds a default nothing can answer.
         serves_default = serves_default_model(name)
 
         if not yes:
-            console.print(f"This will reset [cyan]{name}[/cyan] to schema defaults.")
-            if non_default:
-                preview = ", ".join(non_default[:5])
-                more = f" (+{len(non_default) - 5} more)" if len(non_default) > 5 else ""
-                console.print(f"  Currently non-default: [yellow]{preview}{more}[/yellow]")
+            console.print(f"This will remove the [cyan]{name}[/cyan] entry from your config.")
+            if set_values:
+                preview = ", ".join(set_values[:5])
+                more = f" (+{len(set_values) - 5} more)" if len(set_values) > 5 else ""
+                console.print(f"  Currently set: [yellow]{preview}{more}[/yellow]")
+            if kind == CRED_OAUTH:
+                console.print("  [yellow]The stored sign-in is forgotten too[/yellow] -- you sign in again to use it.")
             if serves_default:
                 console.print("  [yellow]This provider serves your current default model[/yellow] -- pick another")
-                console.print("  [dim]afterwards with /model in the TUI, or sign in to it again.[/dim]")
+                console.print("  [dim]afterwards with /model in the TUI, or configure it again.[/dim]")
             if not typer.confirm("Continue?", default=False):
                 console.print("[yellow]Aborted.[/yellow]")
                 raise typer.Exit(0)
 
         reset_provider(name)
-        console.print(f"[green]✓[/green] {name} reset to defaults (key preserved, values cleared)")
+        console.print(f"[green]✓[/green] {name} removed from the providers section")
         if serves_default:
-            # By credential kind, because each kind is set up by a different
-            # command and a different field: `provider login` exits 1 for anyone
-            # who is not an OAuth family, and a local deployment has no key to
-            # give -- naming the wrong one sends the user to a command that
-            # refuses them or a flag that does nothing.
-            dashed = name.replace("_", "-")
-            kind = credential_kind(name)
             if kind == CRED_OAUTH:
-                back = f"ddeharness provider login {dashed}"
-            elif kind == CRED_LOCAL:
-                back = f"ddeharness provider set {dashed} --api-base <URL>"
+                back = f"ddeharness provider login {name}"
             elif kind == CRED_ENDPOINT:
-                back = f"ddeharness provider set {dashed} --api-key <KEY> --api-base <URL>"
+                back = f"ddeharness provider set {name} --base-url <URL> --api <API>"
             else:
-                back = f"ddeharness provider set {dashed} --api-key <KEY>"
+                back = f"ddeharness provider set {name} --api-key <KEY>"
             console.print("  [yellow]Your default model is served by this provider and no longer works.[/yellow]")
             console.print(f"  [dim]Pick another with /model in the TUI, or set it up again: {back}[/dim]")
 
     @app.command("show")
     def provider_show_cmd(
-        name: str = typer.Argument(..., help="Provider name to describe"),
+        name: str = typer.Argument(..., help="Provider id to describe"),
     ):
         """Show available ``--flag`` fields for a provider (reflection-driven)."""
         _print_schema_table(name)
@@ -708,192 +867,100 @@ def _register_config_commands(app: typer.Typer) -> None:
 _register_config_commands(provider_app)
 
 
-endpoint_app = typer.Typer(
-    help=(
-        "Manage a provider's endpoints -- several full key/base/header groups "
-        "under one section, for a vendor reachable by more than one account or "
-        "region. Only plain API-key providers accept this: a provider using "
-        "OAuth, or Azure OpenAI / OpenAI Codex, is rejected at startup if it has "
-        "any configured."
-    )
-)
-
-
-def _parse_extra_headers(value: str) -> dict[str, str] | None:
-    """Parse ``--extra-headers`` JSON into a dict, or None when unset."""
-    if not value:
-        return None
-    try:
-        parsed = json.loads(value)
-    except json.JSONDecodeError:
-        raise typer.BadParameter('--extra-headers must be a JSON object, e.g. \'{"X-Foo": "bar"}\'')
-    if not isinstance(parsed, dict):
-        raise typer.BadParameter("--extra-headers must be a JSON object")
-    return parsed
-
-
-@endpoint_app.command("add")
-def endpoint_add_cmd(
-    name: str = typer.Argument(..., help="Provider name (e.g. openrouter)"),
-    label: str = typer.Option(..., "--label", help="Idempotency key: an existing label is replaced, not merged"),
-    api_key: str = typer.Option(
-        "", "--api-key", help="API key for this endpoint (omit only for a local, keyless deployment)"
-    ),
-    api_base: str = typer.Option("", "--api-base", help="Base URL for this endpoint"),
-    extra_headers: str = typer.Option("", "--extra-headers", help='Extra headers as JSON, e.g. {"X-Foo": "bar"}'),
-):
-    """Add or replace one endpoint on a provider, keyed by ``--label``.
-
-    Only meaningful for plain API-key providers reached through the LiteLLM
-    client -- a provider using OAuth, or Azure OpenAI / OpenAI Codex, refuses
-    to start with any endpoints configured.
-    """
-    from pydantic import ValidationError
-
-    from opendde_harness.config.update_providers import add_provider_endpoint
-
-    headers = _parse_extra_headers(extra_headers)
-    try:
-        endpoints = add_provider_endpoint(
-            name,
-            label=label,
-            api_key=api_key,
-            api_base=api_base or None,
-            extra_headers=headers,
-        )
-    except (KeyError, RuntimeError) as exc:
-        console.print(f"[red]✗[/red] {exc}")
-        raise typer.Exit(1)
-    except ValidationError as exc:
-        console.print(f"[red]✗ Validation failed:[/red]\n{exc}")
-        raise typer.Exit(1)
-
-    console.print(f"[green]✓[/green] {name} endpoint {label!r} saved ({len(endpoints)} total)")
-
-
-@endpoint_app.command("remove")
-def endpoint_remove_cmd(
-    name: str = typer.Argument(..., help="Provider name"),
-    label: str = typer.Option(..., "--label", help="Label of the endpoint to remove"),
-):
-    """Remove one endpoint by ``--label`` (no-op if the label is not present)."""
-    from pydantic import ValidationError
-
-    from opendde_harness.config.update_providers import remove_provider_endpoint
-
-    try:
-        endpoints = remove_provider_endpoint(name, label)
-    except KeyError as exc:
-        console.print(f"[red]✗[/red] {exc}")
-        raise typer.Exit(1)
-    except ValidationError as exc:
-        console.print(f"[red]✗ Validation failed:[/red]\n{exc}")
-        raise typer.Exit(1)
-
-    console.print(f"[green]✓[/green] {name} endpoint {label!r} removed ({len(endpoints)} remaining)")
-
-
-@endpoint_app.command("list")
-def endpoint_list_cmd(
-    name: str = typer.Argument(..., help="Provider name"),
-):
-    """List a provider's endpoints. API keys redacted."""
-    from pydantic import ValidationError
-
-    from opendde_harness.config.update_providers import list_provider_endpoints
-
-    try:
-        endpoints = list_provider_endpoints(name)
-    except KeyError as exc:
-        console.print(f"[red]✗[/red] {exc}")
-        raise typer.Exit(1)
-    except ValidationError as exc:
-        console.print(f"[red]✗ Validation failed:[/red]\n{exc}")
-        raise typer.Exit(1)
-
-    table = Table(title=f"Provider endpoints: {name}")
-    table.add_column("Label", style="cyan", no_wrap=True)
-    table.add_column("API Key")
-    table.add_column("API Base", overflow="fold")
-    table.add_column("Extra Headers", overflow="fold")
-    for ep in endpoints:
-        table.add_row(
-            ep["label"],
-            ep["api_key"],
-            ep["api_base"] or "",
-            str(ep["extra_headers"]) if ep["extra_headers"] else "",
-        )
-    console.print(table)
-
-
-provider_app.add_typer(endpoint_app, name="endpoint")
-
-
 model_app = typer.Typer(
     help=(
-        "Describe one model under a provider: the wire it is served on "
-        "(--wire), its context window and output ceiling, a label. "
-        "Each flag patches one field of providers.<name>.modelOverlay.<model>; "
-        "the rest keep their values."
+        "Describe one model of a provider: the api it is served on (--api), its "
+        "context window and output ceiling, a name, a price. Each flag patches "
+        "one field of that model's row in providers.<id>.models; the rest keep "
+        "their values."
     )
 )
 
 
 @model_app.command("set")
 def model_set_cmd(
-    name: str = typer.Argument(..., help="Provider name"),
-    model: str = typer.Argument(..., help="Model id, in any spelling the provider accepts"),
-    wire: str = typer.Option(
-        "", "--wire", help="Wire for this model: chat (/v1/chat/completions) or responses (/v1/responses)"
+    provider: str = typer.Argument(..., help="Provider id"),
+    model: str = typer.Argument(..., help="Model id, as the endpoint itself serves it"),
+    api: str = typer.Option(
+        "", "--api", help=f"Wire for this one model, over the provider's own: {', '.join(pi_ids.APIS)}"
     ),
-    context_window: int = typer.Option(0, "--context-window", help="Context window in tokens"),
-    max_output_tokens: int = typer.Option(0, "--max-output-tokens", help="Output ceiling in tokens"),
+    context_window: int = typer.Option(None, "--context-window", help="Context window in tokens"),
+    max_tokens: int = typer.Option(None, "--max-tokens", help="Output ceiling in tokens"),
+    reasoning: bool = typer.Option(
+        None, "--reasoning/--no-reasoning", help="Whether this model thinks before it answers"
+    ),
     reasoning_effort: str = typer.Option(
         "", "--reasoning-effort", help="Thinking level for this model: off, minimal, low, medium, high, xhigh, max"
     ),
-    label: str = typer.Option("", "--label", help="Display name in the picker"),
+    temperature: float = typer.Option(None, "--temperature", help="Sampling temperature for this model"),
+    name: str = typer.Option("", "--name", help="Display name in the picker"),
     description: str = typer.Option("", "--description", help="One-line description in the picker"),
+    catalog_model: str = typer.Option(
+        "", "--catalog-model", help="Catalogue model this deployment serves, e.g. openai/gpt-4o"
+    ),
+    cost: str = typer.Option(
+        "", "--cost", help='Per-million rates as JSON: \'{"input": 3, "output": 15}\' (also cacheRead, cacheWrite)'
+    ),
 ):
     """Declare what you know about one model that no catalogue carries.
 
     Examples:
 
-        ddeharness provider model set custom gpt-5.6-terra --wire responses --context-window 262144
-        ddeharness provider model set hosted-vllm qwen3-32b --context-window 32768 --max-output-tokens 4096
+        ddeharness provider model set my-vllm qwen3-32b --context-window 131072 --max-tokens 32768
+        ddeharness provider model set relay gpt-5.6-terra --api openai-responses --reasoning
+        ddeharness provider model set azure-openai-responses prod --catalog-model openai/gpt-4o
         ddeharness provider model set openai-codex gpt-5.6-luna --reasoning-effort high
     """
-    from pydantic import ValidationError
-
-    from opendde_harness.config.update_providers import set_model_overlay
+    from opendde_harness.config.update_providers import set_model_row
 
     fields: dict[str, Any] = {}
-    if wire:
-        fields["wire"] = wire
-    if context_window:
-        fields["context_window_tokens"] = context_window
-    if max_output_tokens:
-        fields["max_output_tokens"] = max_output_tokens
+    if api:
+        fields["api"] = api
+    # ``is not None`` rather than truthiness for the three that have a
+    # meaningful zero: a temperature of 0 is a real setting, and a rejected 0 for
+    # the two limits should be reported as the refusal it is rather than read as
+    # "not passed".
+    if context_window is not None:
+        fields["context_window"] = context_window
+    if max_tokens is not None:
+        fields["max_tokens"] = max_tokens
+    if reasoning is not None:
+        fields["reasoning"] = reasoning
     if reasoning_effort:
         fields["reasoning_effort"] = reasoning_effort
-    if label:
-        fields["label"] = label
+    if temperature is not None:
+        fields["temperature"] = temperature
+    if name:
+        fields["name"] = name
     if description:
         fields["description"] = description
+    if catalog_model:
+        fields["catalog_model"] = catalog_model
+    if cost:
+        # A price is four numbers, so it arrives as the object pi's row holds
+        # rather than as four flags nobody would pass together.
+        try:
+            fields["cost"] = json.loads(cost)
+        except json.JSONDecodeError as exc:
+            raise typer.BadParameter(f"--cost is not valid JSON: {exc}")
     if not fields:
         raise typer.BadParameter(
-            "pass at least one of --wire, --context-window, --max-output-tokens, --reasoning-effort, --label, --description"
+            "pass at least one of --api, --context-window, --max-tokens, --reasoning/--no-reasoning, "
+            "--reasoning-effort, --temperature, --name, --description, --catalog-model, --cost"
         )
 
     try:
-        entry = set_model_overlay(name, model, fields)
+        row = set_model_row(provider, model, fields)
     except KeyError as exc:
-        console.print(f"[red]✗[/red] {exc}")
+        console.print(f"[red]✗[/red] {_reason(exc)}")
         raise typer.Exit(1)
-    except ValidationError as exc:
-        console.print(f"[red]✗ Validation failed:[/red]\n{exc}")
+    except ValueError as exc:
+        console.print(f"[red]✗ Refused:[/red]\n{_rejection(exc)}")
         raise typer.Exit(1)
 
-    console.print(f"[green]✓[/green] {name} / {model}: {json.dumps(entry)}")
+    # The row as stored, in the spelling the file holds it in, so what is printed
+    # is what a later read will find.
+    console.print(f"[green]✓[/green] {provider} / {row.get('id', model)}: {json.dumps(row)}")
 
 
 provider_app.add_typer(model_app, name="model")

@@ -1,14 +1,22 @@
 """Light/dark theme detection and palette for the interactive CLI.
 
-Dark values are the CLI's existing literals, so dark rendering is unchanged.
-Light values are chosen for legibility on white (body text must clear WCAG AA
-4.5:1); most are drawn from the TUI source of truth ``ui-tui/src/theme.ts`` (TS
-and Python cannot share code), but the mapping is not 1:1:
-  - accent / selected light use ``#6D28D9`` (theme.ts purple ramp .700), not the
-    brand accent ``#6D28D9`` (only 3.64:1 on white) -- the CLI uses accent as
-    inline body text, not large glyphs.
-  - border stays a purple accent (matching the CLI's purple panel borders), whereas
-    theme.ts ``border`` is a neutral grey; separator reuses that grey ``#d0d7de``.
+The palette follows the same standard as the terminal UI, whose values live in
+the TUI's theme module (``ui-tui/src/theme.ts``). TypeScript and Python cannot
+share code, so the values are restated here and must be changed in both places
+together.
+
+The standard is one rule: violet says identity, and everything else is neutral.
+So the prompt marker, the pointer and the answer keep the brand violet, and the
+body text, the greys, the rules and the panel borders take the neutral values
+the TUI borrows from the pi-claude-theme reference (see
+``LICENSES/README.md``). Body text is the terminal's own foreground rather
+than a color of ours, which is what ``INHERIT`` means below; the TUI does the
+same, and it is why a heading is bold rather than tinted.
+
+Measured against the ground each palette is drawn on, with body text clearing
+WCAG AA 4.5:1: light violet 5.70:1 and grey 5.74:1 on white, dark violet 6.13:1
+and grey 5.85:1 on #1E1E1E. Rules, borders and disabled text sit below that
+deliberately, which WCAG allows for what is neither body text nor a control.
 
 Detection is kept out of import time and runs on the first themed render (see
 ``onboard_commands._ThemedConsole``). Only truecolor values are provided;
@@ -33,30 +41,51 @@ POINTER = "❯"
 
 _LUMA_LIGHT_THRESHOLD = 0.6
 
+#: Body text is whatever the terminal already paints with. Each consumer
+#: spells that differently, so the palette carries a sentinel and the builders
+#: translate it.
+INHERIT = "inherit"
+
 PALETTE: dict[Scheme, dict[str, str]] = {
     "dark": {
         "accent": "#A78BFA",
-        "text": "#FFF5EA",
-        "heading": "white",
+        "text": INHERIT,
+        "heading": INHERIT,
         "selected": "#A78BFA",
-        "border": "#8B5CF6",
-        "muted": "#6c6c6c",
-        "separator": "#444444",
-        "disabled": "#585858",
-        "error": "#ff5f5f",
+        "border": "#505050",
+        "muted": "#999999",
+        "separator": "#505050",
+        "disabled": "#666666",
+        "error": "#FF6B80",
+        "ok": "#4EBA65",
+        "warn": "#FFC107",
     },
     "light": {
-        "accent": "#6D28D9",
-        "text": "#24201a",
-        "heading": "#24201a",
-        "selected": "#6D28D9",
-        "border": "#6D28D9",
-        "muted": "#57606a",
-        "separator": "#d0d7de",
-        "disabled": "#6e7681",
-        "error": "#cf222e",
+        "accent": "#7C3AED",
+        "text": INHERIT,
+        "heading": INHERIT,
+        "selected": "#7C3AED",
+        "border": "#AFAFAF",
+        "muted": "#666666",
+        "separator": "#AFAFAF",
+        "disabled": "#767676",
+        "error": "#AB2B3F",
+        "ok": "#2C7A39",
+        "warn": "#966C1E",
     },
 }
+
+
+def _rich(color: str) -> str:
+    """rich's name for the terminal's own foreground."""
+    return "default" if color == INHERIT else color
+
+
+def _prompt_toolkit(color: str) -> str:
+    """prompt_toolkit's name for the same. Its plain ``default`` is not one of
+    its color names; ``ansidefault`` is."""
+    return "ansidefault" if color == INHERIT else color
+
 
 _cache: Scheme | None = None
 
@@ -194,15 +223,17 @@ def build_rich_theme(scheme: Scheme):
     p = PALETTE[scheme]
     return Theme(
         {
-            "accent": p["accent"],
-            "text": p["text"],
-            "heading": _style_str(p["heading"], "bold"),
-            "selected": p["selected"],
-            "border": p["border"],
-            "muted": p["muted"],
-            "separator": p["separator"],
-            "disabled": p["disabled"],
-            "error": p["error"],
+            "accent": _rich(p["accent"]),
+            "text": _rich(p["text"]),
+            "heading": _style_str(_rich(p["heading"]), "bold"),
+            "selected": _rich(p["selected"]),
+            "border": _rich(p["border"]),
+            "muted": _rich(p["muted"]),
+            "separator": _rich(p["separator"]),
+            "disabled": _rich(p["disabled"]),
+            "error": _rich(p["error"]),
+            "ok": _rich(p["ok"]),
+            "warn": _rich(p["warn"]),
         }
     )
 
@@ -210,7 +241,7 @@ def build_rich_theme(scheme: Scheme):
 def build_questionary_style(scheme: Scheme):
     from questionary import Style
 
-    p = PALETTE[scheme]
+    p = {key: _prompt_toolkit(value) for key, value in PALETTE[scheme].items()}
     return Style(
         [
             ("qmark", f"fg:{p['accent']} bold"),

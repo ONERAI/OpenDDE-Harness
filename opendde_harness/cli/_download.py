@@ -6,6 +6,7 @@ import hashlib
 import os
 import time
 from collections.abc import Sequence
+from contextlib import nullcontext
 from pathlib import Path
 
 import httpx
@@ -28,6 +29,17 @@ TIMEOUT = httpx.Timeout(connect=30.0, read=90.0, write=30.0, pool=30.0)
 
 class DownloadError(ValueError):
     pass
+
+
+def report(text: str) -> None:
+    """Where a transfer's commentary goes.
+
+    A line, by default, which is what a log and a non-interactive run want.
+    Rebind it to keep the screen to a few rows -- a wizard does, because the
+    progress display already says what is moving and a line per file scrolls
+    the rest of the screen away.
+    """
+    print(text, flush=True)
 
 
 def progress(console: Console) -> Progress:
@@ -78,6 +90,7 @@ def download_file(
     console: Console | None = None,
     max_bytes: int | None = None,
     deadline_s: float = 7200,
+    bar: Progress | None = None,
 ) -> Path:
     """Stream the first working source into ``target``, resuming a partial file and verifying it.
 
@@ -97,11 +110,15 @@ def download_file(
             return target
         existing = 0
     failures = []
-    with new_client() as client, progress(console) as bar:
+    # A caller that is already drawing a display hands it in and every transfer
+    # shares the one region; on its own, this opens a display of its own. Two
+    # live displays fighting for the terminal is what a pool of downloads used
+    # to look like.
+    owned = progress(console) if bar is None else nullcontext(bar)
+    with new_client() as client, owned as active:
         for index, url in enumerate(sources):
-            print(f"Source: {url}", flush=True)
             try:
-                _fetch(client, bar, url, target, name, existing, sha256, size, max_bytes, deadline_s)
+                _fetch(client, active, url, target, name, existing, sha256, size, max_bytes, deadline_s)
                 return target
             except (httpx.HTTPError, httpx.InvalidURL, DownloadError) as exc:
                 if isinstance(exc, httpx.HTTPStatusError):
@@ -112,9 +129,7 @@ def download_file(
                     reason = type(exc).__name__
                 failures.append(f"{url}: {reason}")
                 remaining = len(sources) - index - 1
-                print(
-                    f"Source failed ({reason}): {url}" + ("; trying the next source" if remaining else ""), flush=True
-                )
+                report(f"Source failed ({reason}): {url}" + ("; trying the next source" if remaining else ""))
                 existing = target.stat().st_size if target.is_file() else 0
     raise DownloadError(f"Every download source failed for {name}: " + "; ".join(failures))
 

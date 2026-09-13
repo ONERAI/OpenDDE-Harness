@@ -33,6 +33,7 @@ Algorithm summary (design.md §D1):
 from __future__ import annotations
 
 import asyncio
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -40,13 +41,20 @@ import typer
 from loguru import logger
 
 from opendde_harness.tui_rpc.methods._typer_reflect import (
+    argument_hint as _argument_hint,
+)
+from opendde_harness.tui_rpc.methods._typer_reflect import (
     resolve_name as _resolve_name,
 )
 
 # Single source of truth for the blacklist — see ``cli_dispatch.py`` header
 # for rationale (design.md §D4.4 — one set read by both ``cli.dispatch``
 # rejection and ``commands.catalog`` exclusion so the two can never drift).
-from opendde_harness.tui_rpc.methods.cli_dispatch import _DISPATCH_BLACKLIST
+from opendde_harness.tui_rpc.methods.cli_dispatch import (
+    _DISPATCH_BLACKLIST,
+    _is_dispatch_compatible,
+    dispatch_timeout,
+)
 
 if TYPE_CHECKING:
     from opendde_harness.tui_rpc.dispatcher import Dispatcher
@@ -56,6 +64,13 @@ if TYPE_CHECKING:
 # ``categories`` so the hermes UI renders it as the primary cluster.
 _TOP_LEVEL_CATEGORY = "(top-level)"
 
+#: Where one sentence ends and the next begins: a full stop, then a space,
+#: then a capital. Not every ". ", which cut "(e.g. cli:<id>)" in half.
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z])")
+
+#: A completion row is one line on a narrow terminal.
+_HELP_MAX = 120
+
 
 @dataclass(frozen=True)
 class _CatalogEntry:
@@ -64,12 +79,41 @@ class _CatalogEntry:
     argv: tuple[str, ...]
     help_text: str
     kind: str  # "top" | "sub" | "group-callback"
+    hint: str = ""
+
+
+def _one_line(raw: str) -> str:
+    """One sentence of prose from a help string or a docstring.
+
+    The first paragraph, unwrapped, up to its first full stop: a docstring is
+    wrapped for source, and taking its first physical line cut descriptions
+    mid-phrase in the popup ("Add a skill to skillForge.blocklist (dropped
+    from the injection"). RST's double backticks go: they are markup for
+    documentation, and a completion list shows them as the four characters
+    they are. Capped, because a popup row is one line.
+    """
+    paragraph = raw.strip().split("\n\n", 1)[0]
+    text = " ".join(paragraph.split()).replace("``", "")
+
+    if not text:
+        return ""
+
+    # A sentence ends where the next one begins, which is a capital letter --
+    # not at every ". ", or "(e.g. `cli:<id>`)" ended the description.
+    sentence = _SENTENCE_SPLIT.split(text, maxsplit=1)[0]
+
+    if len(sentence) <= _HELP_MAX:
+        return sentence
+
+    # On a word, with something to say it was cut.
+    cut = sentence[:_HELP_MAX].rsplit(" ", 1)[0]
+
+    return f"{cut}…"
 
 
 def _extract_help(ci: typer.models.CommandInfo) -> str:
-    """First line of ``help=`` arg → callback docstring → empty string. Capped 120 chars."""
-    raw = ci.help or (ci.callback.__doc__ if ci.callback else None) or ""
-    return raw.strip().split("\n", 1)[0][:120]
+    """``help=`` arg → callback docstring → empty string, as one line."""
+    return _one_line(ci.help or (ci.callback.__doc__ if ci.callback else None) or "")
 
 
 def _extract_group_callback_help(sub_app: typer.Typer) -> str:
@@ -77,8 +121,7 @@ def _extract_group_callback_help(sub_app: typer.Typer) -> str:
     cb = sub_app.registered_callback
     if cb is None or cb.callback is None:
         return ""
-    raw = cb.help or (cb.callback.__doc__ or "")
-    return raw.strip().split("\n", 1)[0][:120]
+    return _one_line(cb.help or (cb.callback.__doc__ or ""))
 
 
 def _reflect_app(app: typer.Typer) -> list[_CatalogEntry]:
@@ -105,7 +148,7 @@ def _reflect_app(app: typer.Typer) -> list[_CatalogEntry]:
         name = _resolve_name(ci)
         if not name:
             continue
-        entries.append(_CatalogEntry(argv=(name,), help_text=_extract_help(ci), kind="top"))
+        entries.append(_CatalogEntry(argv=(name,), help_text=_extract_help(ci), kind="top", hint=_argument_hint(ci)))
 
     # Subgroups (app.add_typer(subapp, name=...))
     for ti in app.registered_groups:
@@ -137,6 +180,7 @@ def _reflect_app(app: typer.Typer) -> list[_CatalogEntry]:
                     argv=(group, sub_name),
                     help_text=_extract_help(ci),
                     kind="sub",
+                    hint=_argument_hint(ci),
                 )
             )
 
@@ -183,50 +227,43 @@ def _matches_blacklist(argv: tuple[str, ...]) -> bool:
 
 
 def _filter_for_catalog(entries: list[_CatalogEntry]) -> list[_CatalogEntry]:
-    """Drop blacklist prefixes.
+    """Keep exactly what ``cli.dispatch`` will accept.
 
-    The catalog filter shares ``_DISPATCH_BLACKLIST`` with ``cli.dispatch`` so
-    a slash that shows up in the catalog is also dispatch-compatible (modulo
-    reflection-based dispatch checking).
+    One rule, and it is the dispatcher's own: an entry belongs in the catalog
+    if ``cli.dispatch`` would run it. That drops the blacklist (interactive
+    logins, long-running servers, the recursive ``tui`` and ``onboard``
+    wizards) and it drops a bare group head such as ``provider``, which is not
+    a command at all -- Typer would print the group's help and the dispatcher
+    answers ``not_dispatch_compatible``.
+
+    Measured before this: the catalog offered ten heads, five of which were
+    groups. Every one of those five failed the moment it was run, and none of
+    the ten carried a description. The subcommands the groups hold are what
+    the user wants and what dispatch accepts, so they are what is served.
     """
-    return [e for e in entries if not _matches_blacklist(e.argv)]
+    return [e for e in entries if _is_dispatch_compatible(list(e.argv))]
 
 
 def _build_response(entries: list[_CatalogEntry], skill_count: int = 0, warning: str | None = None) -> dict[str, Any]:
     """Project filtered entries into ``CommandsCatalogResponse`` shape.
 
-    - ``canon[/<argv joined by ' '>] = same``  (v0.1 alias = canonical 1:1)
-    - ``pairs`` mirrors canon as ``[(alias, canonical), ...]``
-    - ``sub[group] = [sub names]`` — only for two-token argv
+    - ``pairs`` — one ``(/<head>, /<head>)`` per top-level command or group
+      head, in reflection order (alias = canonical 1:1)
     - ``categories`` — ``(top-level)`` first then alphabetical group names
       derived from observed argv prefixes (so a fully-filtered group disappears)
+
+    Heads only: ``slash.exec`` receives the user's ``cmd.slice(1)`` (e.g.
+    "skill list") verbatim and cli.dispatch reflection resolves the
+    multi-token argv, so the catalog never needs the subcommand surface.
     """
-    # hermes catalog contract — ``canon`` keys MUST be single-token slashes.
-    # The TS-side ``parseSlashCommand`` (ui-tui/src/domain/slash.ts:6-10)
-    # extracts ``name`` as the first whitespace-delimited token and
-    # ``createSlashHandler.ts:53-79`` matches ``"/${name}"`` against canon.
-    # Multi-token canon keys would never exact-match (parsed.name is one
-    # token), and they'd false-trigger prefix-1-match against every
-    # ``/group <sub>`` entry, breaking previously-working slashes (smoke
-    # test 2026-05-19 caught this regression on /skill list etc.).
-    #
-    # Resolution: canon ≡ {top-level command names} ∪ {group names}; the
-    # full subcommand surface lives in ``sub`` for hermes UI side panels.
-    # ``slash.exec`` receives the user's original ``cmd.slice(1)`` (e.g.
-    # "skill list") verbatim and cli.dispatch reflection then resolves the
-    # multi-token argv.
-    canon: dict[str, str] = {}
     pairs: list[tuple[str, str]] = []
-    sub: dict[str, list[str]] = {}
     seen_groups: set[str] = set()
     has_top_level = False
 
     def _emit(head: str) -> None:
         canonical = f"/{head}"
-        if canonical in canon:
-            return
-        canon[canonical] = canonical
-        pairs.append((canonical, canonical))
+        if (canonical, canonical) not in pairs:
+            pairs.append((canonical, canonical))
 
     for entry in entries:
         argv = entry.argv
@@ -243,10 +280,8 @@ def _build_response(entries: list[_CatalogEntry], skill_count: int = 0, warning:
                 has_top_level = True
                 _emit(argv[0])
         elif len(argv) >= 2:
-            group, sub_name = argv[0], argv[1]
-            seen_groups.add(group)
-            sub.setdefault(group, []).append(sub_name)
-            _emit(group)
+            seen_groups.add(argv[0])
+            _emit(argv[0])
 
     categories: list[str] = []
     if has_top_level:
@@ -254,9 +289,22 @@ def _build_response(entries: list[_CatalogEntry], skill_count: int = 0, warning:
     categories.extend(sorted(seen_groups))
 
     response: dict[str, Any] = {
-        "canon": canon,
         "pairs": pairs,
-        "sub": sub,
+        # What each of them is, and what it takes. The heads above stay for the
+        # client that reads only them; a client that shows a description reads
+        # this, and every entry here is one ``cli.dispatch`` accepts.
+        "commands": [
+            {
+                "name": " ".join(entry.argv),
+                "description": entry.help_text,
+                **({"argument_hint": entry.hint} if entry.hint else {}),
+                # Only where it is not the ordinary one: a client reads this to
+                # know a command may take a while, and the gateway applies the
+                # same figure itself so an old client cannot shorten it.
+                **({"timeout_s": seconds} if (seconds := dispatch_timeout(entry.argv)) else {}),
+            }
+            for entry in entries
+        ],
         "categories": categories,
         "skill_count": skill_count,
     }

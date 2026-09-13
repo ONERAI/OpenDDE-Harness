@@ -91,7 +91,7 @@ def _strip_tty_stream_handlers() -> None:
     named loggers or the root logger.
 
     ``basicConfig(force=True)`` only resets the ROOT logger's handlers. Some
-    libraries (notably ``litellm``) install their own ``StreamHandler(stderr)``
+    libraries install their own ``StreamHandler(stderr)``
     on named loggers at import time; the root InterceptHandler never sees those
     records because the named-logger handler fires before propagation, and the
     direct-to-TTY write overlays the Ink alt-screen. Stripping

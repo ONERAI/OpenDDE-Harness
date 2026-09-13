@@ -1,72 +1,58 @@
-"""How a failed call is bucketed, since the bucket decides retry and fallback."""
+"""How a failure on *this* side of the pipe is bucketed.
+
+A model's failure is read by pi, in the model service: whether it is transient,
+whether the context window refused it, and pi's own error code all travel on the
+error event, and ``providers/pi_context`` turns them into the verdict the loop
+acts on (tests/test_pi_context.py). The tables of vendor wordings and status
+codes that used to live here are pi's now.
+
+What is left is the short list of failures that happen beside the model: the
+child process gone, and the two stream deadlines ``pi_provider`` enforces because
+pi has none. Both are transient; everything else is this process's own mistake.
+"""
 
 import asyncio
-import ssl
 
-import httpx
 import pytest
 
 from opendde_harness.providers.base import LLMProvider
-
-
-@pytest.mark.parametrize(
-    ("message", "category", "retryable"),
-    [
-        # A status code the message actually reports.
-        ("Error code: 503 - insufficient_system_resource", "server", True),
-        ("HTTP 502 Bad Gateway", "server", True),
-        # Digits that merely contain one. Both used to buy four billed attempts
-        # and then every fallback model for a request that cannot succeed.
-        ("Invalid value for 'max_tokens': 5000", "unknown", False),
-        ("request id: 20260908213316503720727", "unknown", False),
-        # DeepSeek's capacity wording, which the billing bucket claimed through
-        # its "insufficient" match and made non-retryable.
-        ("DeepseekException - insufficient_system_resource", "server", True),
-        ("Insufficient Balance", "billing", False),
-        # Measured against a new-api relay: an unknown model answers this, not a 404.
-        (
-            "APIError: OpenAIException - No available channel for group default model x (distributor).",
-            "model_unavailable",
-            False,
-        ),
-    ],
-)
-def test_classification(message, category, retryable):
-    verdict = LLMProvider.classify_error(content=message)
-
-    assert (verdict.category, verdict.retryable) == (category, retryable)
+from opendde_harness.providers.model_service import ModelServiceError
 
 
 @pytest.mark.parametrize(
     "exc",
     [
-        httpx.RemoteProtocolError("Server disconnected without sending a response."),
-        httpx.ReadError(""),
-        httpx.WriteError(""),
-        httpx.ConnectTimeout(""),
-        httpx.ReadTimeout(""),
-        httpx.PoolTimeout(""),
-        httpx.ProxyError(""),
-        httpx.ConnectError("[Errno 111] Connection refused"),
-        ssl.SSLEOFError(8, "EOF occurred in violation of protocol"),
-        ssl.SSLError(1, "EOF occurred in violation of protocol"),
-        OSError("Temporary failure in name resolution"),
-        ConnectionResetError(104, "Connection reset by peer"),
+        # What `asyncio.wait_for` raises when a gap budget expires. Its class
+        # name is "timeouterror" and its str() is empty, so only the isinstance
+        # check answers for it.
         asyncio.TimeoutError(),
+        TimeoutError("the model service went silent before its first event"),
+        # The child process exited, or closed its input under a send.
+        ModelServiceError("gone", "the model service is not running"),
     ],
 )
-def test_real_transport_failures_are_retryable_network_errors(exc):
-    # Measured against these exception objects: nine of the fourteen used to
-    # classify as unknown, which is fatal -- no retry, no fallback -- on the
-    # httpx providers that LiteLLM's exception mapping does not cover.
+def test_a_failure_beside_the_model_is_a_retryable_network_error(exc):
     verdict = LLMProvider.classify_error(exc)
 
-    assert verdict.category == "network"
-    assert verdict.retryable and verdict.should_fallback
+    assert (verdict.category, verdict.retryable) == ("network", True)
 
 
-def test_a_status_error_is_not_mistaken_for_a_transport_failure():
-    request = httpx.Request("POST", "https://relay/v1/chat/completions")
-    exc = httpx.HTTPStatusError("Client error", request=request, response=httpx.Response(400, request=request))
+def test_a_refused_request_is_labelled_by_its_code_and_not_repeated():
+    """The service's own refusals: a model it does not serve, a malformed call."""
+    for code in ("model_not_found", "no_max_tokens", "invalid_params"):
+        verdict = LLMProvider.classify_error(ModelServiceError(code, "no"))
+        assert (verdict.category, verdict.retryable) == (code, False)
 
-    assert LLMProvider.classify_error(exc).category != "network"
+
+def test_anything_else_is_unknown_and_not_repeated():
+    """A bug in this process. Sending the request again would reproduce it."""
+    verdict = LLMProvider.classify_error(KeyError("tool_calls"))
+
+    assert (verdict.category, verdict.retryable) == ("unknown", False)
+
+
+def test_nothing_reads_the_message_text_any_more():
+    """The wordings a vendor invents are pi's business, not this method's."""
+    verdict = LLMProvider.classify_error(RuntimeError("429 rate limit exceeded, please retry"))
+
+    assert verdict.category == "unknown", "a status code in a string is not a classification here"

@@ -83,8 +83,6 @@ def main(
         check=False,
         dev=False,
         color=None,
-        print_colors=False,
-        preview_colors=False,
     )
 
 

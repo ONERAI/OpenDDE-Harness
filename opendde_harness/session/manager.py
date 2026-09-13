@@ -2,6 +2,8 @@
 
 import copy
 import json
+import secrets
+import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -10,8 +12,113 @@ from typing import Any
 
 from loguru import logger
 
+from opendde_harness.providers import messages as msg
+from opendde_harness.providers.base import COMPACTION_KEY, orphan_tool_results
+from opendde_harness.session.legacy import read_records
 from opendde_harness.utils.atomic_io import atomic_replace, locked_append
 from opendde_harness.utils.helpers import ensure_dir, safe_filename
+
+#: The ``_type`` of a journal record that is not a message: the turn and tool
+#: lifecycle. Messages and lifecycle records share one append-only file so the
+#: order between them is the file's order and needs no reconstruction.
+LIFECYCLE_TYPE = "lifecycle"
+
+#: A turn was accepted and its user message recorded; execution follows.
+TURN_STARTED = "turn.started"
+#: A turn reached its final assistant message with nothing left to run.
+TURN_COMPLETED = "turn.completed"
+#: A turn was cancelled. Written on the way out, before the cancellation is
+#: re-raised, so a reload can tell a cancelled turn from a lost one.
+TURN_INTERRUPTED = "turn.interrupted"
+#: A tool that changes state outside this process is about to be invoked. Its
+#: result may or may not exist; see :meth:`Session.uncertain_tool_calls`.
+TOOL_STARTED = "tool.started"
+
+_LIFECYCLE_KINDS = frozenset({TURN_STARTED, TURN_COMPLETED, TURN_INTERRUPTED, TOOL_STARTED})
+
+#: In-memory only: which message a lifecycle record sits behind. Reconstructed
+#: from file order on load and stripped again on write, so the file never
+#: carries an index that could disagree with its own ordering.
+_ANCHOR = "after"
+
+_ID_LOCK = threading.Lock()
+_ID_LAST_MS = 0
+_ID_LAST_SEQ = 0
+
+
+def new_record_id(now: datetime | None = None) -> str:
+    """Mint a sortable, monotonic record id.
+
+    26 lowercase hex characters in three fixed-width fields: a 48-bit
+    millisecond clock, a 16-bit per-millisecond counter, and 40 random bits.
+    Fixed widths are what make byte order agree with time order, so the journal
+    can be read back in the order it was written without trusting a wall clock
+    that a reader might not share.
+
+    The counter is the reason two records written in the same millisecond still
+    sort; it also carries the clock forward by a millisecond rather than
+    repeating an id when more than 65,536 records land in one. The random tail
+    keeps ids from two processes apart.
+    """
+    global _ID_LAST_MS, _ID_LAST_SEQ
+
+    ms = int((now or datetime.now()).timestamp() * 1000)
+    with _ID_LOCK:
+        if ms > _ID_LAST_MS:
+            _ID_LAST_MS, _ID_LAST_SEQ = ms, 0
+        else:
+            _ID_LAST_SEQ += 1
+            if _ID_LAST_SEQ > 0xFFFF:
+                _ID_LAST_MS += 1
+                _ID_LAST_SEQ = 0
+        stamp, seq = _ID_LAST_MS, _ID_LAST_SEQ
+    return f"{stamp:012x}{seq:04x}{secrets.token_hex(5)}"
+
+
+def unanswered_tool_calls(messages: list[dict[str, Any]]) -> set[str]:
+    """Ids of tool calls in ``messages`` that no tool result answers.
+
+    The journal is append-only, so an assistant message is written with every
+    call the model asked for and the results land as they return. A turn that
+    was cancelled between the two therefore leaves calls with no result, and
+    every wire refuses a history carrying one.
+
+    The reader reconciles rather than the writer inventing: this is the mirror
+    of :func:`~opendde_harness.providers.base.orphan_tool_results`, which drops
+    a result whose call a window cut away.
+    """
+    answered = {m.get("toolCallId") for m in messages if msg.is_tool_result(m)}
+    asked = {call_id for m in messages for call_id in msg.tool_call_ids(m)}
+    return asked - answered
+
+
+def drop_unanswered_tool_calls(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """``messages`` with every unanswered tool call removed.
+
+    An assistant message left with neither text nor a surviving call is dropped
+    with them: it said nothing and asked for nothing the history can show. The
+    call is still in the journal, so what the model intended is not lost -- it
+    is just not replayed as an instruction the model would answer twice.
+    """
+    unanswered = unanswered_tool_calls(messages)
+    if not unanswered:
+        return messages
+    out: list[dict[str, Any]] = []
+    for m in messages:
+        calls = msg.tool_calls_of(m)
+        if not calls:
+            out.append(m)
+            continue
+        kept = [b for b in msg.blocks_of(m) if b.get("type") != msg.TOOL_CALL or b.get("id") not in unanswered]
+        if len(kept) == len(msg.blocks_of(m)):
+            out.append(m)
+            continue
+        if not any(b.get("type") == msg.TOOL_CALL for b in kept) and not any(
+            b.get("type") == msg.TEXT and b.get("text") for b in kept
+        ):
+            continue
+        out.append(msg.with_blocks(m, kept))
+    return out
 
 
 def new_chat_id(now: datetime | None = None) -> str:
@@ -48,6 +155,48 @@ def _first_user_auto_title(messages: list[dict[str, Any]]) -> str | None:
     return None
 
 
+def _record_line(record: dict[str, Any]) -> str:
+    """One journal record as its JSONL line.
+
+    The lifecycle anchor is dropped: file order already says where a record
+    sits, and a stored index is one more thing that can disagree with it.
+    """
+    if record.get("_type") == LIFECYCLE_TYPE:
+        record = {k: v for k, v in record.items() if k != _ANCHOR}
+    return json.dumps(record, ensure_ascii=False)
+
+
+def _interleave(
+    messages: list[dict[str, Any]],
+    lifecycle: list[dict[str, Any]],
+    start_message: int,
+    start_lifecycle: int,
+) -> list[dict[str, Any]]:
+    """Messages and lifecycle records from the given offsets, in write order.
+
+    One merge over two append-only lists, ordered by each lifecycle record's
+    anchor. Used for the whole journal and, with the persisted counts as
+    offsets, for the tail one save appends -- so the file's order and the
+    in-memory order are produced by the same rule.
+    """
+    out: list[dict[str, Any]] = []
+    life = start_lifecycle
+    total = len(lifecycle)
+
+    def _due(upto: int) -> None:
+        nonlocal life
+        while life < total and lifecycle[life].get(_ANCHOR, 0) <= upto:
+            out.append(lifecycle[life])
+            life += 1
+
+    _due(start_message)
+    for index in range(start_message, len(messages)):
+        out.append(messages[index])
+        _due(index + 1)
+    _due(len(messages))
+    return out
+
+
 @dataclass(frozen=True)
 class SessionResolution:
     """Outcome of resolving a user-supplied session id to a full key.
@@ -82,12 +231,20 @@ class Session:
     updated_at: datetime = field(default_factory=datetime.now)
     metadata: dict[str, Any] = field(default_factory=dict)
     last_consolidated: int = 0  # Number of messages already consolidated to files
+    #: How many times this key has been reset. ``/new`` and ``clear`` bump it,
+    #: so a turn recorded after a reset can never be confused with one recorded
+    #: before it -- the key is the same and the ids are fresh, and that pair
+    #: alone does not say which conversation a record belongs to.
+    generation: int = 0
+    #: The turn and tool lifecycle, in append order. Each entry carries an
+    #: in-memory ``after`` anchor: how many messages precede it. Kept apart from
+    #: ``messages`` so every reader of the message projection -- the provider
+    #: history, the resume wire, the message count -- is unaffected by it.
+    lifecycle: list[dict[str, Any]] = field(default_factory=list)
     # Messages already on disk; save() appends only past this index.
     _persisted_count: int = field(default=0, repr=False)
-
-    def add_message(self, role: str, content: str, **kwargs: Any) -> None:
-        """Add a message to the session."""
-        self.record({"role": role, "content": content, **kwargs})
+    # Same, for lifecycle records.
+    _persisted_lifecycle: int = field(default=0, repr=False)
 
     def set_title(self, title: str) -> None:
         """Set a human-given title.
@@ -99,50 +256,145 @@ class Session:
         self.metadata["title"] = title
         self.metadata.pop("title_auto", None)
 
-    def record(self, msg: dict[str, Any]) -> None:
-        """Append a message dict, stamping a wall-clock timestamp.
+    def record(self, message: dict[str, Any]) -> None:
+        """Append a message, stamping a wall-clock timestamp.
 
         The single choke point for session writes — every persistence path
-        (``add_message``, the agent loop's ``_save_turn``, clarification
-        appends) must come through here so no message lands unstamped. A
-        caller-set ``timestamp`` is preserved. Per-message ordering and
-        turn grouping derive from append order and the ``role`` boundary,
-        so no separate received_at / turn_id stamp is kept.
+        (the turn journal, ``journal.record_delivery``, a stored compaction
+        marker) must come through here so no message lands unstamped. A
+        caller-set ``timestamp`` is preserved, which is every message the model
+        service answered: pi stamps its own. Milliseconds, because that is what
+        pi's ``Message`` carries. Per-message ordering and turn grouping derive
+        from append order and the ``role`` boundary, so no separate received_at
+        / turn_id stamp is kept.
         """
-        msg.setdefault("timestamp", datetime.now().isoformat())
-        self.messages.append(msg)
+        message.setdefault("timestamp", msg.now_ms())
+        message.setdefault("id", new_record_id())
+        self.messages.append(message)
         self.updated_at = datetime.now()
 
-    def get_history(self, max_messages: int = 500) -> list[dict[str, Any]]:
-        """Return unconsolidated messages for LLM input, aligned to a user turn."""
-        unconsolidated = self.messages[self.last_consolidated :]
-        sliced = unconsolidated[-max_messages:]
+    def record_lifecycle(self, kind: str, **fields: Any) -> dict[str, Any]:
+        """Append one lifecycle record and return it.
 
-        # Drop leading non-user messages to avoid orphaned tool_result blocks
+        The turn journal's only writer. Stamped like a message (``id``,
+        ``timestamp``) and anchored behind the messages recorded so far, which
+        is what puts it in the right place in :meth:`records`.
+        """
+        record = {
+            "_type": LIFECYCLE_TYPE,
+            "kind": kind,
+            "id": new_record_id(),
+            "timestamp": datetime.now().isoformat(),
+            **fields,
+            _ANCHOR: len(self.messages),
+        }
+        self.lifecycle.append(record)
+        self.updated_at = datetime.now()
+        return record
+
+    def records(self) -> list[dict[str, Any]]:
+        """The journal: messages and lifecycle records in the order written.
+
+        The durable view. :attr:`messages` is the projection a provider is sent;
+        this is what actually happened, including the turns that did not finish.
+        """
+        return _interleave(self.messages, self.lifecycle, 0, 0)
+
+    def turn_status(self) -> dict[str, str]:
+        """``{turn_id: "completed" | "interrupted"}`` for every turn on record.
+
+        A turn with a ``turn.started`` record and no completion of either kind
+        is inferred interrupted: the process that was running it never came back
+        to say so, which is the one case no writer can report for itself.
+        """
+        status: dict[str, str] = {}
+        for record in self.lifecycle:
+            turn_id = record.get("turn_id")
+            if not isinstance(turn_id, str):
+                continue
+            kind = record.get("kind")
+            if kind == TURN_STARTED:
+                status.setdefault(turn_id, "interrupted")
+            elif kind == TURN_COMPLETED:
+                status[turn_id] = "completed"
+            elif kind == TURN_INTERRUPTED:
+                status[turn_id] = "interrupted"
+        return status
+
+    def uncertain_tool_calls(self) -> list[dict[str, Any]]:
+        """The ``tool.started`` records no tool result answers.
+
+        A state-changing tool was invoked and the journal never learned how it
+        ended: the job may be running, may have finished, may never have begun.
+        Reported so a reader can say so, and deliberately never re-executed --
+        running it again is the one response that can do damage twice.
+        """
+        answered = {m.get("toolCallId") for m in self.messages if msg.is_tool_result(m)}
+        return [
+            record
+            for record in self.lifecycle
+            if record.get("kind") == TOOL_STARTED and record.get("call_id") not in answered
+        ]
+
+    @property
+    def unpersisted(self) -> bool:
+        """Whether anything recorded since the last save is still only in memory."""
+        return len(self.messages) > self._persisted_count or len(self.lifecycle) > self._persisted_lifecycle
+
+    def get_history(self, max_messages: int = 500) -> list[dict[str, Any]]:
+        """Return unconsolidated messages for LLM input, aligned to a user turn.
+
+        ``max_messages=0`` is no cap, not an empty history.
+        """
+        unconsolidated = self.messages[self.last_consolidated :]
+        start = max(0, len(unconsolidated) - max_messages) if max_messages else 0
+        # Never past a compaction marker. It is the model's own summary of
+        # everything before it, so a cap that starts after one ships the tail
+        # of a conversation with neither the summary nor the history it stood
+        # in for -- the one slice that has less in it than either alternative.
+        marker_at = next((i for i in reversed(range(len(unconsolidated))) if COMPACTION_KEY in unconsolidated[i]), None)
+        if marker_at is not None:
+            start = min(start, marker_at)
+        sliced = unconsolidated[start:]
+
+        # Drop leading non-user messages to avoid orphaned tool_result blocks.
+        # A marker is as clean a start as a user message -- nothing before it
+        # is sent -- with one exception: a call before it answered after it
+        # leaves a result the cut has orphaned, and that result goes too.
         for i, m in enumerate(sliced):
-            if m.get("role") == "user":
+            if m.get("role") == "user" or COMPACTION_KEY in m:
                 sliced = sliced[i:]
+                orphans = orphan_tool_results(sliced)
+                if orphans:
+                    sliced = [m for at, m in enumerate(sliced) if at not in orphans]
                 break
 
-        out: list[dict[str, Any]] = []
-        for m in sliced:
-            entry: dict[str, Any] = {"role": m["role"], "content": m.get("content", "")}
-            # reasoning_content / thinking_blocks travel with the message they
-            # belong to: a thinking model that gets its own reasoning back is
-            # holding a contract, not a preference. DeepSeek rejects the whole
-            # request without it ("the reasoning_content in the thinking mode
-            # must be passed back"), which broke every turn after the first tool
-            # call. The provider drops what its own wire format cannot carry.
-            for k in ("tool_calls", "tool_call_id", "name", "reasoning_content", "thinking_blocks"):
-                if k in m:
-                    entry[k] = m[k]
-            out.append(entry)
-        return out
+        # The record is what the request carries, less the harness's own
+        # bookkeeping: a pi message replays whole, thinking signatures and
+        # native tool-call ids included, and ``compaction`` travels because it
+        # is the boundary a backend that compacted the conversation itself
+        # replays in place of everything before it. Dropped, the request falls
+        # back to the local history and the compaction is paid for again every
+        # eligible turn.
+        out = [msg.wire_projection(m) for m in sliced]
+        # A turn cancelled between an assistant's tool calls and their results
+        # leaves calls nothing answers, and the journal keeps them rather than
+        # inventing a result. They must not reach a request: a history with an
+        # unanswered call is a 400 on every turn that follows.
+        return drop_unanswered_tool_calls(out)
 
     def clear(self) -> None:
-        """Clear all messages and reset session to initial state."""
+        """Clear all messages and start a new generation.
+
+        The key survives the reset, so the generation is what tells the records
+        written after it apart from the ones written before -- the fact an
+        extraction job replayed from the outbox needs in order to say which
+        conversation it belongs to.
+        """
         self.messages = []
+        self.lifecycle = []
         self.last_consolidated = 0
+        self.generation += 1
         self.updated_at = datetime.now()
 
     def undo_last_turn(self, n: int = 1) -> int:
@@ -163,7 +415,16 @@ class Session:
             return 0
         cut_index = user_starts[-n] if n <= len(user_starts) else user_starts[0]
         removed = len(self.messages) - cut_index
+        dropped_turns = {m.get("turn_id") for m in self.messages[cut_index:] if m.get("turn_id")}
         self.messages = self.messages[:cut_index]
+        # The dropped turns' lifecycle goes with them. Left behind, a
+        # ``turn.started`` whose messages no longer exist reads as a turn that
+        # was interrupted, and the next resume would say so. By turn id, not by
+        # anchor alone: one turn's completion and the next one's start sit behind
+        # the same message, and only the id tells them apart.
+        self.lifecycle = [
+            r for r in self.lifecycle if r.get(_ANCHOR, 0) <= cut_index and r.get("turn_id") not in dropped_turns
+        ]
         self.updated_at = datetime.now()
         return removed
 
@@ -295,9 +556,11 @@ class SessionManager:
                         data = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    if isinstance(data, dict) and data.get("_type") == "metadata":
+                    if not isinstance(data, dict):
+                        continue
+                    if data.get("_type") == "metadata":
                         meta = data
-                    else:
+                    elif data.get("_type") != LIFECYCLE_TYPE:
                         count += 1
         except OSError:
             return None, 0
@@ -330,10 +593,12 @@ class SessionManager:
             return None
 
         try:
-            messages = []
+            messages: list[dict[str, Any]] = []
+            lifecycle: list[dict[str, Any]] = []
             metadata = {}
             created_at = None
             last_consolidated = 0
+            generation = 0
 
             with open(path, encoding="utf-8") as f:
                 for line in f:
@@ -353,8 +618,23 @@ class SessionManager:
                         metadata = data.get("metadata", {})
                         created_at = datetime.fromisoformat(data["created_at"]) if data.get("created_at") else None
                         last_consolidated = data.get("last_consolidated", 0)
+                        generation = int(data.get("generation", 0) or 0)
+                    elif data.get("_type") == LIFECYCLE_TYPE:
+                        # The anchor is the file's own ordering, read back.
+                        data[_ANCHOR] = len(messages)
+                        lifecycle.append(data)
                     else:
+                        # A file written before ids existed still loads, and
+                        # gets ids here rather than on a rewrite: adding a
+                        # field is not a reason to rewrite a conversation, and
+                        # the append-only log has no place to put one anyway.
+                        data.setdefault("id", new_record_id())
                         messages.append(data)
+
+            # A file written before the records were pi messages is converted
+            # here, in memory, for the same reason: the bytes on disk stay as
+            # they were written (see ``session.legacy``).
+            messages = read_records(messages)
 
             session = Session(
                 key=key,
@@ -362,8 +642,11 @@ class SessionManager:
                 created_at=created_at or datetime.now(),
                 metadata=metadata,
                 last_consolidated=last_consolidated,
+                generation=generation,
+                lifecycle=lifecycle,
             )
             session._persisted_count = len(messages)
+            session._persisted_lifecycle = len(lifecycle)
             return session
         except Exception as e:
             logger.warning("Failed to load session {}: {}", key, e)
@@ -409,26 +692,66 @@ class SessionManager:
                 "updated_at": session.updated_at.isoformat(),
                 "metadata": session.metadata,
                 "last_consolidated": session.last_consolidated,
+                "generation": session.generation,
             },
             ensure_ascii=False,
         )
 
         if len(session.messages) < session._persisted_count:
+            tail = _interleave(session.messages, session.lifecycle, 0, 0)
             lines = [metadata_line]
-            lines += [json.dumps(m, ensure_ascii=False) for m in session.messages]
+            lines += [_record_line(r) for r in tail]
             atomic_replace(path, "".join(line + "\n" for line in lines))
         else:
-            new_messages = session.messages[session._persisted_count :]
+            tail = _interleave(
+                session.messages,
+                session.lifecycle,
+                session._persisted_count,
+                session._persisted_lifecycle,
+            )
             lines = [metadata_line]
-            lines += [json.dumps(m, ensure_ascii=False) for m in new_messages]
+            lines += [_record_line(r) for r in tail]
             locked_append(path, lines)
 
         session._persisted_count = len(session.messages)
+        session._persisted_lifecycle = len(session.lifecycle)
         self._cache[session.key] = session
 
     def invalidate(self, key: str) -> None:
         """Remove a session from the in-memory cache."""
         self._cache.pop(key, None)
+
+    def archive(self, key: str) -> Path | None:
+        """Move a session's file aside so the key starts empty next time.
+
+        ``/new`` closes a conversation; what was said in it is not what the
+        user asked to discard. The file is preserved under
+        ``sessions/_closed/<channel>/<chat_id>.<stamp>.jsonl`` -- one level
+        deeper than the two-level glob that lists live sessions, so a closed
+        conversation stops appearing as one -- and the stamp (plus a counter
+        for the same second) means closing one key repeatedly never overwrites
+        an earlier close.
+
+        The cache entry goes with it, so the next :meth:`get_or_create` builds
+        a genuinely fresh session rather than handing back the closed one.
+        Returns the archive path, or ``None`` when the key had no file on disk.
+        """
+        path = self._get_session_path(key)
+        self.invalidate(key)
+        if not path.exists():
+            return None
+        channel, _, chat_id = key.partition(":")
+        dest_dir = ensure_dir(self.sessions_dir / "_closed" / safe_filename(channel))
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        stem = safe_filename(chat_id)
+        dest = dest_dir / f"{stem}.{stamp}.jsonl"
+        n = 1
+        while dest.exists():
+            dest = dest_dir / f"{stem}.{stamp}-{n}.jsonl"
+            n += 1
+        path.rename(dest)
+        logger.info("session {} closed; preserved at {}", key, dest)
+        return dest
 
     def delete(self, key: str) -> bool:
         """Remove the session file and invalidate the cache entry.
@@ -490,6 +813,7 @@ class SessionManager:
             key=f"{channel}:{new_chat_id()}",
             messages=copy.deepcopy(source.messages),
             last_consolidated=source.last_consolidated,
+            lifecycle=copy.deepcopy(source.lifecycle),
         )
         if title is not None:
             child.metadata["title"] = title
@@ -497,6 +821,14 @@ class SessionManager:
             parent_title = (source.metadata or {}).get("title")
             if parent_title and not (source.metadata or {}).get("title_auto"):
                 child.metadata["title"] = f"{parent_title} (fork)"
+        # A fork continues its parent's conversation, so it continues on its
+        # parent's model. The caller re-points the live binding, but that lives
+        # in memory only -- without carrying the record too, the fork drops to
+        # the default the first time it is resumed in a new process.
+        for slot in ("model", "provider"):
+            inherited = (source.metadata or {}).get(slot)
+            if inherited:
+                child.metadata[slot] = inherited
         child.metadata["parent_session_id"] = source_key
         self.save(child)
         return child
@@ -511,13 +843,22 @@ class SessionManager:
         cached = self._cache.get(key)
         if cached is None:
             return True
-        if len(cached.messages) > cached._persisted_count:
+        if cached.unpersisted:
             try:
                 self.save(cached)
             except Exception:
                 logger.warning("flush: failed to persist session {}", key)
                 return False
         return True
+
+    def records(self, key: str) -> list[dict[str, Any]]:
+        """The journal of ``key``: messages and lifecycle records, in write order.
+
+        Read-only, through :meth:`peek`, so asking what happened in a session
+        never mints one. Empty for a key with no file and no cache entry.
+        """
+        session = self.peek(key)
+        return session.records() if session is not None else []
 
     def list_sessions(self, channel: str | None = None) -> list[dict[str, Any]]:
         """List sessions, optionally filtered by channel.

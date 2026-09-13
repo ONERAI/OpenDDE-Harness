@@ -186,8 +186,10 @@ for a busy GPU waits in the queue instead of failing. Validate the file with
 | Field | Meaning |
 |---|---|
 | `llm.model_name` | Model used by the task's Agents. |
-| `llm.temperature` | Sampling temperature. |
 | `llm.max_tokens` | Maximum response tokens per Agent call. |
+
+A sampling temperature is declared on the model's own row in the harness config,
+not here.
 
 ## Design fields
 

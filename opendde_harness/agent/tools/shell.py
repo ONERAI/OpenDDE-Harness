@@ -3,53 +3,29 @@
 import os
 import re
 import shlex
-from contextvars import ContextVar
-from dataclasses import dataclass, replace
-from hashlib import sha256
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
+from opendde_harness.agent.tools.approval import (
+    ALREADY_REFUSED,
+    NOT_INTERACTIVE,
+    ApprovalGate,
+    ApprovalResponder,
+)
 from opendde_harness.agent.tools.base import Tool, ToolResult
 from opendde_harness.agent.tools.shell_policy import CommandDecision, ShellCommandPolicy
 from opendde_harness.plugin.active import active_registry
 from opendde_harness.sandbox import DirectExecutor, SandboxExecutor
 
 
-class ApprovalResponder(Protocol):
-    """Turn-scoped capability that can approve one exact shell command."""
-
-    async def await_approval(
-        self,
-        *,
-        conversation_id: str,
-        turn_id: str,
-        tool_call_id: str,
-        command: str,
-        description: str,
-    ) -> bool: ...
-
-
-@dataclass(frozen=True)
-class _ApprovalTurn:
-    """Approval state isolated by async context for one agent turn.
-
-    ``denied_digests`` suppresses duplicate prompts only within this turn; a
-    later user turn receives a fresh decision boundary.
-    """
-
-    responder: ApprovalResponder | None = None
-    conversation_id: str = ""
-    turn_id: str = ""
-    tool_call_id: str = ""
-    denied_digests: frozenset[str] = frozenset()
-
-
 class ExecTool(Tool):
     """Tool to execute shell commands."""
 
-    # Backstop above the 600s internal exec cap (``_MAX_TIMEOUT``); the
+    # Backstop above the 600s internal command cap (``_MAX_TIMEOUT``); the
     # executor's own timeout fires first, this only catches a wedged executor.
     timeout_seconds = 660.0
+    # A shell command is the widest external effect there is.
+    external_effects = True
 
     def __init__(
         self,
@@ -74,8 +50,9 @@ class ExecTool(Tool):
             r">\s*/dev/sd",  # write to disk
             r":\(\)\s*\{.*\};\s*:",  # fork bomb
         ]
-        # Operator-configurable extras (tools.exec.extra_deny_patterns), appended
-        # to the built-in defaults; empty by default so product behaviour is
+        # Operator-configurable extras (the ``tools.exec`` config section, whose
+        # key is unchanged by the rename to ``bash``), appended to the built-in
+        # defaults; empty by default so product behaviour is
         # unchanged. The proactivity-eval harness sets these to block host GUI
         # automation (osascript / `open -a|-b`) because it runs the agent
         # un-sandboxed on the operator's machine — not a product default.
@@ -86,10 +63,7 @@ class ExecTool(Tool):
         self.restrict_to_workspace = restrict_to_workspace
         self.path_append = path_append
         self._executor: SandboxExecutor = executor if executor is not None else DirectExecutor()
-        self._approval_turn: ContextVar[_ApprovalTurn] = ContextVar(
-            "exec_tool_approval_turn",
-            default=_ApprovalTurn(),
-        )
+        self._approval = ApprovalGate("bash_tool_approval_turn")
 
     def start_approval_turn(
         self,
@@ -99,23 +73,15 @@ class ExecTool(Tool):
         turn_id: str,
     ) -> None:
         """Bind or revoke interactive approval capability for the current turn."""
-
-        self._approval_turn.set(
-            _ApprovalTurn(
-                responder=responder,
-                conversation_id=conversation_id,
-                turn_id=turn_id,
-            )
-        )
+        self._approval.start_approval_turn(responder, conversation_id=conversation_id, turn_id=turn_id)
 
     def set_tool_call_id(self, tool_call_id: str) -> None:
         """Attach the provider call ID so approval is auditable end to end."""
-
-        self._approval_turn.set(replace(self._approval_turn.get(), tool_call_id=tool_call_id))
+        self._approval.set_tool_call_id(tool_call_id)
 
     @property
     def name(self) -> str:
-        return "exec"
+        return "bash"
 
     _MAX_TIMEOUT = 600
     _MAX_OUTPUT = 10_000
@@ -132,7 +98,13 @@ class ExecTool(Tool):
     @property
     def description(self) -> str:
         location = "the configured shell sandbox" if self._executor.is_sandboxed else "the Harness client host"
-        base = f"Execute a shell command on {location} and return its output."
+        base = (
+            f"Execute a bash command on {location}, in the current working directory. "
+            f"Returns stdout and stderr. Output is truncated to {self._MAX_OUTPUT:,} characters. "
+            f"Optionally provide a timeout in seconds (default {self.timeout}, max {self._MAX_TIMEOUT}). "
+            "Destructive commands are blocked or need the user's approval, and the command "
+            "may be confined to the working directory."
+        )
         note = active_registry().tool_description_note(self.name)
         return f"{base} {note}" if note else base
 
@@ -150,22 +122,23 @@ class ExecTool(Tool):
 
     @property
     def parameters(self) -> dict[str, Any]:
+        # pi's ``bash`` schema: ``command`` and an optional ``timeout`` in
+        # seconds, nothing else. There is no ``working_dir``: the command runs
+        # in the session's working directory, which is also the boundary
+        # ``restrict_to_workspace`` enforces -- a per-call override would let a
+        # command step outside it by naming a different cwd.
         return {
             "type": "object",
             "properties": {
                 "command": {
                     "type": "string",
-                    "description": "The shell command to execute",
-                },
-                "working_dir": {
-                    "type": "string",
-                    "description": "Optional working directory for the command",
+                    "description": "Shell command to execute",
                 },
                 "timeout": {
                     "type": "integer",
                     "description": (
-                        "Timeout in seconds. Increase for long-running commands "
-                        "like compilation or installation (default 60, max 600)."
+                        f"Timeout in seconds (default {self.timeout}, max {self._MAX_TIMEOUT}). "
+                        "Increase for long-running commands like compilation or installation."
                     ),
                     "minimum": 1,
                     "maximum": 600,
@@ -177,11 +150,10 @@ class ExecTool(Tool):
     async def execute(
         self,
         command: str,
-        working_dir: str | None = None,
         timeout: int | None = None,
         **kwargs: Any,
     ) -> str | ToolResult:
-        cwd = working_dir or self.working_dir or os.getcwd()
+        cwd = self.working_dir or os.getcwd()
 
         if not self._executor.is_sandboxed:
             # Non-sandboxed: full guard — deny-list patterns AND workspace restriction.
@@ -229,31 +201,27 @@ class ExecTool(Tool):
 
         The responder belongs to the current turn and is installed only for an
         Origin with a trusted approval transport. A missing responder therefore
-        means "cannot approve", not "approval unnecessary". A digest rejected
+        means "cannot approve", not "approval unnecessary". A command rejected
         earlier in the same turn is remembered to avoid prompting repeatedly.
         """
-        turn = self._approval_turn.get()
-        digest = sha256(command.encode()).hexdigest()
-        if digest in turn.denied_digests:
-            return self._terminal_error("Error: User denied this command earlier in the current turn")
-        if turn.responder is None or not turn.conversation_id:
-            return self._terminal_error("Error: Command requires user approval, but this turn is not interactive")
-        approved = await turn.responder.await_approval(
-            conversation_id=turn.conversation_id,
-            turn_id=turn.turn_id,
-            tool_call_id=turn.tool_call_id,
-            command=command,
-            description="Delete files using a shell command",
-        )
-        if approved:
+        reason = await self._approval.ask(subject=command, description="Delete files using a shell command")
+
+        if reason is None:
             return None
-        self._approval_turn.set(
-            replace(
-                turn,
-                denied_digests=turn.denied_digests | {digest},
-            )
-        )
-        return self._terminal_error("Error: User denied this command or the approval request expired")
+
+        return self._terminal_error(self._REFUSAL_MESSAGES.get(reason, self._REFUSAL_UNANSWERED))
+
+    # One message per outcome. Reporting a denial as "denied or expired" told
+    # the model, and the person reading the transcript, that the UI did not
+    # know which had happened -- when the broker had recorded exactly that.
+    _REFUSAL_UNANSWERED = "Error: The approval request could not be completed, so the command did not run"
+    _REFUSAL_MESSAGES = {
+        ALREADY_REFUSED: "Error: This command was already refused earlier in the current turn",
+        NOT_INTERACTIVE: "Error: Command requires user approval, but this turn is not interactive",
+        "deny": "Error: User denied this command",
+        "timeout": "Error: The approval request expired before it was answered",
+        "cancelled": "Error: The approval request was cancelled before it was answered",
+    }
 
     @classmethod
     def _terminal_error(cls, message: str) -> ToolResult:

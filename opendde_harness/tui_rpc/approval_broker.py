@@ -31,6 +31,8 @@ from uuid import uuid4
 
 from loguru import logger
 
+from opendde_harness.agent.tools.approval import ApprovalDecision
+
 SendFrame = Callable[[dict[str, Any]], Awaitable[None]]
 
 
@@ -67,14 +69,18 @@ class ApprovalBroker:
         tool_call_id: str,
         command: str,
         description: str,
-    ) -> bool:
+    ) -> ApprovalDecision:
         """Wait for an approval decision and fail closed on every error path.
 
-        ``True`` means the exact command may execute once. User denial, visible
-        timeout forwarded by the TUI, backend timeout, connection failure, and
-        broker cancellation all resolve to ``False``. Exceptions are contained
-        here because an approval transport failure must never turn into tool
-        execution or leave the agent loop waiting indefinitely.
+        ``approved`` means the exact command may execute once. User denial,
+        visible timeout forwarded by the TUI, backend timeout, connection
+        failure, and broker cancellation all resolve to ``False``. Exceptions
+        are contained here because an approval transport failure must never
+        turn into tool execution or leave the agent loop waiting indefinitely.
+
+        ``reason`` carries the same close reason the ``approval.closed``
+        notification announces, so the caller can say which of those happened
+        instead of listing the possibilities.
         """
         approval_id = uuid4().hex
         future = asyncio.get_running_loop().create_future()
@@ -105,14 +111,14 @@ class ApprovalBroker:
             )
             request_sent = True
             approved, close_reason = await asyncio.wait_for(future, self._hard_timeout_s)
-            return approved
+            return ApprovalDecision(approved, close_reason)
         except TimeoutError:
             close_reason = "timeout"
-            return False
+            return ApprovalDecision(False, close_reason)
         except Exception:
             close_reason = "error"
             logger.exception("approval_broker: request failed for {}", approval_id)
-            return False
+            return ApprovalDecision(False, close_reason)
         finally:
             self._pending.pop(approval_id, None)
             if request_sent:

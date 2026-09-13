@@ -81,6 +81,11 @@ class ContextTool(Tool):
 
 
 class StartTool(Tool):
+    # Launches a design task on a compute worker. The one case the journal
+    # exists for: a submitted job cannot be reconstructed from local files, so
+    # the turn records that it started before it knows the task id.
+    external_effects = True
+
     def __init__(
         self,
         runtime: DetachedDesignTaskController,
@@ -125,10 +130,21 @@ class StartTool(Tool):
                 "target, binder, design, and compute review"
             )
         workflow = self._runtime.config_from_path(config_path)
+        if not workflow.llm_model:
+            # A YAML that names no model runs its design on the model the
+            # conversation that launched it is on, not on the install's
+            # default: that is the model the user was just talking to.
+            from opendde_harness.providers.binding import active_binding
+
+            binding = active_binding()
+            if binding is not None:
+                workflow = workflow.model_copy(update={"llm_model": str(binding.model)})
         snapshot = await self._launcher(workflow)
+        payload = snapshot.model_dump(mode="json")
+        payload["design_model"] = workflow.llm_model or "(install default)"
         return ToolResult(
-            json.dumps(snapshot.model_dump(mode="json"), ensure_ascii=False),
-            f"Started protein design task {snapshot.task_id}",
+            json.dumps(payload, ensure_ascii=False),
+            f"Started protein design task {snapshot.task_id} on {payload['design_model']}",
         )
 
 
@@ -158,6 +174,9 @@ class StatusTool(Tool):
 
 
 class AdjustTool(Tool):
+    # Queues a parameter change against a running task.
+    external_effects = True
+
     def __init__(self, runtime: DetachedDesignTaskController) -> None:
         self._runtime = runtime
 
@@ -193,6 +212,9 @@ class AdjustTool(Tool):
 
 
 class StopTool(Tool):
+    # Stops a running task.
+    external_effects = True
+
     def __init__(self, runtime: DetachedDesignTaskController) -> None:
         self._runtime = runtime
 
@@ -251,6 +273,9 @@ class CandidatesTool(Tool):
 
 class TargetMsaSearchTool(Tool):
     """Search an antigen-chain MSA on the selected protein-design worker."""
+
+    # Submits work to a worker and writes A3M files where the task will read them.
+    external_effects = True
 
     def __init__(self, runtime: DetachedDesignTaskController) -> None:
         self._runtime = runtime

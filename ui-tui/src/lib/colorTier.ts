@@ -1,22 +1,18 @@
 /**
- * Color-capability override, applied BEFORE chalk / supports-color initialize.
+ * How many colors we may emit, and where that number comes from.
  *
- * Detection of the actual terminal capability is left to chalk (mainstream
- * `supports-color`), corrected by hermes-ink's vscode/tmux level tweaks. This
- * module only handles user *overrides*, by translating them into the
- * `HERMES_TUI_LEVEL` env var that hermes-ink reads to pin chalk's level
- * EXACTLY. (FORCE_COLOR is only a floor — supports-color still returns 3 when
- * COLORTERM=truecolor, so it can't force a downgrade to 256/16.)
+ * Detection of the terminal's real capability is chalk's job (mainstream
+ * `supports-color`). This module layers our overrides and the two corrections
+ * chalk gets wrong on top of it, and hands the answer to `theme.ts`, which
+ * builds a `Chalk` instance pinned to that level. Nothing here mutates the
+ * global chalk singleton, so import order is not load-bearing.
  *
  * Channels:
- *   - `OPENDDE_HARNESS_TUI_COLOR` = auto | truecolor | 256 | 16 | none  (the `--color`
- *     flag forwards here).
- *   - `OPENDDE_HARNESS_TUI_TRUECOLOR` = 1/true/... — legacy alias for
+ *   - `NO_COLOR` (any value, per no-color.org) — colors off, beats everything.
+ *   - `OPENDDE_HARNESS_TUI_COLOR` = auto | truecolor | 256 | 16 | none — the
+ *     `--color` flag forwards here. Pins the tier exactly.
+ *   - `OPENDDE_HARNESS_TUI_TRUECOLOR` = 1/true/yes/on — legacy alias for
  *     `OPENDDE_HARNESS_TUI_COLOR=truecolor`.
- *
- * Precedence (highest first): NO_COLOR > OPENDDE_HARNESS_TUI_COLOR > legacy
- * OPENDDE_HARNESS_TUI_TRUECOLOR > chalk auto-detect. Per product decision, a typed
- * `--color` does NOT outrank `NO_COLOR`.
  */
 
 export type ColorTier = 0 | 1 | 2 | 3
@@ -24,38 +20,34 @@ export type ColorTier = 0 | 1 | 2 | 3
 const TRUE_RE = /^(?:1|true|yes|on)$/i
 
 /**
- * Parse the requested tier from the OpenDDE Harness color env vars. Returns the
- * forced tier, or `null` for "auto" (defer to chalk's detection).
+ * The tier the user asked for, or `null` for "auto" (defer to detection).
+ * `NO_COLOR` is not consulted here — see `resolveColorTier`.
  */
-export function parseColorOverride(env: NodeJS.ProcessEnv = process.env): ColorTier | null {
+export function parseColorOverride(env: NodeJS.ProcessEnv): ColorTier | null {
   const raw = (env.OPENDDE_HARNESS_TUI_COLOR ?? '').trim().toLowerCase()
 
   switch (raw) {
+    case '0':
     case 'none':
     case 'off':
-    case '0':
       return 0
+    case '1':
     case '16':
     case 'ansi':
-    case '1':
       return 1
+    case '2':
     case '256':
     case 'ansi256':
-    case '2':
       return 2
-    case 'truecolor':
     case '24bit':
-    case 'rgb':
     case '3':
+    case 'rgb':
+    case 'truecolor':
       return 3
-    case '':
-    case 'auto':
-      break
     default:
       break
   }
 
-  // Legacy alias: OPENDDE_HARNESS_TUI_TRUECOLOR=1 == OPENDDE_HARNESS_TUI_COLOR=truecolor.
   if (TRUE_RE.test((env.OPENDDE_HARNESS_TUI_TRUECOLOR ?? '').trim())) {
     return 3
   }
@@ -64,35 +56,45 @@ export function parseColorOverride(env: NodeJS.ProcessEnv = process.env): ColorT
 }
 
 /**
- * Apply the override to `env` by setting `HERMES_TUI_LEVEL` (mutates in
- * place). Must run before chalk / hermes-ink are imported. Returns the tier
- * that was pinned, or `null` when left on auto.
+ * The tier to render at, given the environment and chalk's auto-detected level.
+ *
+ * Corrections applied to the detected level (skipped entirely when the user
+ * pinned a tier):
+ *   - xterm.js (VS Code / Cursor / code-server) has been truecolor since 2017
+ *     but often doesn't set COLORTERM, and supports-color doesn't know
+ *     `TERM_PROGRAM=vscode` — it lands on 2, where `chalk.hex()` collapses onto
+ *     the 6x6x6 cube. Boost to 3.
+ *   - tmux only re-emits truecolor SGR when the outer terminal advertises RGB,
+ *     which the default config doesn't. Clamp to 256, which passes through.
+ *   - Terminal.app before macOS Tahoe 26 approximates 24-bit SGR to its own
+ *     256 palette, and many shells export COLORTERM=truecolor globally. Clamp.
+ *
+ * Order matters: the boost runs first so that tmux inside VS Code still clamps.
  */
-export function applyColorOverride(env: NodeJS.ProcessEnv = process.env): ColorTier | null {
-  // NO_COLOR (any value, per no-color.org) beats every override, including a
-  // typed --color — colors off.
+export function resolveColorTier(env: NodeJS.ProcessEnv, detectedLevel: number): ColorTier {
   if ('NO_COLOR' in env) {
-    env.HERMES_TUI_LEVEL = '0'
-    env.FORCE_COLOR = '0'
     return 0
   }
 
-  const tier = parseColorOverride(env)
+  const pinned = parseColorOverride(env)
 
-  if (tier === null) {
-    return null
+  if (pinned !== null) {
+    return pinned
   }
 
-  // Pin chalk's level exactly (hermes-ink reads HERMES_TUI_LEVEL).
-  env.HERMES_TUI_LEVEL = String(tier)
-  // Also drop FORCE_COLOR to off for `none` so any non-hermes chalk goes dark.
-  if (tier === 0) {
-    env.FORCE_COLOR = '0'
+  let level = Math.max(0, Math.min(3, Math.trunc(detectedLevel))) as ColorTier
+
+  if (env.TERM_PROGRAM === 'vscode' && level === 2) {
+    level = 3
   }
 
-  return tier
+  if (env.TMUX && level > 2) {
+    level = 2
+  }
+
+  if (env.TERM_PROGRAM === 'Apple_Terminal' && level > 2) {
+    level = 2
+  }
+
+  return level
 }
-
-applyColorOverride()
-
-export {}

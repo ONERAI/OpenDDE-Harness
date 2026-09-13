@@ -1,9 +1,9 @@
 """Configuration schema using Pydantic."""
 
 from pathlib import Path
-from typing import Any, Literal
+from typing import Literal
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, RootModel, model_validator
 from pydantic.alias_generators import to_camel
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -15,6 +15,7 @@ from opendde_harness.config.features import (
     SkillForgeConfig,
     TracingConfig,
 )
+from opendde_harness.providers import model_id, pi_ids
 
 
 class Base(BaseModel):
@@ -34,27 +35,148 @@ class Base(BaseModel):
 #: budget for DashScope, on/off for Z.ai. ``off`` switches thinking off.
 ReasoningEffort = Literal["off", "minimal", "low", "medium", "high", "xhigh", "max"]
 
+#: pi's own compatibility fields, per wire: what ``OpenAICompletionsCompat``,
+#: ``OpenAIResponsesCompat`` and ``AnthropicMessagesCompat`` declare in
+#: ``@earendil-works/pi-ai/dist/types.d.ts``. A ``compat`` block is a set of
+#: overrides for what pi otherwise detects from a provider's address, and it
+#: travels to pi untouched -- so a key pi has no field for would be sent and
+#: ignored, which is why the key set is vendored here and an unknown one is
+#: refused where the config is read.
+#:
+#: The two wires missing from this table take no compat at all: pi types
+#: ``Model.compat`` as ``never`` for ``google-generative-ai`` and
+#: ``mistral-conversations``, and a block written under either is refused.
+#:
+#: Regenerate from ``ui-tui/`` with::
+#:
+#:     node --input-type=module -e "
+#:     import {readFileSync} from 'node:fs';
+#:     const src = readFileSync('node_modules/@earendil-works/pi-ai/dist/types.d.ts', 'utf8');
+#:     for (const name of ['OpenAICompletionsCompat','OpenAIResponsesCompat','AnthropicMessagesCompat']) {
+#:       const start = src.indexOf('export interface ' + name + ' {');
+#:       const body = src.slice(start, src.indexOf('\n}', start));
+#:       console.log(name, [...body.matchAll(/^\s{4}([A-Za-z][A-Za-z0-9]*)\?:/gm)].map(m => m[1]))}"
+_RESPONSES_COMPAT = frozenset(
+    {
+        "sessionAffinityFormat",
+        "supportsAdditionalTools",
+        "supportsDeveloperRole",
+        "supportsExplicitPromptCacheMode",
+        "supportsLongCacheRetention",
+        "supportsMaxOutputTokens",
+        "supportsOpenAIGrammarTools",
+        "supportsStrictMode",
+        "supportsToolSearch",
+    }
+)
+
+COMPAT_KEYS: dict[str, frozenset[str]] = {
+    "anthropic-messages": frozenset(
+        {
+            "allowEmptySignature",
+            "allowedFallbackModels",
+            "forceAdaptiveThinking",
+            "sendSessionAffinityHeaders",
+            "supportsCacheControlOnTools",
+            "supportsEagerToolInputStreaming",
+            "supportsLongCacheRetention",
+            "supportsMidConvoEffort",
+            "supportsStrictTools",
+            "supportsTemperature",
+            "supportsToolReferences",
+        }
+    ),
+    "azure-openai-responses": _RESPONSES_COMPAT,
+    "openai-codex-responses": _RESPONSES_COMPAT,
+    "openai-completions": frozenset(
+        {
+            "cacheControlFormat",
+            "chatTemplateArgs",
+            "chatTemplateKwargs",
+            "deferredToolsMode",
+            "maxTokensField",
+            "openRouterRouting",
+            "requiresAssistantAfterToolResult",
+            "requiresReasoningContentOnAssistantMessages",
+            "requiresThinkingAsText",
+            "requiresToolResultName",
+            "sendSessionAffinityHeaders",
+            "sessionAffinityFormat",
+            "supportsDeveloperRole",
+            "supportsFinishReason",
+            "supportsLongCacheRetention",
+            "supportsOpenAIGrammarTools",
+            "supportsReasoningEffort",
+            "supportsStore",
+            "supportsStrictMode",
+            "supportsThinkingTokenBudget",
+            "supportsUsageInStreaming",
+            "thinkingFormat",
+            "thinkingTokenBudgetField",
+            "vercelGatewayRouting",
+            "vllmPriority",
+            "zaiToolStream",
+        }
+    ),
+    "openai-responses": _RESPONSES_COMPAT,
+}
+
+
+def _refuse_unknown_compat(compat: dict[str, object] | None, api: str, subject: str) -> None:
+    """Refuse a ``compat`` key the wire it is written under does not read.
+
+    Always against one named wire, never against the union of all of them: a
+    list of every field every wire reads answers a question nobody asked, and
+    the wire is always knowable by the time this matters -- a model row that
+    leaves ``api`` to its provider is checked by :class:`ProviderEntry`, which
+    can see both.
+    """
+    if not compat:
+        return
+    if api not in COMPAT_KEYS:
+        raise ValueError(
+            f"{subject} sets compat, and pi reads none on {api}: compatibility overrides exist for "
+            f"{', '.join(sorted(COMPAT_KEYS))}. Delete the block."
+        )
+    unknown = sorted(key for key in compat if key not in COMPAT_KEYS[api])
+    if unknown:
+        raise ValueError(
+            f"{subject} sets compat {', '.join(repr(key) for key in unknown)}, which pi does not read on "
+            f"{api}: the block travels to pi untouched, so a field it does not have would be sent and "
+            f"ignored. What that wire reads: {', '.join(sorted(COMPAT_KEYS[api]))}."
+        )
+
 
 class AgentDefaults(Base):
     """Default agent configuration."""
 
     workspace: str = "~/.opendde_harness/workspace"
+    # "<pi provider id>/<model id>", exactly as pi spells it:
+    # "openai-codex/gpt-5.4", "my-vllm/qwen3-32b". The prefix names the
+    # `providers` entry whose credential and address serve the model, and it is
+    # the only thing that does -- a bare id names nobody and is refused.
     model: str = "anthropic/claude-opus-4-5"
-    provider: str = "auto"  # Provider name (e.g. "anthropic", "openrouter") or "auto" for auto-detection
-    # No maxTokens and no contextWindowTokens here on purpose. A number in a
-    # config file cannot be right for every model -- too large is a 400, too
-    # small truncates or trims silently -- so both are resolved per model from
-    # the model's own overlay and the bundled tables (providers/rates). The
-    # place to declare either is `providers.<name>.modelOverlay.<id>`.
-    temperature: float = 0.1
-    # Wall-clock cap (seconds) on a non-streamed LLM request (main loop and
-    # sub-agents). A streamed request is bounded per silence instead: the
-    # wait for its first event, then the gap between events. A stalled gateway
-    # then surfaces after the idle bound, not after ten minutes, and a reply
-    # that keeps arriving is never cut off for being long.
-    llm_call_timeout: int = 600
+    # No maxTokens, no contextWindowTokens and no temperature here on purpose.
+    # A number in a config file cannot be right for every model -- too large a
+    # ceiling is a 400, too small truncates or trims silently, and a model that
+    # rejects `temperature` outright refuses every request that carries one
+    # ("Unsupported parameter: temperature" is what the Codex wire answers). So
+    # all three are per model: the two limits resolve from the model's own row
+    # and then from what the model layer reports, and a temperature is sent only
+    # where a row asks for one. The place to declare any of them is a row in
+    # `providers.<id>.models`: `contextWindow`, `maxTokens`, `temperature`.
+    # A request is bounded per silence, never in total: the wait for its first
+    # event (a model with hidden reasoning thinks for minutes before it), then
+    # the gap between events. A stalled gateway surfaces after the idle bound,
+    # and a reply that keeps arriving is never cut off for being long.
     llm_first_token_timeout: int = 300
     llm_idle_timeout: int = 120
+    # How many times a request the server has not accepted may be sent again:
+    # a refused connection, a 429 or a 5xx before any stream opened. The
+    # transport applies it, honouring Retry-After and the first-event budget.
+    # A stream that was accepted and began delivering is never re-sent
+    # automatically; the user's own retry is the only second attempt there.
+    llm_retries: int = Field(default=3, ge=0)
     max_tool_iterations: int = 40
     # Cap on subagent VMs running at once (excess spawns queue). ge=1: a
     # 0/negative cap would deadlock every subagent (Semaphore(0)).
@@ -77,393 +199,351 @@ class AgentDefaults(Base):
     # pi's DEFAULT_THINKING_LEVEL; None leaves each vendor's default in place.
     # A model the catalogue marks as non-reasoning is sent nothing.
     reasoning_effort: ReasoningEffort | None = "medium"
-    # Per-model request-parameter overrides, keyed by a substring of the model
-    # name: {"kimi-k2.5": {"temperature": 1.0}}. Some models reject the usual
-    # defaults, and hard-coding those quirks in the registry left users unable to
-    # adjust them. Entries here win over the registry's built-in defaults.
-    # This is also the direct channel for arbitrary sampling/serving params: an
-    # unknown top-level key is auto-forwarded into extra_body by LiteLLM for
-    # OpenAI-compatible backends (e.g. sglang's repetition_penalty); a nested
-    # structure can be written directly as extra_body: {...}.
-    model_overrides: dict[str, dict[str, Any]] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _model_names_its_provider(self) -> "AgentDefaults":
+        """The default model is "<provider>/<model>", and says so or is refused.
+
+        One identity, stated once in the file: every consumer -- routing, the
+        catalogue, the window and price readers, the model row lookup, the
+        provider being built -- then sees "deepseek/deepseek-chat" and never
+        has to work out who serves a bare "deepseek-chat".
+
+        Whether that provider is configured is :class:`Config`'s question, not
+        this model's: the providers map is a sibling field and is not visible
+        from here.
+
+        Empty is "not chosen yet", which the setup gate parks on and the wizard
+        writes when the provider that served the default is removed; only a
+        model that is named has to name its provider.
+        """
+        if self.model == "":
+            return self
+        provider, model = model_id.split(self.model)
+        if not provider or not model:
+            raise ValueError(
+                f"agents.defaults.model = {self.model!r} names no provider. Write it as "
+                f"<provider>/<model> -- the provider is a key of the providers section "
+                f"(for example openrouter/{self.model or 'some-model'})."
+            )
+        return self
+
+    # ``provider`` was here, naming the section that served a bare model id.
+    # The id carries its provider now, so the field said a second time what the
+    # id already says -- and when the two disagreed the field won, which sent
+    # one vendor's model to another vendor's key.
 
 
 class AgentsConfig(Base):
     """Agent configuration."""
 
     defaults: AgentDefaults = Field(default_factory=AgentDefaults)
+    #: pi's scoped models: the ``<provider>/<model>`` ids ``/model`` shows under
+    #: its "scoped" tab, in the order ``/scoped-models`` saved them. ``None`` is
+    #: pi's "all enabled": no scope, the picker opens on every model.
+    scoped_models: list[str] | None = None
 
 
-class ModelOverlay(Base):
-    """What the user knows about a model that no catalogue carries.
+class TuiConfig(Base):
+    """Terminal UI preferences shared by config files and the RPC handlers."""
 
-    A self-hosted deployment serves whatever was put there, and a model released
-    since the bundled snapshot is in no table yet, so the picker falls back to
-    showing the id and the loop to an unknown window. The id is usually a fine
-    name -- it is what the user called their own deployment -- but nothing else
-    about such a model can be looked up, and the user is the only source.
+    # Deliberately a plain string rather than a Literal: a name written by an
+    # earlier release must not stop the whole config from loading. The TUI
+    # validates it on read and falls back to `default` for anything else.
+    theme: str = Field(
+        default="default",
+        strict=True,
+        pattern=r"^[A-Za-z0-9_-]+$",
+        description=(
+            "Palette the TUI paints with: 'dark', 'light', or 'default' to follow the terminal. "
+            "Any other name falls back to 'default'. "
+            "OPENDDE_HARNESS_TUI_THEME and OPENDDE_HARNESS_TUI_LIGHT outrank this."
+        ),
+    )
+    show_token_usage: bool = Field(default=True, strict=True)
 
-    ``context_window_tokens`` and ``max_output_tokens`` are read first by the
-    resolvers in ``providers.rates``, ahead of every table: a person describing
-    their own deployment is the authority on it. Per model, and only per
-    model: one number for every model the session switches to is wrong for
-    all but one of them. A deployment configured with a smaller window than
-    the model's native one is exactly the case for this: the catalogue's
-    figure would be an over-estimate, and an over-estimate is a refused
-    request rather than wasted context.
 
-    ``wire`` picks the wire for this one model, over the section's
-    ``wire``: one relay can serve different models on different wires
-    (models.dev carries 289 such per-model overrides), so a provider-wide
+class ModelCost(Base):
+    """pi's four per-million rates for a model, as pi's ``cost`` row spells them.
+
+    Only for a model no catalogue prices -- a self-hosted deployment, a relay
+    that renamed what it fronts. Without one such a model reports unknown spend
+    rather than borrowing a hosted model's rate, which is the honest answer and
+    the default.
+    """
+
+    input: float = Field(default=0.0, ge=0)
+    output: float = Field(default=0.0, ge=0)
+    cache_read: float = Field(default=0.0, ge=0)
+    cache_write: float = Field(default=0.0, ge=0)
+
+
+class ModelEntry(Base):
+    """One model of a provider: pi's model row, plus what only this project reads.
+
+    Written either as a bare id string or as this row. The string is the whole
+    declaration for a model whose facts are already known -- a built-in's own
+    catalogue carries them -- and the row is for what no catalogue can carry:
+    a deployment the operator configured, a model newer than pi's catalogue, a
+    relay that renamed what it fronts.
+
+    ``context_window`` and ``max_tokens`` are the first tier of both ladders,
+    ahead of anything the model layer reports: a person describing their own
+    deployment is the authority on it. Per model, and only per model -- one
+    number for every model a session switches to is wrong for all but one of
+    them. A deployment configured with a smaller window than the model's native
+    one is exactly the case for this: the vendor's own figure would be an
+    over-estimate, and an over-estimate is a refused request rather than wasted
+    context. A limit nothing knows is left out rather than guessed.
+
+    ``api`` picks the wire for this one model, over the provider's own: one
+    relay can serve different models on different wires, so a provider-wide
     setting cannot always be right.
 
-    What has no knob is a *price* for an endpoint no catalogue prices; such a
-    deployment reports unknown spend rather than borrowing a hosted model's
-    rate. Adding one is a separate ask.
+    ``compat`` overrides what pi otherwise detects from the provider's address,
+    for this one model: the wire's own fields (:data:`COMPAT_KEYS`), passed to
+    pi as the row's ``compat``. It replaces the provider's block rather than
+    merging with it, so one row's answer is the whole answer for that row.
+
+    The last three are this project's, not pi's, and the request path is what
+    reads them. ``reasoning_effort`` and ``temperature`` are per model because a
+    hybrid model one wants fast and a reasoning model one wants deep share a
+    session, and because some models reject the usual default outright.
+    ``catalog_model`` names the catalogue model a deployment serves, for an id
+    that names a deployment rather than a model (an Azure deployment called
+    "prod"): its limits and its price then apply. Without it such a
+    deployment's limits are unknown -- a familiar-looking deployment name is
+    not evidence of what is behind it.
     """
 
-    label: str = ""
+    id: str = Field(min_length=1)
+    name: str = ""
+    #: Shown under the name in the model picker. Ours; pi's rows carry none.
     description: str = ""
-    context_window_tokens: int | None = Field(default=None, gt=0)
-    max_output_tokens: int | None = Field(default=None, gt=0)
-    wire: Literal["responses", "chat"] | None = None
-    # This model's thinking level, over ``agents.defaults.reasoningEffort``:
-    # a hybrid model one wants fast and a reasoning model one wants deep can
-    # share a session without the global default being wrong for one.
+    api: str | None = None
+    context_window: int | None = Field(default=None, gt=0)
+    max_tokens: int | None = Field(default=None, gt=0)
+    reasoning: bool | None = None
+    input: list[Literal["text", "image"]] | None = None
+    cost: ModelCost | None = None
+    compat: dict[str, object] | None = None
+
+    # --- read by this project's request path, never sent to pi as a row field
     reasoning_effort: ReasoningEffort | None = None
+    temperature: float | None = Field(default=None, ge=0)
+    catalog_model: str | None = None
+
+    @model_validator(mode="after")
+    def _api_is_one_pi_serves(self) -> "ModelEntry":
+        if self.api is not None and self.api not in pi_ids.APIS:
+            raise ValueError(f"model {self.id!r} names api {self.api!r}; known apis are {', '.join(pi_ids.APIS)}")
+        # Only against a wire this row names itself. A row that leaves the wire
+        # to its provider is checked by ProviderEntry, which can see both --
+        # from in here the provider is not visible, and every wire's fields at
+        # once is not a rule worth holding anything to.
+        if self.api is not None:
+            _refuse_unknown_compat(self.compat, self.api, f"model {self.id!r}")
+        return self
 
 
-class ProviderEndpoint(Base):
-    """One named URL/key group under a provider section.
+class ProviderEntry(Base):
+    """One provider, in pi's ``models.json`` shape.
 
-    ``label`` is not decoration: it is the idempotency key a later stage
-    (rotation, failover, per-endpoint health) uses to address one entry across
-    edits, so two endpoints in the same list must not share one.
+    Two kinds, and ``base_url`` is what tells them apart. An entry with no
+    address is one of pi's own: pi has the address, the wire and the catalogue,
+    so the entry carries the credential and nothing else has to be said. An
+    entry with an address is a provider this config **declares** -- a relay, a
+    self-hosted server, an Azure resource -- and an address needs a protocol, so
+    ``api`` is required with it and refused without it. That pairing is the whole
+    rule: there is no per-vendor table saying which wire a name speaks, and
+    nothing is probed.
+
+    A key pi does not ship can only be the declared kind, so it needs both.
+
+    ``login`` is the credential that is a sign-in rather than a key. The grant
+    lives in the model service's credential store, never in this file, so an
+    entry that names one carries no ``api_key``.
+
+    An entry with neither ``login`` nor ``api_key`` is still a declaration: pi
+    reads the vendor's own environment variable itself (``OPENAI_API_KEY`` and
+    the rest), and a self-hosted server usually wants no key at all.
     """
 
-    label: str = Field(min_length=1)
-    api_key: str = ""
-    api_base: str | None = None
-    extra_headers: dict[str, str] | None = None
+    login: Literal["oauth"] | None = None
+    api_key: str = Field(default="", json_schema_extra={"secret": True})
+    base_url: str = ""
+    api: str | None = None
+    #: Display name. pi defaults it to the id; a declared provider is the only
+    #: kind worth naming, since a built-in's name is pi's own.
+    name: str = ""
+    #: Sent with every request to this provider -- can carry a secret, so
+    #: display faces redact the values and leave the keys visible.
+    headers: dict[str, str] | None = Field(default=None, json_schema_extra={"secret": True})
+    #: pi's compatibility overrides for every model this entry serves, in pi's
+    #: own shape (:data:`COMPAT_KEYS`). What pi detects from an address is right
+    #: for the hosts it has rules for and a guess for everyone else, and this is
+    #: where the operator of a relay states what theirs actually accepts. Only a
+    #: declared entry has one: pi owns its own providers' flags, and an entry
+    #: with no address sends nothing but a credential.
+    compat: dict[str, object] | None = None
+    #: A bare id, or a full row. A built-in's list curates what the picker
+    #: offers out of pi's catalogue; a declared provider's list IS its
+    #: catalogue, because pi has none for one.
+    models: list[str | ModelEntry] = Field(default_factory=list)
 
+    @model_validator(mode="after")
+    def _an_address_names_its_protocol(self) -> "ProviderEntry":
+        if self.api is not None and self.api not in pi_ids.APIS:
+            raise ValueError(f"api {self.api!r} is not one of {', '.join(pi_ids.APIS)}")
+        if self.base_url and not self.api:
+            raise ValueError(
+                "baseUrl is set but api is not: an address needs the protocol it serves, declared and "
+                f"never probed. One of {', '.join(pi_ids.APIS)}."
+            )
+        if self.api and not self.base_url:
+            raise ValueError(
+                f"api is {self.api!r} but baseUrl is not set: naming a protocol is only meaningful for a "
+                "provider this config declares, and a declared one is reached by address."
+            )
+        return self
 
-class ProviderConfig(Base):
-    """LLM provider configuration."""
+    @model_validator(mode="after")
+    def _compat_is_read_by_the_wire_it_is_written_under(self) -> "ProviderEntry":
+        """Every ``compat`` block here, against the one wire that will read it.
 
-    api_key: str = ""
-    api_base: str | None = None
-    # OpenAI-compatible endpoints have two wire protocols: "chat" is
-    # POST /v1/chat/completions, "responses" is POST /v1/responses. None means
-    # the provider's own default (`ProviderSpec.wire`): Responses for
-    # OpenAI proper, Chat Completions for a relay or self-hosted endpoint,
-    # which is what most of them implement. Wrong wire is reported as a
-    # configuration error naming this field, never routed around silently.
-    wire: Literal["responses", "chat"] | None = None
-    # Custom headers (e.g. APP-Code for AiHubMix) -- can carry a secret, so
-    # display faces redact the values (keys stay visible).
-    extra_headers: dict[str, str] | None = Field(default=None, json_schema_extra={"secret": True})
-    models: list[str] = Field(default_factory=list)  # User-curated model names for the picker
-    # Several full url/key/header groups under one provider section, for a
-    # vendor reachable by more than one account or region. Meaningful only for
-    # a plain API-key provider reached through the litellm client -- a section
-    # whose auth is OAuth, or that needs more than a key and an address (Azure
-    # OpenAI, Codex), gets this rejected at `make_provider` construction time
-    # (wired in a later stage; this field exists regardless). Set and non-empty,
-    # it replaces the flat `api_key` outright rather than merging with it; an
-    # entry inherits the flat `api_base`/`extra_headers` for whichever it does
-    # not name itself -- see `opendde_harness.providers.endpoints.provider_endpoints` for the
-    # one place that resolves which of the two shapes (or Gemini's
-    # `api_key_list`) is in effect.
-    endpoints: list[ProviderEndpoint] = Field(default_factory=list)
+        A row's wire is its own ``api`` or, far more often, this provider's, so
+        this is where a row's block is finally checked -- from inside the row the
+        provider is not visible.
 
-    @field_validator("endpoints")
-    @classmethod
-    def _unique_endpoint_labels(cls, value: list[ProviderEndpoint]) -> list[ProviderEndpoint]:
-        """Reject a duplicate label -- see the class docstring for why one must be unique."""
-        seen: set[str] = set()
-        for ep in value:
-            if ep.label in seen:
-                raise ValueError(f"duplicate endpoint label {ep.label!r}: labels must be unique within a provider")
-            seen.add(ep.label)
-        return value
-
-    # How requests spread across `endpoints` when there is more than one:
-    # "sticky" keeps using the first healthy entry until it fails, "round_robin"
-    # cycles through all of them. Meaningless with zero or one endpoint.
-    endpoint_strategy: Literal["sticky", "round_robin"] = "sticky"
-    # Keyed by model id, in any spelling: what the user knows about a model that
-    # the catalogues do not. Deliberately additive rather than a change to
-    # `models` -- that list already lets a model be added, and what was missing
-    # was a way to describe one, so no config has to be rewritten to get it.
-    model_overlay: dict[str, ModelOverlay] = Field(default_factory=dict)
-
-    @property
-    def effective_api_key(self) -> str:
-        """The key to send, which is not always the ``api_key`` field.
-
-        Declared on the base so every call site can ask without knowing which
-        providers keep their key somewhere else. Gemini accepts a list, and a
-        section holding only that list handed LiteLLM an empty string: the
-        request left with no credential and failed at the API, having passed
-        every check that only asked whether credentials existed.
+        An entry with no address carries no block at all. pi detects the flags
+        for its own providers, and such an entry sends nothing but a credential,
+        so a block written there would be accepted and never sent anywhere.
         """
-        return self.api_key
-
-
-class AzureProviderConfig(ProviderConfig):
-    """Azure OpenAI, whose connection needs more than a key and an address.
-
-    A deployment is a name the tenant gives one model, and it goes into the
-    request URL's path. It used to be read off ``agents.defaults.model``, which
-    made a model id double as a connection parameter: the id could carry no
-    prefix without the prefix landing in the path, so Azure was the one provider
-    whose ids had to be spelled differently from everyone else's. Declared here,
-    the model id is free to be a model id.
-
-    ``api_version`` was hardcoded in the client, so a tenant on a different one
-    had no way to say so.
-    """
-
-    deployment: str = ""  # falls back to the model id, for configs written before this field
-    api_version: str = "2024-10-21"
-
-
-class GeminiProviderConfig(ProviderConfig):
-    """Gemini, which accepts several keys under one section.
-
-    Example:
-        gemini:
-          apiKeyList:
-            - "key1"
-            - "key2"
-
-    A ``vertex`` flag used to sit here, documented as setting
-    ``GOOGLE_GENAI_USE_VERTEXAI``. Nothing read it, and it could not have worked:
-    that variable belongs to the google-genai SDK, while requests go through
-    LiteLLM, which does not read it and reaches Vertex as a separate provider
-    (``vertex_ai``) needing ``VERTEXAI_PROJECT`` and ``VERTEXAI_LOCATION``. It was
-    settable from the CLI and covered by tests, so it read as a supported feature
-    while doing nothing at all. Reaching Vertex is a change to how a request is
-    routed, not a boolean on a key.
-    """
-
-    #: Several keys may be listed; the first is used. Round-robin rotation was
-    #: declared here once and never called -- listing keys and silently using one
-    #: is the honest description of what happens.
-    api_key_list: list[str] = Field(default_factory=list)
-
-    @property
-    def effective_api_key(self) -> str:
-        if self.api_key_list:
-            return self.api_key_list[0]
-        return self.api_key
-
-    @property
-    def all_keys(self) -> list[str]:
-        """Return all configured API keys."""
-        if self.api_key_list:
-            return list(self.api_key_list)
-        return [self.api_key] if self.api_key else []
-
-
-def _prefer_set_values(base: dict[str, Any], winner: dict[str, Any]) -> dict[str, Any]:
-    """Merge two sections for one provider, letting a set value beat an unset one.
-
-    The current name wins a genuine conflict, but a declared field exists as an
-    empty section whether or not it was configured -- so taking it verbatim let a
-    placeholder erase the credential the user had written under the provider's
-    other spelling.
-    """
-    merged = dict(base)
-    merged.update({k: v for k, v in winner.items() if v not in ("", None, [], {})})
-    return merged
-
-
-def _has_credentials(config: "ProviderConfig", spec: Any, name: str = "") -> bool:
-    """Is this section actually usable, or just a placeholder?
-
-    Every declared provider exists as an empty section whether or not the user
-    configured it, so "the field is there" says nothing. A spec flag must not
-    stand in for evidence either: `is_local` used to answer with no api_base at
-    all, and an empty declared section then beat the credentials the user had
-    really written under one of that provider's other names.
-
-    The rule itself lives in `providers.auth`, because deciding it here as well
-    is what made a Gemini section holding only `api_key_list` invisible to
-    routing while `provider list` showed it as configured.
-
-    A vendor OpenDDE Harness carries no spec for reaches this too -- the passthrough route,
-    where the section name is all there is -- so the name is passed separately
-    rather than read off a spec that may not exist.
-    """
-    from opendde_harness.providers.auth import credential_status
-
-    return credential_status(name or (spec.name if spec else ""), config, spec=spec).ok
-
-
-class ProvidersConfig(Base):
-    """Configuration for LLM providers.
-
-    Fields below are the providers OpenDDE Harness carries metadata for. Any other key is
-    kept as-is and served through :meth:`get`, so a provider LiteLLM supports but
-    OpenDDE Harness has no spec for still works from config alone.
-    """
-
-    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="allow")
-
-    @model_validator(mode="before")
-    @classmethod
-    def _merge_renamed_sections(cls, data: Any) -> Any:
-        """Fold a provider's pre-rename section into its current one.
-
-        A file touched by both names holds two half-filled sections -- say the
-        credentials under the old name and a model list under the new one.
-        Picking either section alone drops the other's fields, so merge with the
-        current name winning per field.
-        """
-        if not isinstance(data, dict):
-            return data
-        from opendde_harness.providers.registry import PROVIDERS, names_same_provider
-
-        merged = dict(data)
-
-        # Fold any key that spells a declared field differently into that field.
-        # Extras are matched spelling-insensitively (`ProvidersConfig.get`), and
-        # a declared field exists as an empty section whether or not it was
-        # configured -- so without this, "azure-openai" or "OpenRouter" lands in
-        # extras where the always-present empty field then wins, and a key the
-        # user really wrote reads back as unset. One rule for both kinds.
-        for key in [k for k in merged if k not in cls.model_fields]:
-            field = next((f for f in cls.model_fields if names_same_provider(key, f)), None)
-            if field is None or not isinstance(merged[key], dict):
+        # A declared entry always names its wire: `api` is required with
+        # `baseUrl`, so a row that names none falls back to one, never to None.
+        wire = self.api or ""
+        blocks = [("this provider", self.compat, wire)]
+        blocks += [(f"model {row.id!r}", row.compat, row.api or wire) for row in self.rows()]
+        for subject, compat, api in blocks:
+            if not compat:
                 continue
-            section = dict(merged.pop(key))
-            current = merged.get(field)
-            if isinstance(current, dict):
-                section = _prefer_set_values(section, current)
-            merged[field] = section
+            if not self.declared:
+                raise ValueError(
+                    f"{subject} sets compat, and this entry declares no baseUrl: pi detects the "
+                    "compatibility of its own providers from the address it holds, and an entry with no "
+                    "address sends nothing but its credential. Set baseUrl and api to declare the "
+                    "provider, or delete the compat block."
+                )
+            _refuse_unknown_compat(compat, api, subject)
+        return self
 
-        for spec in PROVIDERS:
-            stale = [merged.pop(a) for a in spec.name_aliases if isinstance(merged.get(a), dict)]
-            if not stale:
-                continue
-            section: dict[str, Any] = {}
-            for older in stale:
-                section = _prefer_set_values(section, older)
-            current = merged.get(spec.name)
-            if isinstance(current, dict):
-                section = _prefer_set_values(section, current)
-            merged[spec.name] = section
-        return merged
+    @property
+    def declared(self) -> bool:
+        """Is this a provider this config declares, rather than one of pi's?
 
-    custom: ProviderConfig = Field(default_factory=ProviderConfig)  # Any OpenAI-compatible endpoint
-    azure_openai: AzureProviderConfig = Field(default_factory=AzureProviderConfig)  # Azure OpenAI
-    anthropic: ProviderConfig = Field(default_factory=ProviderConfig)
-    openai: ProviderConfig = Field(default_factory=ProviderConfig)
-    openrouter: ProviderConfig = Field(default_factory=ProviderConfig)
-    deepseek: ProviderConfig = Field(default_factory=ProviderConfig)
-    groq: ProviderConfig = Field(default_factory=ProviderConfig)
-    # Z.ai, the vendor's current brand and LiteLLM's name for it. Configs
-    # written before the rename say "zhipu"; both keys load.
-    zai: ProviderConfig = Field(
-        default_factory=ProviderConfig,
-        validation_alias=AliasChoices("zai", "zhipu"),
-    )
-    dashscope: ProviderConfig = Field(default_factory=ProviderConfig)  # Alibaba Cloud Tongyi Qianwen
-    # LiteLLM's own names for these two, so a model id and a config section are
-    # spelled the same. Configs written before the rename keep loading.
-    hosted_vllm: ProviderConfig = Field(
-        default_factory=ProviderConfig,
-        validation_alias=AliasChoices("hosted_vllm", "hostedVllm", "vllm"),
-    )
-    gemini: GeminiProviderConfig = Field(default_factory=GeminiProviderConfig)  # Google Gemini / Vertex AI
-    moonshot: ProviderConfig = Field(default_factory=ProviderConfig)
-    minimax: ProviderConfig = Field(default_factory=ProviderConfig)
-    minimax_global: ProviderConfig = Field(default_factory=ProviderConfig)
-    minimax_cn: ProviderConfig = Field(default_factory=ProviderConfig)
-    aihubmix: ProviderConfig = Field(default_factory=ProviderConfig)  # AiHubMix API gateway
-    ollama_chat: ProviderConfig = Field(
-        default_factory=ProviderConfig,
-        validation_alias=AliasChoices("ollama_chat", "ollamaChat", "ollama"),
-    )
-    siliconflow: ProviderConfig = Field(default_factory=ProviderConfig)  # SiliconFlow
-    volcengine: ProviderConfig = Field(default_factory=ProviderConfig)  # VolcEngine
-    openai_codex: ProviderConfig = Field(default_factory=ProviderConfig)  # OpenAI Codex (OAuth)
-    github_copilot: ProviderConfig = Field(default_factory=ProviderConfig)  # Github Copilot (OAuth)
-
-    def get(self, name: str) -> ProviderConfig | None:
-        """Return one provider's config, declared field or extra key alike.
-
-        The lookup is spelling-insensitive on both sides. A section key reaches
-        here in whichever form its writer used -- LiteLLM's hyphenated vendor
-        name, the camelCase this model serializes to, or the underscored field
-        name -- and a caller holding a model-id prefix has only one of those. So
-        this is the only place a provider name may be resolved to its config;
-        reading the attribute directly sees just the one spelling.
+        The address is what decides. A built-in id carrying one is declared too:
+        an Azure resource URL with its own deployment names is not something
+        pi's catalogue can have, so it goes over as a declaration under that
+        same id and replaces pi's built-in for it.
         """
-        from opendde_harness.providers.registry import canonical_provider_name, names_same_provider
+        return bool(self.base_url)
 
-        # A renamed provider keeps answering to its old name, and the declared
-        # field wins: a half-migrated config holding both keys must not serve
-        # the stale one.
-        name = canonical_provider_name(name)
-        declared = self.__dict__.get(name)
-        if isinstance(declared, ProviderConfig):
-            return declared
-        extra = (self.model_extra or {}).get(name)
-        if extra is None:
-            for key, value in (self.model_extra or {}).items():
-                if names_same_provider(key, name):
-                    extra = value
-                    break
-        if isinstance(extra, ProviderConfig):
-            return extra
-        if isinstance(extra, dict):
-            return ProviderConfig.model_validate(extra)
+    @property
+    def model_ids(self) -> list[str]:
+        """Every model id this entry declares, bare as the endpoint serves it."""
+        return [m if isinstance(m, str) else m.id for m in self.models]
+
+    def rows(self) -> list[ModelEntry]:
+        """Every declared model as a row; a bare id becomes a row of just an id."""
+        return [ModelEntry(id=m) if isinstance(m, str) else m for m in self.models]
+
+    def row(self, model: str) -> ModelEntry | None:
+        """The declared row for one bare model id, or None if it is not declared.
+
+        None for a model declared as a bare string too: such an entry states
+        the id and nothing else, and this is asked for what the user knows
+        beyond it.
+        """
+        for entry in self.models:
+            if isinstance(entry, ModelEntry) and entry.id == model:
+                return entry
         return None
 
-    def model_overlays(self) -> dict[str, ModelOverlay]:
-        """Every section's overlays in one map, keyed by ``wire.merge_key``.
 
-        Keyed by identity rather than by the string the user typed, so an
-        overlay written against a bare id still matches the qualified id the
-        loop runs on. One map for the loop to carry: it switches models at
-        runtime and has to find the new model's declaration without holding
-        the whole config.
-        """
-        from opendde_harness.providers.wire import merge_key
+class ProvidersConfig(RootModel[dict[str, ProviderEntry]]):
+    """The ``providers`` section: pi provider ids to pi provider declarations.
 
-        out: dict[str, ModelOverlay] = {}
-        sections: dict[str, Any] = {**self.__dict__, **(self.model_extra or {})}
-        for name, section in sections.items():
-            if isinstance(section, dict):
-                try:
-                    section = ProviderConfig.model_validate(section)
-                except Exception:
-                    continue
-            overlays = getattr(section, "model_overlay", None) or {}
-            for model, overlay in overlays.items():
-                out[merge_key(name, model)] = overlay
-        return out
+    This is pi's own ``models.json`` shape, so pi's documentation describes this
+    section and there is no translation to keep in step. A key is a pi provider
+    id -- ``anthropic``, ``openai-codex``, ``openrouter``, ``azure-openai-responses``
+    -- or a name this config invents for a provider it declares outright, and
+    the id is written exactly once, here, with no aliases and no spellings to
+    reconcile.
 
+    What a key may be is checked here rather than left to the model service:
+    the config is read on machines with no Node at all (``ddeharness doctor``),
+    and a key that is a near-miss for a built-in -- ``gemini`` for ``google``,
+    ``azure-openai`` for ``azure-openai-responses`` -- would otherwise be
+    accepted as a declared provider and then refused for having no address.
+    """
 
-class WebSearchConfig(Base):
-    """Web search tool configuration."""
+    root: dict[str, ProviderEntry] = Field(default_factory=dict)
 
-    api_key: str = ""  # Serper API key
-    max_results: int = 5
+    @model_validator(mode="after")
+    def _each_entry_is_reachable(self) -> "ProvidersConfig":
+        for provider, entry in self.root.items():
+            if not provider or "/" in provider or provider != provider.strip():
+                raise ValueError(f"providers.{provider!r} is not a provider id")
+            if pi_ids.is_builtin(provider) or entry.declared:
+                continue
+            meant = pi_ids.suggestion(provider)
+            hint = f" Did you mean {meant!r}?" if meant else ""
+            raise ValueError(
+                f"providers.{provider} is not one of pi's built-in providers, so it is a provider this "
+                f"config declares -- and a declared one needs baseUrl and api.{hint} Built-in ids are: "
+                f"{', '.join(sorted(pi_ids.BUILTIN))}."
+            )
+        return self
+
+    # -- mapping face. Callers hold this object, not the dict inside it.
+    def get(self, provider: str | None) -> ProviderEntry | None:
+        return self.root.get(provider or "")
+
+    def keys(self):  # noqa: ANN201 - a dict view, typed by the dict
+        return self.root.keys()
+
+    def values(self):  # noqa: ANN201
+        return self.root.values()
+
+    def items(self):  # noqa: ANN201
+        return self.root.items()
+
+    def __getitem__(self, provider: str) -> ProviderEntry:
+        return self.root[provider]
+
+    def __contains__(self, provider: object) -> bool:
+        return provider in self.root
+
+    def __iter__(self):  # noqa: ANN204 - iterates keys, like a dict
+        return iter(self.root)
+
+    def __len__(self) -> int:
+        return len(self.root)
 
 
 class WebToolsConfig(Base):
     """Web tools configuration."""
 
     proxy: str | None = None  # HTTP/SOCKS5 proxy URL, e.g. "http://127.0.0.1:7890" or "socks5://127.0.0.1:1080"
-    jina_api_key: str = ""  # Jina Reader API key
-    search: WebSearchConfig = Field(default_factory=WebSearchConfig)
+    jina_api_key: str = ""  # Jina Reader API key (optional; raises its rate limit)
+    # Brave Search API key (optional). With one, web_search queries Brave
+    # first (free tier: 2,000 queries a month); without one it queries
+    # DuckDuckGo, which needs no key. See ``agent.tools.web``.
+    brave_api_key: str = ""
 
 
 class ExecToolConfig(Base):
-    """Shell exec tool configuration."""
+    """Configuration for the shell tool (advertised to the model as ``bash``)."""
 
     timeout: int = 60
     path_append: str = ""
@@ -518,7 +598,7 @@ class ToolsConfig(Base):
     """Tool names to unregister after default-tool registration and MCP connect.
     Used by eval harnesses (e.g. BrowseComp-Plus) that need to constrain the
     agent to a specific tool subset. Names match those in ``ToolRegistry``
-    (e.g. ``read_file``, ``web_search``, or ``mcp_bcp-search_search``)."""
+    (e.g. ``read``, ``web_search``, or ``mcp_bcp-search_search``)."""
 
 
 class CliConfig(Base):
@@ -528,12 +608,27 @@ class CliConfig(Base):
     """Render a one-line tokens/cost summary after each successful CLI turn."""
 
 
+#: The shape of ``config.json``, as a number that goes up by one whenever a
+#: field is added, removed or renamed anywhere under :class:`Config`.
+#:
+#: It is what tells ``ddeharness onboard`` whether the configuration on disk is
+#: one this build understands. A release that does not touch the shape leaves
+#: it alone and the wizard reuses what is there; a release that does moves the
+#: old file aside and starts clean, which is the rule this program has always
+#: had -- nothing is migrated. ``tests/test_config_schema_version.py`` fails
+#: when the shape moves and this does not, so it cannot be forgotten.
+CONFIG_SCHEMA_VERSION = 1
+
+
 class Config(BaseSettings):
     """Root configuration for opendde_harness: the base agent blocks plus the
     feature blocks (:mod:`opendde_harness.config.features`), all parsed from
     the one ``config.json``."""
 
+    #: Which shape this file was written in; see :data:`CONFIG_SCHEMA_VERSION`.
+    schema_version: int = CONFIG_SCHEMA_VERSION
     agents: AgentsConfig = Field(default_factory=AgentsConfig)
+    tui: TuiConfig = Field(default_factory=TuiConfig)
     cli: CliConfig = Field(default_factory=CliConfig)
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
@@ -554,119 +649,90 @@ class Config(BaseSettings):
         """Get expanded workspace path."""
         return Path(self.agents.defaults.workspace).expanduser()
 
-    def _match_provider(self, model: str | None = None) -> tuple["ProviderConfig | None", str | None]:
-        """Match provider config and its registry name. Returns (config, spec_name)."""
-        from opendde_harness.providers.registry import (
-            PROVIDERS,
-            canonical_provider_name,
-            find_by_keywords,
-            find_by_name,
-            split_model_id,
+    @model_validator(mode="after")
+    def _default_model_names_a_provider(self) -> "Config":
+        """The default model's prefix names a provider that could serve it.
+
+        Configured, or one pi ships. Both count because an entry carrying
+        nothing is still a declaration -- pi reads the vendor's own environment
+        variable itself -- and because a fresh config names a built-in before
+        anyone has written a key. A prefix that is neither is a typo, and
+        saying so here is the difference between a named error and every
+        request failing on a provider that was never built.
+        """
+        if self.agents.defaults.model == "":
+            return self  # not chosen yet; the setup gate parks on it
+        provider = model_id.provider_of(self.agents.defaults.model)
+        if provider in self.providers or pi_ids.is_builtin(provider):
+            return self
+        raise ValueError(
+            f"agents.defaults.model names provider {provider!r}, which is neither a key of the "
+            f"providers section nor one of pi's built-in providers. Run `ddeharness onboard`, or "
+            f"declare providers.{provider} with its baseUrl and api."
         )
 
-        forced = self.agents.defaults.provider
-        if forced != "auto":
-            # Return the canonical name: callers look the spec up by it, and a
-            # config still naming the provider the old way would find nothing.
-            forced = canonical_provider_name(forced)
-            p = self.providers.get(forced)
-            return (p, forced) if p else (None, None)
+    def _match_provider(self, model: str | None = None) -> tuple["ProviderEntry | None", str | None]:
+        """The entry that serves ``model``, and the provider id it is filed under.
 
-        model_id = model or self.agents.defaults.model
-        prefix, _ = split_model_id(model_id)
+        The provider is part of the model's identity and the id's own prefix is
+        what names it. A bare id names nobody and gets ``(None, None)`` -- the
+        caller refuses it (see :meth:`explain_unrouted`) rather than guessing
+        from the spelling, which is how a request and a key went to a vendor the
+        user never chose for that model. A prefixed id naming an entry that is
+        not configured is the same answer: nothing else is offered in its place,
+        because a gateway that happens to hold a key is not the provider the id
+        names.
+        """
+        provider = model_id.provider_of(model or self.agents.defaults.model)
+        if not provider:
+            return None, None
+        entry = self.providers.get(provider)
+        return (entry, provider) if entry is not None else (None, None)
 
-        # `spec.claims` is the whole prefix-beats-keyword rule: a prefixed id is
-        # answered only by the provider it names (so `github-copilot/...codex`
-        # cannot match openai_codex, and no vendor's key is posted to another's
-        # endpoint), while a bare id falls to keywords in registry order.
-        for spec in PROVIDERS:
-            if not spec.claims(model_id):
-                continue
-            p = self.providers.get(spec.name)
-            if p and _has_credentials(p, spec):
-                return p, spec.name
+    def explain_unrouted(self, model: str | None = None) -> str:
+        """Why ``model`` has no provider, as the sentence to show the user.
 
-        # Explicit prefix naming a provider OpenDDE Harness has no spec for: LiteLLM knows
-        # the vendor, so credentials under that name are enough to reach it.
-        #
-        # Only where there is genuinely no spec. A provider that has one has
-        # already been offered above and turned down for want of credentials --
-        # letting it back in here on `api_key` alone reinstated exactly the
-        # material this rejected it for missing: Azure with a key and no address
-        # routed here, while display and startup both called it unconfigured.
-        if prefix and find_by_name(prefix) is None:
-            passthrough = self.providers.get(prefix)
-            if passthrough and _has_credentials(passthrough, None, prefix):
-                return passthrough, canonical_provider_name(prefix)
+        Only meaningful after :meth:`_match_provider` answered nothing. A bare
+        id is told how to name a provider; a prefixed one is told which entry it
+        names, so the credential report can be about that entry.
+        """
+        wanted = model or self.agents.defaults.model
+        provider, bare = model_id.split(wanted)
+        if provider:
+            return f"{wanted!r} names providers.{provider}, which is not configured"
+        return (
+            f"model {wanted!r} names no provider. Write it as <provider>/{bare} "
+            f"(for example openrouter/{bare}): ddeharness provider use <provider>/{bare}"
+        )
 
-        # Fallback: gateways first, then others (follows registry order).
-        # OAuth providers are NOT valid fallbacks -- they require explicit model
-        # selection.
-        #
-        # Once an id names a vendor -- by prefix, or by a keyword that only one
-        # vendor answers to -- reaching this point means that vendor has no
-        # credentials. Only a gateway or a local deployment may answer then,
-        # because they route whatever they are handed; a direct vendor would be
-        # receiving a competitor's model id along with its own key. Getting here
-        # having named nobody ("llama-3.3-70b") carries no such claim, so any
-        # credentialed provider is a legitimate guess.
-        names_a_vendor = bool(prefix) or find_by_keywords(model_id) is not None
-        for spec in PROVIDERS:
-            # A prefix is the user naming a provider. A local deployment is not
-            # that provider, so "anthropic/claude-sonnet-5" is a misroute rather
-            # than a fallback -- while a bare "qwen3-32b", which only matches a
-            # vendor keyword, is exactly what a local box is likely serving.
-            if spec.is_local and prefix:
-                continue
-            if names_a_vendor and not (spec.is_gateway or spec.is_local):
-                continue
-            if spec.is_oauth:
-                continue
-            # A gateway with no keywords answers to nothing on its own: it is
-            # reached by naming it, as a prefix or as agents.defaults.provider.
-            # Left in this loop it stood first in registry order and quietly
-            # took every model whose own vendor had no credentials, so the
-            # picker named one provider while the prompt and a different key
-            # went to an endpoint the user never chose for that model. The
-            # local deployments below are the same case: they route whatever
-            # they are handed, which is only a legitimate guess for an id that
-            # names nobody.
-            if spec.is_gateway and not spec.keywords:
-                continue
-            p = self.providers.get(spec.name)
-            if p and _has_credentials(p, spec):
-                return p, spec.name
-        return None, None
-
-    def get_provider(self, model: str | None = None) -> ProviderConfig | None:
-        """Get matched provider config (api_key, api_base, extra_headers). Falls back to first available."""
-        p, _ = self._match_provider(model)
-        return p
+    def get_provider(self, model: str | None = None) -> ProviderEntry | None:
+        """The providers entry that serves this model, or None."""
+        entry, _ = self._match_provider(model)
+        return entry
 
     def get_provider_name(self, model: str | None = None) -> str | None:
-        """Get the registry name of the matched provider (e.g. "deepseek", "openrouter")."""
-        _, name = self._match_provider(model)
-        return name
+        """The pi provider id serving this model (e.g. "deepseek", "openrouter")."""
+        _, provider = self._match_provider(model)
+        return provider
 
     def get_api_key(self, model: str | None = None) -> str | None:
-        """Get API key for the given model. Falls back to first available key."""
-        p = self.get_provider(model)
-        return p.effective_api_key if p else None
+        """The key configured for this model's provider, if the config holds one.
+
+        Empty for a provider reached by a sign-in or by the vendor's own
+        environment variable: pi resolves both itself, and neither is in
+        this file.
+        """
+        entry = self.get_provider(model)
+        return entry.api_key if entry else None
 
     def get_api_base(self, model: str | None = None) -> str | None:
-        """Get API base URL for the given model. Applies default URLs for gateway/local providers."""
-        from opendde_harness.providers.registry import find_by_name
+        """The address configured for this model's provider, if it declares one.
 
-        p, name = self._match_provider(model)
-        if p and p.api_base:
-            return p.api_base
-        # Only gateways get a default api_base here. Standard providers
-        # (like Moonshot) set their base URL via the spec's env_extras.
-        if name:
-            spec = find_by_name(name)
-            if spec and spec.usable_default_api_base:
-                return spec.usable_default_api_base
-        return None
+        None for a built-in: pi carries its address, and inventing one here
+        would be this project holding a second copy of a fact pi already has.
+        """
+        entry = self.get_provider(model)
+        return (entry.base_url or None) if entry else None
 
     # The file spells the feature blocks camelCase (``skillForge``); both
     # spellings load, and dumps use the camelCase alias like every nested block.

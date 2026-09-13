@@ -25,8 +25,8 @@ from opendde_harness.plugin.protein_design.tools.agent import (
     ProteinDesignToolRegistry,
     ToolContext,
 )
+from opendde_harness.providers import messages as msg
 from opendde_harness.providers.base import LLMProvider
-from opendde_harness.utils.helpers import build_assistant_message
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -34,21 +34,26 @@ T = TypeVar("T", bound=BaseModel)
 def _assistant_message(response: Any, content: Any, tool_calls: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """One assistant turn, carrying whatever the model signed.
 
-    A thinking model wants its own reasoning back: DeepSeek rejects the whole
+    The model layer's own message when there is one: it replays verbatim, which
+    is how thinking signatures and native tool-call ids survive the turn. A
+    thinking model wants its own reasoning back -- DeepSeek rejects the whole
     request without it ("the reasoning_content in the thinking mode must be
     passed back"), which failed the analyze agent on its first tool call and
     took the design task down before cycle 0.
     """
-    return build_assistant_message(
+    stored = getattr(response, "pi_message", None)
+    if isinstance(stored, dict):
+        return dict(stored)
+    return msg.assistant_message(
         content,
-        tool_calls,
-        getattr(response, "reasoning_content", None),
-        getattr(response, "thinking_blocks", None),
+        tool_calls=tool_calls,
+        reasoning_content=getattr(response, "reasoning_content", None),
+        thinking_blocks=getattr(response, "thinking_blocks", None),
     )
 
 
 _MAX_TRUNCATION_RETRIES = 2
-_MAX_OUTPUT_TOKENS = 16384
+_MAX_OUTPUT_TOKENS = 32768
 
 _USE_SKILL_TOOL = {
     "type": "function",
@@ -85,14 +90,12 @@ class OpenDDEHarnessStructuredSession:
         *,
         tool_registry: ProteinDesignToolRegistry | None = None,
         max_attempts: int = 3,
-        temperature: float = 0.2,
         progress_sink=None,
     ) -> None:
         self._provider = provider
         self._model = model
         self._tool_registry = tool_registry or ProteinDesignToolRegistry()
         self._max_attempts = max_attempts
-        self._temperature = temperature
         self._progress_sink = progress_sink
 
     async def close(self) -> None:
@@ -105,13 +108,9 @@ class OpenDDEHarnessStructuredSession:
             if inspect.isawaitable(result):
                 await result
             return
-        from opendde_harness.providers.litellm_setup import import_litellm
-
-        close_clients = getattr(import_litellm(), "close_litellm_async_clients", None)
-        if callable(close_clients):
-            result = close_clients()
-            if inspect.isawaitable(result):
-                await result
+        # Nothing else to close. Every provider this project builds owns its own
+        # client and closes it above; the fallback here shut down a shared pool
+        # that a retired driver kept process-wide, and there is no such pool now.
 
     async def run(
         self,
@@ -161,8 +160,8 @@ class OpenDDEHarnessStructuredSession:
     ) -> T:
         schema = profile.output_schema
         messages: list[dict] = [
-            {"role": "system", "content": self._system_message(profile, skills)},
-            {"role": "user", "content": prompt},
+            msg.system_message(self._system_message(profile, skills)),
+            msg.user_message(prompt),
         ]
         skill_by_name = {skill.name: skill for skill in skills}
         definitions = self._definitions(profile, bool(skill_by_name))
@@ -185,17 +184,17 @@ class OpenDDEHarnessStructuredSession:
             # ``chat()`` directly here used the structured-output repair budget
             # for transient wire errors and let a short 503 outage kill the
             # complete design task before cycle 0.
+            #
+            # No temperature. A sampling temperature is a property of the
+            # model's row in the config, which the provider reads for itself;
+            # one passed from here went to whatever model the task is running
+            # on, and a Codex model refuses the whole turn over the parameter
+            # ("Unsupported parameter: temperature").
             response = await self._provider.chat_with_retry(
                 messages=messages,
                 tools=definitions or None,
                 model=str(tool_context.metadata.get("llm_model") or self._model),
                 max_tokens=max_tokens,
-                temperature=float(
-                    tool_context.metadata.get(
-                        "llm_temperature",
-                        profile.temperature,
-                    )
-                ),
             )
             content = response.content or ""
             truncated = response.finish_reason == "length" or getattr(response, "truncated", False)
@@ -237,7 +236,7 @@ class OpenDDEHarnessStructuredSession:
                     _assistant_message(
                         response,
                         response.content,
-                        [call.to_openai_tool_call() for call in response.tool_calls],
+                        [call.to_pi_tool_call() for call in response.tool_calls],
                     )
                 )
                 for call in response.tool_calls:
@@ -343,12 +342,11 @@ class OpenDDEHarnessStructuredSession:
                                 error=str(exc),
                             )
                     messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": call.id,
-                            "name": call.name,
-                            "content": json.dumps(result, ensure_ascii=False, default=str),
-                        }
+                        msg.tool_result_message(
+                            call.id,
+                            call.name,
+                            json.dumps(result, ensure_ascii=False, default=str),
+                        )
                     )
                 if tool_turns >= profile.max_tool_turns:
                     definitions = [_USE_SKILL_TOOL] if skill_by_name else []
@@ -382,13 +380,10 @@ class OpenDDEHarnessStructuredSession:
                         messages.extend(
                             [
                                 _assistant_message(response, content),
-                                {
-                                    "role": "user",
-                                    "content": (
-                                        f"{last_error}. Call use_skill with an exact available "
-                                        "skill id before returning the final JSON."
-                                    ),
-                                },
+                                msg.user_message(
+                                    f"{last_error}. Call use_skill with an exact available "
+                                    "skill id before returning the final JSON."
+                                ),
                             ]
                         )
                         continue
@@ -401,10 +396,7 @@ class OpenDDEHarnessStructuredSession:
                     messages.extend(
                         [
                             _assistant_message(response, content),
-                            {
-                                "role": "user",
-                                "content": f"The output was invalid: {last_error}. Return corrected JSON only.",
-                            },
+                            msg.user_message(f"The output was invalid: {last_error}. Return corrected JSON only."),
                         ]
                     )
         raise ValueError(f"{profile.role} produced no valid {schema.__name__}: {last_error}")

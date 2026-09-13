@@ -1,7 +1,5 @@
 """Utility functions for opendde_harness."""
 
-import base64
-import binascii
 import hashlib
 import json
 import math
@@ -10,10 +8,12 @@ import threading
 from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Literal, TypedDict
+from typing import Any
 
 import tiktoken
 from loguru import logger
+
+from opendde_harness.providers import messages as msg
 
 # Workspace sync runs before the CLI decides logger.enable/disable("opendde_harness"),
 # so an unscoped debug in this module would spam stderr through loguru's
@@ -38,69 +38,6 @@ def detect_image_mime(data: bytes) -> str | None:
     return None
 
 
-class ImageURL(TypedDict):
-    url: str
-
-
-class ImagePart(TypedDict):
-    """An OpenAI-shaped image content part."""
-
-    type: Literal["image_url"]
-    image_url: ImageURL
-
-
-class TextPart(TypedDict):
-    """A text content part."""
-
-    type: Literal["text"]
-    text: str
-
-
-# What OpenDDE Harness *produces*. Deliberately not used to type what OpenDDE Harness *reads*:
-# inbound content legitimately contains parts this union does not model (an
-# Anthropic part carrying cache_control, an MCP audio block, a provider-specific
-# extension), and the pass-through code that forwards them unchanged would
-# otherwise become a type error for doing the right thing. So read-side helpers
-# keep taking ``Any`` and check shape at runtime.
-ContentPart = TextPart | ImagePart
-
-
-def image_block(data_uri: str) -> ImagePart:
-    """The single place the image content-part shape is written.
-
-    CI runs no type checker, so this annotation does not gate a merge -- but an
-    editor language server does flag a mistyped key against a TypedDict, and the
-    signature documents the shape that ``dict[str, Any]`` could not. Combined
-    with being the only constructor, a wrong key ("imageURL") stops being a
-    silent dropped picture in five places and becomes one line with a test.
-    """
-    return {"type": "image_url", "image_url": {"url": data_uri}}
-
-
-def text_block(text: str) -> TextPart:
-    """Counterpart to :func:`image_block` for the text half of a block list."""
-    return {"type": "text", "text": text}
-
-
-def is_image_part(part: Any) -> bool:
-    """True for any image content part, inline or remote."""
-    return isinstance(part, dict) and part.get("type") == "image_url"
-
-
-def is_inline_image(part: Any) -> bool:
-    """True for a content part carrying inline base64 image bytes.
-
-    The distinction matters wherever the *payload size* is the concern -- token
-    accounting, persistence, emergency shrinking. A remote URL is a reference and
-    costs nothing to keep.
-    """
-    if not is_image_part(part):
-        return False
-    url = part.get("image_url") or {}
-    url = url.get("url", "") if isinstance(url, dict) else ""
-    return isinstance(url, str) and url.startswith("data:image/")
-
-
 # Vision models bill images by patch area, not by the size of the transport
 # encoding. Counting a data URI as text charges ~350x the real cost (a 1000x1000
 # JPEG is ~1.3k image tokens but ~460k base64 characters), which starves the
@@ -108,7 +45,6 @@ def is_inline_image(part: Any) -> bool:
 # fit comfortably.
 _IMAGE_PATCH_PX = 28
 _IMAGE_TOKEN_CAP = 1568
-_IMAGE_HEADER_BYTES = 4096
 
 
 def _image_pixel_size(data: bytes) -> tuple[int, int] | None:
@@ -174,18 +110,16 @@ def estimate_image_tokens(width: int, height: int, cap: int = _IMAGE_TOKEN_CAP) 
 
 
 def estimate_content_part_tokens(part: Any) -> int | None:
-    """Token estimate for a non-text multimodal content part, or None when the
-    part carries no image and should fall through to text accounting."""
-    if not is_image_part(part):
+    """Token estimate for an image content block, or None for anything else.
+
+    A block whose header does not parse is charged the ceiling: over-estimating
+    is the safe direction for a budget guard, and under-estimating overflows the
+    context.
+    """
+    if not msg.is_image(part):
         return None
-    if not is_inline_image(part):
-        # A remote URL costs the model an image either way, but its dimensions
-        # are unknowable without fetching it. Charge the ceiling.
-        return _IMAGE_TOKEN_CAP
-    _, _, payload = part["image_url"]["url"].partition(",")
-    try:
-        head = base64.b64decode(payload[:_IMAGE_HEADER_BYTES], validate=False)
-    except (binascii.Error, ValueError):
+    head = msg.image_payload(part)
+    if head is None:
         return _IMAGE_TOKEN_CAP
     size = _image_pixel_size(head)
     return estimate_image_tokens(*size) if size else _IMAGE_TOKEN_CAP
@@ -242,23 +176,6 @@ def split_message(content: str, max_len: int = 2000) -> list[str]:
     return chunks
 
 
-def build_assistant_message(
-    content: str | None,
-    tool_calls: list[dict[str, Any]] | None = None,
-    reasoning_content: str | None = None,
-    thinking_blocks: list[dict] | None = None,
-) -> dict[str, Any]:
-    """Build a provider-safe assistant message with optional reasoning fields."""
-    msg: dict[str, Any] = {"role": "assistant", "content": content}
-    if tool_calls:
-        msg["tool_calls"] = tool_calls
-    if reasoning_content is not None:
-        msg["reasoning_content"] = reasoning_content
-    if thinking_blocks:
-        msg["thinking_blocks"] = thinking_blocks
-    return msg
-
-
 # Token counts keyed by a digest of the text they were counted on. A session's
 # messages are re-estimated on every turn -- the manifest, the budget, and each
 # iteration of the trim loop all ask again -- and encoding is the cost: one
@@ -270,7 +187,7 @@ def build_assistant_message(
 # stale hit. Bounded, so a long session cannot grow it without limit.
 _TOKEN_COUNT_CACHE: OrderedDict[bytes, int] = OrderedDict()
 _TOKEN_COUNT_CACHE_MAX = 16384
-# The curator counts in worker threads while the loop counts on its own; a
+# History selection counts in a worker thread while the loop counts on its own; a
 # lookup racing an eviction raised KeyError out of move_to_end.
 _TOKEN_COUNT_LOCK = threading.Lock()
 
@@ -286,7 +203,7 @@ def count_text_tokens(payload: str) -> int:
             _TOKEN_COUNT_CACHE.move_to_end(key)
             return cached
     try:
-        count = len(tiktoken.get_encoding("cl100k_base").encode(payload))
+        count = len(_encode(payload))
     except Exception:
         count = len(payload) // 4
     with _TOKEN_COUNT_LOCK:
@@ -294,6 +211,94 @@ def count_text_tokens(payload: str) -> int:
         if len(_TOKEN_COUNT_CACHE) > _TOKEN_COUNT_CACHE_MAX:
             _TOKEN_COUNT_CACHE.popitem(last=False)
     return count
+
+
+def tokenizer_is_loaded() -> bool:
+    """Whether counting is a local operation in this process, right now.
+
+    tiktoken fetches its vocabulary over the network the first time it is asked
+    for one, and a fresh install has no cache to read. Inside a turn that costs
+    nothing anybody notices -- the turn is a network call already -- but a path
+    that must answer offline cannot reach for the internet to do it: measured
+    with an empty cache, the first count opened a connection and only then fell
+    back to characters over four.
+
+    Callers that must not fetch ask this first and use the character rule
+    otherwise, which is the same answer ``count_text_tokens`` gives when the
+    tokenizer is away. False on any version of tiktoken that keeps its built
+    encodings somewhere else, which costs an estimate its precision and never
+    its correctness.
+    """
+    try:
+        return "cl100k_base" in tiktoken.registry.ENCODINGS
+    except Exception:
+        return False
+
+
+def _encode(payload: str) -> list[int]:
+    """``payload`` as tokens, with every special-token spelling read as text.
+
+    tiktoken refuses ``<|endoftext|>`` in user text by default, and the refusal
+    is an exception, not a count: every caller fell through to its own rough
+    fallback the moment a user pasted those eleven characters. Nothing here
+    ever sends a control token, so the spelling is just text.
+    """
+    return tiktoken.get_encoding("cl100k_base").encode(payload, disallowed_special=())
+
+
+def take_tokens(payload: str, limit: int) -> tuple[str, int]:
+    """The longest prefix of ``payload`` within ``limit`` tokens, and its cost.
+
+    A prefix of the source, always. Cutting at ``limit * 4`` characters is not
+    a token limit -- dense text, CJK above all, stays several times over the
+    budget it was supposedly cut to -- and cutting at a token boundary is not a
+    character boundary: decoding across one puts a U+FFFD where the user's last
+    character was, which is text they never wrote, stored in their session.
+    The incomplete bytes are dropped instead, and the result is recounted,
+    because a cut string need not re-encode to what its tokens cost inside the
+    whole.
+
+    The cost comes back with the text because a caller spending one shared
+    allowance cannot work it out afterwards: counting the returned prefix asks
+    the same estimator that answers characters-over-four when the tokenizer is
+    away, which is not what the cut was measured in. Fifteen parts that each
+    "fit" that way totalled 67,000 tokens of a 20,000 budget.
+    """
+    if limit <= 0 or not payload:
+        return "", 0
+    try:
+        encoding = tiktoken.get_encoding("cl100k_base")
+        tokens = _encode(payload)
+        if len(tokens) <= limit:
+            return payload, len(tokens)
+        text = _utf8_prefix(encoding.decode_bytes(tokens[:limit]))
+        if text:
+            exact = len(_encode(text))
+            if exact <= limit:
+                return text, exact
+    except Exception:
+        pass
+    # One byte is at most one token, so a byte budget is a token budget nothing
+    # can exceed -- the conservative answer when the tokenizer is unavailable,
+    # or when its slice re-encodes over the allowance. Charged in bytes for the
+    # same reason it was cut in bytes.
+    text = _utf8_prefix(payload.encode("utf-8")[:limit])
+    return text, len(text.encode("utf-8"))
+
+
+def truncate_to_tokens(payload: str, limit: int) -> str:
+    """The longest prefix of ``payload`` that costs at most ``limit`` tokens."""
+    return take_tokens(payload, limit)[0]
+
+
+def _utf8_prefix(raw: bytes) -> str:
+    """``raw`` decoded, less any character its last bytes only start.
+
+    The bytes are a prefix of a valid UTF-8 string, so the only sequence that
+    can be incomplete is the final one; dropping it leaves a prefix of the
+    source rather than a replacement character.
+    """
+    return raw.decode("utf-8", "ignore")
 
 
 def estimate_prompt_tokens(
@@ -315,38 +320,46 @@ def estimate_prompt_tokens(
 
 
 def estimate_message_tokens(message: dict[str, Any]) -> int:
-    """Estimate prompt tokens contributed by one persisted message."""
+    """Estimate prompt tokens contributed by one message.
+
+    Text counts as text; an image by its patch area; a tool call by its name
+    and its arguments, which is what the request spells out. Replayed thinking
+    counts as the text the model wrote, once -- never its signature, an opaque
+    blob many times the size of the reasoning it encodes and not billed as
+    prompt text: measured on the Codex login, counting it made a 31k-token
+    prompt read as 161k, and the fitter that trusted the number elided the
+    history.
+    """
     content = message.get("content")
     parts: list[str] = []
     extra_tokens = 0
     if isinstance(content, str):
         parts.append(content)
     elif isinstance(content, list):
-        for part in content:
-            if isinstance(part, dict) and part.get("type") == "text":
-                text = part.get("text", "")
-                if text:
-                    parts.append(text)
-            elif (image_tokens := estimate_content_part_tokens(part)) is not None:
+        for block in content:
+            kind = block.get("type") if isinstance(block, dict) else None
+            if kind == msg.TEXT:
+                parts.append(str(block.get("text") or ""))
+            elif kind == msg.THINKING:
+                parts.append(str(block.get("thinking") or ""))
+            elif kind == msg.TOOL_CALL:
+                parts.append(str(block.get("name") or ""))
+                parts.append(json.dumps(block.get("arguments") or {}, ensure_ascii=False))
+            elif (image_tokens := estimate_content_part_tokens(block)) is not None:
                 extra_tokens += image_tokens
             else:
-                parts.append(json.dumps(part, ensure_ascii=False))
+                parts.append(json.dumps(block, ensure_ascii=False))
     elif content is not None:
         parts.append(json.dumps(content, ensure_ascii=False))
 
-    for key in ("name", "tool_call_id"):
+    # The pairing a tool result carries, which the request spells out beside
+    # its body.
+    for key in ("toolName", "toolCallId"):
         value = message.get(key)
         if isinstance(value, str) and value:
             parts.append(value)
-    if message.get("tool_calls"):
-        parts.append(json.dumps(message["tool_calls"], ensure_ascii=False))
-    reasoning = message.get("reasoning_content")
-    if isinstance(reasoning, str) and reasoning:
-        parts.append(reasoning)
-    if message.get("thinking_blocks"):
-        parts.append(json.dumps(message["thinking_blocks"], ensure_ascii=False))
 
-    payload = "\n".join(parts)
+    payload = "\n".join(part for part in parts if part)
     if not payload:
         return max(1, extra_tokens)
     return max(1, count_text_tokens(payload) + extra_tokens)

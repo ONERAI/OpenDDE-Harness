@@ -58,8 +58,13 @@ async def _watch_control(
         await asyncio.sleep(1.0)
 
 
+def design_model(workflow: WorkflowConfig, default_model: str) -> str:
+    """The model this task's design calls run on: the YAML's ``llm.model_name`` when set, else ``default_model``."""
+    return str(workflow.llm_model or default_model)
+
+
 async def run_task(task_id: str, task_root: Path) -> TaskSnapshot:
-    from opendde_harness.cli._helpers import load_runtime_config, make_lazy_provider
+    from opendde_harness.cli._helpers import load_runtime_config, make_provider
     from opendde_harness.cli._plugin_stack import build_plugin_registry, maybe_build_memory_backend
     from opendde_harness.config.opendde_harness import load_opendde_harness_config
 
@@ -77,7 +82,12 @@ async def run_task(task_id: str, task_root: Path) -> TaskSnapshot:
             "compute_worker_id": selection.worker.worker_id,
         }
     )
-    provider = make_lazy_provider(runtime_config)
+    # The design model is the task's own when its YAML names one, else the
+    # install's default. Routing follows ``agents.defaults.model`` when the
+    # provider is built, so the choice has to land there rather than travel as
+    # a per-call ``model=`` the bound route would ignore.
+    runtime_config.agents.defaults.model = design_model(workflow, str(runtime_config.agents.defaults.model))
+    provider = make_provider(runtime_config)
     registry = build_plugin_registry(opendde_harness_config)
     backend = maybe_build_memory_backend(
         runtime_config.workspace_path,

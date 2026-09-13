@@ -488,6 +488,11 @@ class SkillRegistry:
 # ----------------------------------------------------------------------
 
 
+#: YAML block-scalar indicators. ``description: |`` is how most shipped
+#: SKILL.md files write a description that runs past one line.
+_BLOCK_SCALARS = ("|", "|-", "|+", ">", ">-", ">+")
+
+
 def _parse_frontmatter(content: str) -> dict | None:
     """Minimal YAML-lite parser — matches legacy SkillsLoader behavior.
 
@@ -496,10 +501,18 @@ def _parse_frontmatter(content: str) -> dict | None:
         ---
         name: foo
         description: "bar"
+        summary: |
+          a value that runs
+          past one line
         metadata: '{"opendde_harness": {...}}'
         ---
 
     Values are stripped of surrounding quotes; nested keys are not supported.
+    A block scalar (``|`` / ``>`` and their chomping variants) is folded into
+    one space-joined line: every consumer here wants a single line, and the
+    alternative — what this parser used to do — was to store the indicator
+    itself, which put a literal ``|`` in the skill catalogue in place of the
+    description the author wrote.
     Returns ``None`` when no frontmatter is present.
     """
     if not content.startswith("---"):
@@ -508,10 +521,22 @@ def _parse_frontmatter(content: str) -> dict | None:
     if not m:
         return None
     metadata: dict = {}
-    for line in m.group(1).split("\n"):
-        if ":" in line:
-            key, value = line.split(":", 1)
-            metadata[key.strip()] = value.strip().strip("\"'")
+    lines = m.group(1).split("\n")
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        i += 1
+        if ":" not in line or line.startswith((" ", "\t")):
+            continue
+        key, value = line.split(":", 1)
+        value = value.strip()
+        if value in _BLOCK_SCALARS:
+            block: list[str] = []
+            while i < len(lines) and (not lines[i].strip() or lines[i].startswith((" ", "\t"))):
+                block.append(lines[i].strip())
+                i += 1
+            value = " ".join(part for part in block if part)
+        metadata[key.strip()] = value.strip("\"'")
     return metadata
 
 

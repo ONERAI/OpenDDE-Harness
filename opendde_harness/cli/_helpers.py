@@ -19,6 +19,7 @@ import typer
 from rich.console import Console
 
 from opendde_harness.config.schema import Config
+from opendde_harness.providers import messages as pi_messages
 
 console = Console()
 
@@ -29,7 +30,7 @@ DEFAULT_PROBE_MESSAGE = "Hi! Say hello in one sentence."
 def check_provider_credentials(config: Config) -> None:
     """Fail-fast when the configured provider is missing required credentials.
 
-    Cheap (no litellm import), so it can run at startup even when the real
+    Cheap (nothing is constructed), so it can run at startup even when the real
     provider is built lazily.
 
     Raises ``MissingCredentialsError`` rather than printing and exiting: three entry
@@ -39,29 +40,20 @@ def check_provider_credentials(config: Config) -> None:
 
     What counts as configured is `providers.auth`, the same declaration routing
     and `provider list` consult. Deciding it here as well is what produced three
-    verdicts on one config: a Gemini section holding only `api_key_list` read as
-    configured in `provider list` and refused to start, and Azure with a key and
-    no address was routed and displayed as configured yet rejected here.
+    verdicts on one config: Azure with a key and no address was routed and
+    displayed as configured yet rejected here.
     """
+    from opendde_harness.providers import model_id
     from opendde_harness.providers.auth import MissingCredentialsError, credential_status
-    from opendde_harness.providers.registry import find_by_model, split_model_id
 
     model = config.agents.defaults.model
-    provider_name = config.get_provider_name(model)
-    if not provider_name:
-        # Routing found no configured section, so name the provider the model id
-        # points at rather than reporting on nothing.
-        spec = find_by_model(model)
-        provider_name = spec.name if spec else split_model_id(model)[0]
+    # The id's own prefix names the provider whether or not it is configured,
+    # so the report is about the provider the user named rather than nothing.
+    provider_name = model_id.provider_of(model)
     if not provider_name:
         raise MissingCredentialsError(
-            "no provider configured",
-            # A command, not a config path: the old text pointed at
-            # ~/.opendde_harness/config.json, the layout the CLI exists to hide.
-            remedy=(
-                "Run: ddeharness provider set <name> --api-key <key>, then ddeharness provider use <name>/<model>\n"
-                "Or run `ddeharness onboard` for guided setup."
-            ),
+            config.explain_unrouted(model),
+            remedy="Or run `ddeharness onboard` for guided setup.",
         )
 
     status = credential_status(provider_name, config.providers.get(provider_name), include_external=True)
@@ -75,15 +67,9 @@ def check_provider_credentials(config: Config) -> None:
     # so answer the wizard instead. Both halves are required -- a user who picked
     # this model, or who has some other provider working, gets the specific
     # verdict, which for the OAuth families names a sign-in rather than a key.
-    # Names come from the declared fields *and* the extras: an undeclared
-    # provider key is a supported shape, and `ProvidersConfig.get` is the only
-    # place allowed to resolve either kind, so route both through it rather than
-    # reading `__dict__` -- which sees no extras and would call a user whose one
-    # working credential lives there unconfigured.
     chose_a_model = config.agents.defaults.model != type(config.agents.defaults)().model
-    configured = (*config.providers.__dict__, *(config.providers.model_extra or {}))
     if not chose_a_model and not any(
-        credential_status(name, config.providers.get(name), include_external=True).ok for name in configured
+        credential_status(name, entry, include_external=True).ok for name, entry in config.providers.items()
     ):
         raise MissingCredentialsError(
             "no provider is configured yet -- run `ddeharness onboard` for guided setup",
@@ -98,151 +84,55 @@ def check_provider_credentials(config: Config) -> None:
 
 
 def make_provider(config: Config):
-    """Create the appropriate LLM provider from config."""
-    from opendde_harness.providers.auth import MissingCredentialsError
-    from opendde_harness.providers.azure_openai_provider import AzureOpenAIProvider
-    from opendde_harness.providers.base import GenerationSettings
-    from opendde_harness.providers.openai_codex_provider import OpenAICodexProvider
+    """The provider for the configured default model.
 
-    check_provider_credentials(config)
+    One model layer: pi-ai in the Node model service, for every model and every
+    provider. What an entry declares -- its address, its key or its sign-in, the
+    protocol named by its ``api`` -- decides which pi adapter serves it, and
+    there is nothing here to choose between.
+
+    Constructing one is a constructor call: the service is started on the first
+    request, not here, so this is cheap enough to run at startup.
+    """
+    from opendde_harness.providers import model_id, pi_ids
+    from opendde_harness.providers.base import GenerationSettings
+    from opendde_harness.providers.pi_provider import build_pi_provider
 
     model = config.agents.defaults.model
-    provider_name = config.get_provider_name(model)
-    p = config.get_provider(model)
-
-    from opendde_harness.providers.registry import default_wire, endpoints_unsupported_reason, find_by_name
-
-    spec = find_by_name(provider_name) if provider_name else None
-    client = spec.client if spec else ""
-    wire = (p.wire if p else None) or default_wire(provider_name)
-    model_overlays = config.providers.model_overlays()
-
-    if p and p.endpoints:
-        reason = endpoints_unsupported_reason(provider_name)
-        if reason:
-            raise MissingCredentialsError(reason, provider=provider_name or "")
-
-    if client == "codex":
-        provider = OpenAICodexProvider(default_model=model, model_overlays=model_overlays)
-    elif client == "minimax_oauth":
-        from opendde_harness.providers.minimax_oauth_provider import MiniMaxOAuthProvider
-
-        provider = MiniMaxOAuthProvider(
-            region="global" if provider_name == "minimax_global" else "cn",
-            default_model=model,
-        )
-    elif client == "azure":
-        provider = AzureOpenAIProvider(
-            api_key=p.effective_api_key,
-            api_base=p.api_base,
-            default_model=model,
-            deployment=getattr(p, "deployment", "") or "",
-            api_version=getattr(p, "api_version", "") or "2024-10-21",
-        )
-    else:
-        from opendde_harness.providers.capabilities import wire_overrides
-        from opendde_harness.providers.endpoints import provider_endpoints
-        from opendde_harness.providers.litellm_provider import LiteLLMProvider
-
-        eps = provider_endpoints(p) if p else []
-        if len(eps) > 1:
-            from opendde_harness.providers.endpoint_rotor import EndpointRotorProvider
-
-            def make_inner(ep):
-                return LiteLLMProvider(
-                    api_key=ep.api_key,
-                    # ``ep.api_base`` already carries the section's flat address
-                    # when the endpoint named none of its own (see
-                    # ``provider_endpoints``); the fallback here is only for a
-                    # gateway/local provider whose *flat* address is also empty,
-                    # where ``get_api_base`` still has the spec's default to
-                    # offer.
-                    api_base=ep.api_base or config.get_api_base(model),
-                    default_model=model,
-                    extra_headers=ep.extra_headers,
-                    provider_name=provider_name,
-                    wire=wire,
-                    model_overlays=model_overlays,
-                    extra_body=wire_overrides(provider_name, model) or None,
-                    model_overrides=config.agents.defaults.model_overrides,
-                )
-
-            provider = EndpointRotorProvider(
-                eps,
-                make_inner,
-                default_model=model,
-                strategy=p.endpoint_strategy if p else "sticky",
-            )
-        elif eps:
-            extra_body = wire_overrides(provider_name, model) or None
-            provider = LiteLLMProvider(
-                api_key=eps[0].api_key,
-                # Same fallback as ``make_inner`` above: only reached when the
-                # flat address is empty too, for a gateway/local provider's
-                # spec default.
-                api_base=eps[0].api_base or config.get_api_base(model),
-                default_model=model,
-                extra_headers=eps[0].extra_headers,
-                provider_name=provider_name,
-                wire=wire,
-                model_overlays=model_overlays,
-                extra_body=extra_body,
-                model_overrides=config.agents.defaults.model_overrides,
-            )
-        else:
-            extra_body = wire_overrides(provider_name, model) or None
-            provider = LiteLLMProvider(
-                api_key=p.effective_api_key if p else None,
-                api_base=config.get_api_base(model),
-                default_model=model,
-                extra_headers=p.extra_headers if p else None,
-                provider_name=provider_name,
-                wire=wire,
-                model_overlays=model_overlays,
-                extra_body=extra_body,
-                model_overrides=config.agents.defaults.model_overrides,
-            )
-
-    defaults = config.agents.defaults
-    provider.generation = GenerationSettings(
-        temperature=defaults.temperature,
-        reasoning_effort=defaults.reasoning_effort,
-        timeout=defaults.llm_call_timeout,
-        first_token_timeout=defaults.llm_first_token_timeout,
-        idle_timeout=defaults.llm_idle_timeout,
-    )
-    return provider
-
-
-def make_lazy_provider(config: Config):
-    """Provider that defers the real (litellm-importing) build to the first model
-    call, so AgentLoop construction stays fast. Credentials are checked now
-    (fail-fast preserved) and the real provider is pre-warmed in the background."""
-    from opendde_harness.providers.base import GenerationSettings
-    from opendde_harness.providers.endpoints import provider_endpoints
-    from opendde_harness.providers.lazy import LazyProvider
+    provider_name = model_id.provider_of(model)
+    # First, before the credential gate and before any driver is constructed:
+    # the answer for a removed provider is the removal, not a missing key.
+    pi_ids.refuse_removed(provider_name)
 
     check_provider_credentials(config)
+
+    provider = build_pi_provider(config, model, provider_name or "")
     defaults = config.agents.defaults
-
-    p = config.get_provider(defaults.model)
-    eps = provider_endpoints(p) if p else []
-    initial_endpoint_label = eps[0].label if len(eps) > 1 else None
-
-    provider = LazyProvider(
-        factory=lambda: make_provider(config),
-        default_model=defaults.model,
-        generation=GenerationSettings(
-            temperature=defaults.temperature,
-            reasoning_effort=defaults.reasoning_effort,
-            timeout=defaults.llm_call_timeout,
-            first_token_timeout=defaults.llm_first_token_timeout,
-            idle_timeout=defaults.llm_idle_timeout,
-        ),
-        initial_endpoint_label=initial_endpoint_label,
+    provider.generation = GenerationSettings(
+        reasoning_effort=defaults.reasoning_effort,
+        first_token_timeout=defaults.llm_first_token_timeout,
+        idle_timeout=defaults.llm_idle_timeout,
+        retries=defaults.llm_retries,
     )
-    provider.prewarm()
     return provider
+
+
+def declared_compaction_provider(config: Config) -> str:
+    """What the provider ``make_provider`` would build writes into a marker.
+
+    Named from the configuration alone, so the question can be answered before
+    anything is built: the history selector asks it while budgeting the first
+    prompt, and both a wrong yes and a wrong no cost the whole history. Empty
+    for every backend that compacts nothing, which is all but the Codex login.
+
+    The default model is the only one this answers for, and the only one it has
+    to: a session on any other model is bound through ``ProviderPool``, which
+    builds eagerly.
+    """
+    from opendde_harness.providers import model_id
+    from opendde_harness.providers.pi_provider import pi_compaction_provider
+
+    return pi_compaction_provider(model_id.provider_of(config.agents.defaults.model))
 
 
 def send_probe(
@@ -269,13 +159,28 @@ def send_probe(
     config = load_config()
     provider = make_provider(config)
 
+    # A probe proves the provider answers. It is not the place to exercise
+    # thinking, and asking for it here made the check impossible on a model
+    # whose thinking has a floor: a budget profile needs at least 1024 tokens
+    # and this cap is 200, so the adapter refused before any request was built
+    # and the wizard reported a working provider as broken. ``off`` explicitly
+    # -- stated rather than left to the model's own default, which an overlay
+    # may have set to medium -- and the cap stays small.
+    #
+    # No temperature either, for the same reason one turn away: a number pinned
+    # here would go out to whatever model is configured, and a model that does
+    # not take the parameter would refuse the probe over it. Whatever the
+    # model's own row asks for is what it gets.
+    from opendde_harness.providers.pi_service import run_then_shutdown
+
     start = time.monotonic()
-    response = asyncio.run(
+    # The service is ended on the loop that owns its pipes; see run_then_shutdown.
+    response = run_then_shutdown(
         asyncio.wait_for(
             provider.chat_with_retry(
-                messages=[{"role": "user", "content": message}],
+                messages=[pi_messages.user_message(message)],
                 max_tokens=max_tokens,
-                temperature=0.3,
+                reasoning_effort="off",
             ),
             timeout=timeout_s,
         )

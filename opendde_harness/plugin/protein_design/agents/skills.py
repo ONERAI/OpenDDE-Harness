@@ -18,6 +18,9 @@ BUILTIN_PROTEIN_DESIGN_SKILLS = (
     "structure-analysis",
     "developability-filter",
     "post-filter",
+    "pdb-lookup",
+    "uniprot-lookup",
+    "pubmed-lookup",
 )
 
 _REQUIRED_FILES: dict[str, tuple[str, ...]] = {
@@ -30,6 +33,9 @@ _REQUIRED_FILES: dict[str, tuple[str, ...]] = {
     "structure-analysis": ("SKILL.md",),
     "developability-filter": ("SKILL.md",),
     "post-filter": ("SKILL.md",),
+    "pdb-lookup": ("SKILL.md",),
+    "uniprot-lookup": ("SKILL.md",),
+    "pubmed-lookup": ("SKILL.md",),
 }
 
 

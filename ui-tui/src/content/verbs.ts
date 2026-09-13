@@ -1,23 +1,10 @@
-export const TOOL_VERBS: Record<string, string> = {
-  browser: 'browsing',
-  clarify: 'asking',
-  create_file: 'creating',
-  delegate_task: 'delegating',
-  delete_file: 'deleting',
-  execute_code: 'executing',
-  image_generate: 'generating',
-  list_files: 'listing',
-  memory: 'remembering',
-  patch: 'patching',
-  read_file: 'reading',
-  run_command: 'running',
-  search_code: 'searching',
-  search_files: 'searching',
-  terminal: 'terminal',
-  web_extract: 'extracting',
-  web_search: 'searching',
-  write_file: 'writing'
-}
+// The flavour vocabulary the running UI draws from: the domain's own activity
+// list. One verb is drawn per turn and stands beside the busy indicator until
+// the turn ends, which is what makes a wait read as antibody design rather
+// than as a generic spinner. A tool row carries no verb of its own: the tool's
+// name is pi's, and is already the verb.
+
+import { pick } from './pick.js'
 
 export const VERBS = [
   'folding',
@@ -268,3 +255,8 @@ export const VERBS = [
   'rebutting reviewers',
   'brewing coffee'
 ]
+
+/** One activity verb, drawn when a turn starts and kept for its whole length. */
+export function pickVerb(random?: () => number): string {
+  return pick(VERBS, random)
+}

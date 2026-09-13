@@ -10,9 +10,7 @@ Registered via a closure that pre-binds the broker (mirrors
 by the umbrella, so the demo / test paths that build no broker do not register
 it — keeping the umbrella-vs-production drift test balanced.
 
-This method is intentionally NOT in ``METHOD_MODELS`` / ``openrpc.json`` — like
-the existing clarify/sudo/secret round-trips, the confirm pair lives outside
-the cross-language schema-parity contract.
+The method and its notification payload are declared in ``openrpc.json``.
 """
 
 from __future__ import annotations

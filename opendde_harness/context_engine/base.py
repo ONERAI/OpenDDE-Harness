@@ -1,61 +1,76 @@
-"""ContextEngine ABC — contract for the context engine.
+"""The contributor model every part of the turn context is built through.
 
-This package (``opendde_harness.context_engine``) hosts the single
-:class:`ContextAssembler` (a concrete subclass of
-:class:`ContextEngine`) plus its building blocks. AgentLoop holds
-exactly one ``self.context_engine: ContextEngine`` reference, built via
-:func:`opendde_harness.context_engine.build_context_engine`. The ABC is kept so
-alternative engines can be slotted in for experiments, but there is one
-shipping implementation.
+One engine ships — :class:`~opendde_harness.context_engine.assembler.ContextAssembler` —
+and it is a concrete class, not an implementation of an ABC: there was one
+subclass, and the abstract layer only made the real contract harder to read.
+AgentLoop holds one ``self.context_engine``, built by
+:func:`~opendde_harness.context_engine.factory.build_context_engine`.
 
 Naming note:
     Named ``context_engine`` (not ``context``) to mirror the L4
     ``memory_engine`` package and to avoid colliding with
     :mod:`opendde_harness.agent.context`, which hosts the lower-level
-    :class:`ContextBuilder` utility that engines use as a building block.
+    :class:`ContextBuilder` holder.
 
-Layering note:
-    The data carriers ``AssembledContext`` and ``TokenBudget`` live in
-    :mod:`opendde_harness.memory_engine.base` (they were placed there before
-    this ABC landed). The two engines (``MemoryEngine``,
-    ``ContextEngine``) are peer L4 abstractions; the dataclasses are
-    shared value objects, not part of either's contract surface.
+Every part of the system prompt is produced by a :class:`SegmentBuilder`
+(identity / bootstrap / project instructions / memory / active skills /
+skills); they run concurrently and their ``text`` joins in ``order``. The
+history is not a segment: it is chosen by the engine's one history selector
+from the prefix those builders produced.
 """
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
-
-from opendde_harness.memory_engine.base import AssembledContext, TokenBudget
-
-if TYPE_CHECKING:
-    # Avoid runtime import — ``curator`` imports back from this module
-    # for ``ContextEngine``, so referencing ``TurnContext`` only in type
-    # hints keeps the loop unbroken.
-    from opendde_harness.context_engine.curator import TurnContext
-    from opendde_harness.providers.base import LLMProvider
+from typing import Any, Protocol, runtime_checkable
 
 
-# ---------------------------------------------------------------------------
-# SegmentBuilder abstraction — the uniform contributor model
-# ---------------------------------------------------------------------------
-#
-# Every part of the turn context is produced by a :class:`SegmentBuilder`.
-# seg1–5 (identity / bootstrap / memory / active-skills / skills) and the
-# Curator are all SegmentBuilders — there is no separate "lane" category.
-# :class:`ContextAssembler` runs them in two phases and routes their
-# outputs into the system / history slots.
+@dataclass
+class TurnContext:
+    """Per-turn inputs the loop hands the engine.
+
+    Everything here is known only to the loop: the message being answered, the
+    attachments, the conversation it belongs to, and the facts about the bound
+    model and the configuration that the prompt is rendered against. They are
+    passed rather than read from config inside rendering, so one turn's prompt
+    can never be assembled from another turn's settings.
+    """
+
+    current_message: str
+    media: list[str] | None = None
+    channel: str | None = None
+    chat_id: str | None = None
+    # Whether this turn's model can see a picture. Decided by the loop (it owns
+    # the provider and the model id) and carried here because the message is
+    # built down in render, which knows neither. Defaults True so a caller that
+    # does not set it keeps the old inline-everything behavior.
+    can_see_images: bool = True
+    # Name of a registered tool that can read an attachment the model cannot,
+    # or None when none is (it comes from an optional plugin). Naming a tool the
+    # model does not have reads as an instruction it cannot follow.
+    describe_tool: str | None = None
+    # The id the request actually reaches, told to the model so it never
+    # guesses its own identity from pretraining. None omits the line.
+    model: str | None = None
+    # ``config.language``: "zh" adds the reply-language directive.
+    language: str = "en"
+    # Whether a long-term memory backend is configured, which decides whether
+    # the workspace block may point the model at profile / episode paths.
+    long_term_memory: bool = False
+    # Tokens to hold back for the reply, from the model's own output ceiling.
+    # The budget is the window less this.
+    reserved_output: int = 0
 
 
 @dataclass(frozen=True)
 class AssembledPrefix:
-    """Phase-A output handed to phase-B builders (the Curator).
+    """The fixed part of one turn's prompt, as a value.
 
-    A phase-B builder needs the already-assembled system prefix + the
-    user message + tool defs so it can size the *fixed* prompt overhead
-    and budget ``*history`` exactly.
+    Phase A's assembled system prefix + the user message + the tool
+    definitions: everything the history selector must price *around* before it
+    can decide what history fits. A per-turn argument rather than a field on a
+    long-lived object, because two conversations assemble at once and one must
+    never size itself against the other's prefix.
     """
 
     system_prefix: str
@@ -65,12 +80,7 @@ class AssembledPrefix:
 
 @dataclass(frozen=True)
 class AssemblyContext:
-    """Per-turn, read-only inputs shared by every :class:`SegmentBuilder`.
-
-    ``prefix`` is ``None`` during phase A (independent builders) and is
-    populated by :class:`ContextAssembler` before phase-B builders run.
-    Phase-A builders ignore it; phase-B builders require it.
-    """
+    """Per-turn, read-only inputs shared by every :class:`SegmentBuilder`."""
 
     session_key: str
     current_message: str
@@ -78,10 +88,11 @@ class AssemblyContext:
     channel: str | None
     chat_id: str | None
     session_messages: list[dict[str, Any]]
-    budget: TokenBudget
-    prefix: AssembledPrefix | None = None
     can_see_images: bool = True
     describe_tool: str | None = None
+    model: str | None = None
+    language: str = "en"
+    long_term_memory: bool = False
 
 
 @dataclass
@@ -90,113 +101,33 @@ class Segment:
 
     - ``text`` — the segment's contribution to the **system** slot
       (joined by ``order``); ``""`` means "no segment this turn".
-    - ``history`` — the **history** slot contribution; only the Curator
-      sets this (``None`` for every other builder).
     - ``meta`` — merged into ``AssembledContext.metadata`` (e.g.
-      ``injected_skill_ids`` / ``memory_hits`` / ``path``).
+      ``injected_skill_ids`` / ``memory_hits``).
     """
 
     text: str = ""
-    history: list[dict[str, Any]] | None = None
     meta: dict[str, Any] = field(default_factory=dict)
 
 
 @runtime_checkable
 class SegmentBuilder(Protocol):
-    """One context contributor. seg1–5 and the Curator all implement it.
+    """One contributor to the system prompt.
 
-    ``order`` fixes the segment's position in the system prompt.
-    ``needs_prefix`` routes the builder to phase B (it reads
-    ``ctx.prefix``); the default ``False`` keeps a builder in the
-    phase-A parallel batch.
+    ``order`` fixes the segment's position in the assembled prefix.
     """
 
     name: str
     order: int
-    needs_prefix: bool
 
     async def build(self, ctx: AssemblyContext) -> "Segment | None":
         """Return this turn's :class:`Segment`, or ``None`` to contribute nothing."""
         ...
 
 
-class ContextEngine(ABC):
-    """Decides which messages reach the main agent's LLM each turn.
-
-    One implementation ships:
-    :class:`ContextAssembler <opendde_harness.context_engine.assembler.ContextAssembler>`
-    — assembles a flat list of :class:`SegmentBuilder` into the turn's
-    messages. Phase A runs seg1–5 concurrently (identity / bootstrap /
-    memory+recall / active-skills / router-skills); phase B runs the
-    Curator (``# Curator Working State`` + budget-trimmed ``*history``).
-    ``owns_compaction=True``; AgentLoop defers compaction to
-    :meth:`after_turn`.
-    """
-
-    @property
-    @abstractmethod
-    def name(self) -> str:
-        """Short identifier used in logs / metadata (``"unified"``)."""
-
-    @property
-    @abstractmethod
-    def owns_compaction(self) -> bool:
-        """If True, AgentLoop skips ``MemoryEngine.maybe_consolidate`` and
-        lets the engine manage history compaction itself (Curator archives
-        messages out-of-band)."""
-
-    def set_provider(self, provider: "LLMProvider", model: str) -> None:
-        """Adopt the provider a live ``/model`` switch just built.
-
-        Segments that call an LLM hold the provider handed to them at
-        construction; without this they keep calling the old one for the
-        rest of the process. Concrete rather than abstract so a future
-        implementation with no LLM-backed segment is not forced to write an
-        empty override; ``ContextAssembler`` is the only one today and does
-        override it.
-        """
-
-    @abstractmethod
-    async def assemble(
-        self,
-        session_key: str,
-        session_messages: list[dict[str, Any]],
-        budget: TokenBudget,
-        *,
-        turn: "TurnContext",
-    ) -> AssembledContext:
-        """Build the exact message list passed to the main agent's LLM.
-
-        ``session_messages`` is what the engine should consider as candidate
-        history. Whether it's ``session.messages`` (full append-only log) or
-        ``session.get_history()`` (post-consolidation slice) is decided by
-        AgentLoop based on :attr:`owns_compaction`.
-        """
-
-    async def after_turn(
-        self,
-        session_key: str,
-        outcome: dict[str, Any],
-    ) -> None:
-        """Optional post-turn hook. Curator updates its manifest / archives
-        here; Legacy ignores it. Default is no-op so future engines can
-        opt in incrementally.
-        """
-        return None
-
-    def set_context_window(self, tokens: int | None) -> None:
-        """Follow a ``/model`` switch: re-budget whichever builders sized
-        themselves against the window at construction. ``None`` is an unknown
-        window, which the builders treat as "do not trim". Default is no-op so
-        an engine with no such builder need not override it.
-        """
-        return None
-
-
 __all__ = [
     "AssembledPrefix",
     "AssemblyContext",
-    "ContextEngine",
     "Segment",
     "SegmentBuilder",
+    "TurnContext",
 ]

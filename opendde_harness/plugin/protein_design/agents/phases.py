@@ -581,8 +581,6 @@ class ProteinDesignPhases:
         }
         if config.llm_model:
             metadata["llm_model"] = config.llm_model
-        if config.llm_temperature is not None:
-            metadata["llm_temperature"] = config.llm_temperature
         if config.llm_max_tokens is not None:
             metadata["llm_max_tokens"] = config.llm_max_tokens
         return metadata

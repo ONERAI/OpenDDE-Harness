@@ -1,9 +1,7 @@
 """MemoryBackend Protocol — the single contract every memory plugin implements.
 
-MB-1 introduction. This is the **new** seam between AgentLoop and the
-memory subsystem, deliberately distinct from the older
-:class:`MemoryEngine` ABC in :mod:`opendde_harness.memory_engine.base` so the
-two can coexist while the codebase transitions.
+MB-1 introduction. This is the seam between AgentLoop and the memory
+subsystem; the L4 ``MemoryEngine`` ABC it replaced is gone.
 
 Three design points to flag for plugin authors:
 
@@ -41,6 +39,14 @@ from typing import Any, Protocol, runtime_checkable
 # ---------------------------------------------------------------------------
 # Data carrier
 # ---------------------------------------------------------------------------
+
+
+#: ``memory.backend`` spelled to mean "no owner at all": no plugin, and not the
+#: host's own markdown writer either. A name rather than ``None`` because ``None``
+#: is what a config that says nothing about memory looks like, and that config
+#: gets the default owner -- turning extraction off has to be something the user
+#: wrote, not something they omitted.
+BACKEND_OFF = "off"
 
 
 @dataclass(frozen=True)
@@ -87,7 +93,7 @@ class MemoryBackend(Protocol):
 
     Five methods, ordered by hot-path:
 
-    1. :meth:`recall` — called by ``ContextEngine.assemble`` every turn
+    1. :meth:`recall` — called by ``ContextAssembler.assemble`` every turn
        (potentially twice: once for user-track memory with ``user_id``,
        once for agent-track skills with ``agent_id`` via
        :class:`MemorySkillSource`).
@@ -132,10 +138,13 @@ class MemoryBackend(Protocol):
     ) -> bool:
         """Persist a session slice. Returns whether it landed.
 
-        ``messages`` follows the AgentLoop ``{"role", "content", ...}``
-        shape — the existing list-of-dicts form the codebase already
-        produces, so adapters don't need a conversion step. Backends
-        that want to chunk / deduplicate / extract are free to.
+        ``messages`` are pi ``Message`` dicts
+        (:mod:`opendde_harness.providers.messages`): roles ``user`` /
+        ``assistant`` / ``toolResult``, content a string or a list of
+        ``text`` / ``image`` / ``thinking`` / ``toolCall`` blocks. That is the
+        one shape the session log, the journal and the request all hold, so an
+        adapter reads what was actually said. Backends that want to chunk /
+        deduplicate / extract are free to.
 
         ``metadata`` is an optional dict for caller-supplied context
         that does not fit the message list.  Callers may pass
@@ -180,4 +189,4 @@ class MemoryBackend(Protocol):
         ...
 
 
-__all__ = ["Memory", "MemoryBackend"]
+__all__ = ["BACKEND_OFF", "Memory", "MemoryBackend"]

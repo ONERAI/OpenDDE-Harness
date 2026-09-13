@@ -277,7 +277,6 @@ class WorkflowConfig(ContractModel):
     quality_check_enabled: bool = True
     quality_check_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
     llm_model: str | None = None
-    llm_temperature: float | None = None
     llm_max_tokens: int | None = Field(default=None, ge=1)
     bootstrap_full_redesign_cycles: int = Field(default=0, ge=0)
     stagnation_full_redesign_threshold: int = Field(default=0, ge=0)

@@ -13,8 +13,16 @@ dispatches concurrently via `asyncio.create_task` so a long-running streaming
 subscription doesn't block other RPC calls, and serializes writes with an
 `asyncio.Lock` so concurrent dispatch tasks can't interleave bytes on the wire.
 
-Frame size limit: 1 MiB (specs §2.5). Larger frames trigger immediate
-shutdown of the connection.
+Inbound frame size limit: 1 MiB (specs §2.5). A frame over the cap closes
+the connection. Nothing caps what the server writes: a frame goes out whole,
+however large it is.
+
+Writes await the transport's drain, so a slow reader backpressures the
+subscription emitter's bounded queue instead of piling up unboundedly in the
+socket's write buffer. That wait is bounded by ``DRAIN_TIMEOUT_S``: a peer
+that has not read a byte for that long is gone, and a write side stalled
+behind it would otherwise hold every RPC behind one lock forever, so the
+connection is closed and the server stops.
 """
 
 from __future__ import annotations
@@ -34,6 +42,16 @@ if TYPE_CHECKING:
 
 # Per specs/tui-ipc.md §2.5
 MAX_FRAME_BYTES = 1 * 1024 * 1024  # 1 MiB
+
+# How long one write may wait for the peer to make room before the connection
+# is declared dead.
+#
+# Every write holds ``_write_lock`` while it drains, so a peer that stops
+# reading holds every other RPC behind it. Thirty seconds is far longer than
+# any TUI render takes and far shorter than forever: past it the peer is gone,
+# and the honest answer is to close rather than to queue for a reader that
+# will never come back.
+DRAIN_TIMEOUT_S = 30.0
 
 
 class RpcServer:
@@ -72,6 +90,9 @@ class RpcServer:
         self._reader: asyncio.StreamReader | None = None
         self._write_transport: asyncio.WriteTransport | None = None
         self._write_protocol: asyncio.BaseProtocol | None = None
+        # Wraps the write transport so ``send_frame`` can await real socket
+        # backpressure. Both paths below build one.
+        self._writer: asyncio.StreamWriter | None = None
         self._write_lock = asyncio.Lock()
         self._pending: set[asyncio.Task] = set()
         self._stopped = asyncio.Event()
@@ -85,16 +106,53 @@ class RpcServer:
     # ----- write side -------------------------------------------------------
 
     async def send_frame(self, frame: dict) -> None:
-        """Serialize and write a single JSON frame + newline to `notify_fd`.
+        """Serialize and write a single JSON frame + newline to the peer.
 
         All writes (responses + notifications) MUST go through this method so
-        the lock serializes them.
+        the lock serializes them. The frame goes out whole, however large.
         """
+        if self._stopped.is_set():
+            # The connection is gone or going -- a peer that stopped reading,
+            # or an ordinary shutdown. Nothing to write to, and nothing to
+            # wait the drain timeout for a second time.
+            return
         if self._write_transport is None:
             raise RuntimeError("RpcServer.send_frame called before serve_forever()")
         data = (json.dumps(frame, ensure_ascii=False) + "\n").encode("utf-8")
         async with self._write_lock:
             self._write_transport.write(data)
+            # Connects the emitter's bounded queue to the socket's write
+            # buffer: without this the queue bounds a staging area only.
+            if self._writer is not None:
+                try:
+                    await asyncio.wait_for(self._writer.drain(), DRAIN_TIMEOUT_S)
+                except TimeoutError:
+                    logger.error(
+                        "tui_rpc: peer stopped reading for {}s; closing the connection",
+                        DRAIN_TIMEOUT_S,
+                    )
+                    self._abandon_stalled_peer()
+
+    def _abandon_stalled_peer(self) -> None:
+        """Give up on a peer that has stopped reading, and stop the server.
+
+        A drain that never completes holds ``_write_lock`` forever, so every
+        other RPC queues behind one dead subscription. Closing the transport
+        and feeding the reader EOF ends ``serve_forever``'s read loop, which
+        runs the ordinary shutdown: in-flight dispatch tasks cancelled, FDs
+        closed. ``_stopped`` also makes every later ``send_frame`` a no-op
+        rather than another wait of the same length.
+        """
+        self._stopped.set()
+        if self._write_transport is not None:
+            try:
+                self._write_transport.close()
+            except Exception:
+                logger.exception("tui_rpc: error closing a stalled write transport")
+        if self._reader is not None:
+            # Unblocks the ``readuntil`` in ``serve_forever``, whose ``finally``
+            # is what actually shuts the server down.
+            self._reader.feed_eof()
 
     # ----- main loop --------------------------------------------------------
 
@@ -140,6 +198,7 @@ class RpcServer:
             transport, _ = await loop.connect_accepted_socket(lambda: reader_protocol, self._sock)
             self._write_transport = transport
             self._write_protocol = reader_protocol
+            self._writer = asyncio.StreamWriter(transport, reader_protocol, reader, loop)
         elif req_is_sock and notif_is_sock:
             # Both fds are dups of the same accepted socket. Close the read
             # dup and reclaim the write dup as a ``socket.socket`` — only one
@@ -153,17 +212,22 @@ class RpcServer:
             transport, _ = await loop.connect_accepted_socket(lambda: reader_protocol, sock)
             self._write_transport = transport
             self._write_protocol = reader_protocol
+            self._writer = asyncio.StreamWriter(transport, reader_protocol, reader, loop)
         else:
             # Legacy / test path: bare pipes via ``os.pipe()``.
             # `os.fdopen` so the transport owns a Python file object; loop
             # will close the underlying fd when the transport closes.
             await loop.connect_read_pipe(lambda: reader_protocol, os.fdopen(self._request_fd, "rb", buffering=0))
+            # ``FlowControlMixin`` rather than ``BaseProtocol``: it is what
+            # gives the pipe transport a ``_drain_helper`` for ``send_frame``
+            # to await, so this path backpressures like the socket ones.
             write_transport, write_protocol = await loop.connect_write_pipe(
-                asyncio.BaseProtocol,
+                lambda: asyncio.streams.FlowControlMixin(loop=loop),
                 os.fdopen(self._notify_fd, "wb", buffering=0),
             )
             self._write_transport = write_transport
             self._write_protocol = write_protocol
+            self._writer = asyncio.StreamWriter(write_transport, write_protocol, None, loop)
 
         self._reader = reader
 
@@ -270,6 +334,7 @@ class RpcServer:
             except Exception:
                 logger.exception("tui_rpc: error closing write transport")
             self._write_transport = None
+        self._writer = None
 
         self._stopped.set()
         logger.info("tui_rpc: RpcServer stopped (pid={})", os.getpid())
@@ -282,4 +347,4 @@ class RpcServer:
         # bail. Caller typically just cancels the serve_forever task.
 
 
-__all__ = ["RpcServer", "MAX_FRAME_BYTES"]
+__all__ = ["RpcServer", "MAX_FRAME_BYTES", "DRAIN_TIMEOUT_S"]

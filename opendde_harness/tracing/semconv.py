@@ -13,13 +13,12 @@ from collections import Counter
 from typing import Any
 
 from . import config
-from . import usage as usage_mod
 from .store import preview_text
 
 _SKILL_TOOLS = {"use_skill", "read_skill"}
 
 
-_FILE_READ_TOOLS = {"read_file"}
+_FILE_READ_TOOLS = {"read"}
 
 
 def _preview(value: Any, n: int | None = None) -> str:
@@ -70,16 +69,15 @@ def _turn_capabilities(loop: Any) -> dict[str, Any]:
 def _provider_label(model: str | None, provider_class: str | None) -> str | None:
     """Logical routing backend for a call.
 
-    opendde reaches every gateway through a single ``LiteLLMProvider`` class, so
-    the class name hides which backend actually served the call. LiteLLM encodes
-    that as the model prefix (``openrouter/anthropic/claude-...``), so the first
-    path segment is the backend (``openrouter``). Fall back to the provider class
+    A gateway fronts many vendors, so the provider class name does not say which
+    backend actually served the call. The model id does: it is stored with the
+    gateway named (``openrouter/anthropic/claude-...``), so the first path
+    segment is the backend (``openrouter``). Fall back to the provider class
     name when the model carries no prefix (e.g. a native provider).
     """
-    from opendde_harness.providers.registry import split_model_id
+    from opendde_harness.providers import model_id
 
-    prefix, _ = split_model_id(model or "")
-    return prefix or provider_class
+    return model_id.provider_of(model) or provider_class
 
 
 def _llm_attrs(resp: Any, provider: str, model: str | None, provider_class: str | None = None) -> dict[str, Any]:
@@ -94,13 +92,21 @@ def _llm_attrs(resp: Any, provider: str, model: str | None, provider_class: str 
     attrs["llm.tool_call_count"] = len(tool_calls)
     if tool_calls:
         attrs["llm.tool_names"] = [getattr(t, "name", None) for t in tool_calls]
-    u = usage_mod.normalize(getattr(resp, "usage", None), model)
-    attrs["llm.usage.input_tokens"] = u["input_tokens"]
-    attrs["llm.usage.output_tokens"] = u["output_tokens"]
-    attrs["llm.usage.cache_read_tokens"] = u["cache_read_tokens"]
-    attrs["llm.usage.cache_write_tokens"] = u["cache_write_tokens"]
-    attrs["llm.usage.total_tokens"] = u["total_tokens"]
-    attrs["llm.usage.cost_total"] = u["cost_usd"]
+    # The figures as the loop records them: ``prompt_tokens`` is fresh-only on
+    # every route (pi takes the cache counts out), so nothing is derived here.
+    # Read off the dict rather than through ``token_wise``: this module is
+    # imported by the plugin registry, which the compute container loads with
+    # the image's own Python, and the image ships the compute dependencies
+    # only. No cost: what a call cost is the model layer's figure, recorded by
+    # the loop; the key stays so the span's shape does not change.
+    usage = getattr(resp, "usage", None) or {}
+    count = lambda key: int(usage.get(key, 0) or 0)  # noqa: E731
+    attrs["llm.usage.input_tokens"] = count("prompt_tokens")
+    attrs["llm.usage.output_tokens"] = count("completion_tokens")
+    attrs["llm.usage.cache_read_tokens"] = count("cache_read_input_tokens")
+    attrs["llm.usage.cache_write_tokens"] = count("cache_creation_input_tokens")
+    attrs["llm.usage.total_tokens"] = count("total_tokens") or (count("prompt_tokens") + count("completion_tokens"))
+    attrs["llm.usage.cost_total"] = None
     reasoning = getattr(resp, "reasoning_content", None)
     if reasoning:
         attrs["llm.reasoning_preview"] = _preview(reasoning)
@@ -137,9 +143,9 @@ def _llm_input_payload(
       - ``historyMessages``: the prior turns only — everything EXCEPT the system
         message and that latest user message (so it doesn't duplicate them).
     ``messages`` keeps the full raw list as handed to the provider, which is not
-    what went on the wire: the provider adds or removes prompt-cache breakpoints
-    on copies (``providers.prompt_cache``) after this is recorded. Neither the
-    presence nor the absence of ``cache_control`` here says what was sent.
+    what went on the wire: a route that places prompt-cache breakpoints does so
+    on copies after this is recorded. Neither the presence nor the absence of
+    ``cache_control`` here says what was sent.
     """
     msgs = messages if isinstance(messages, list) else []
     system_prompt = ""
@@ -202,7 +208,7 @@ def _parse_skill_name(result: Any) -> str | None:
 
 def _skill_scripts_dir(result: Any) -> str | None:
     """``use_skill`` embeds a ``scripts_dir: <path>`` line when it materialized a
-    runnable bundle; a plain body read (``read_skill`` / ``read_file``) never does.
+    runnable bundle; a plain body read (``read_skill`` / ``read``) never does.
     Surface that path so "pulled a bundle" vs "just instructions" is a first-class
     signal on the one Skill node, rather than buried in the output blob."""
     if not isinstance(result, str):
@@ -245,10 +251,10 @@ def _skill_name_from_path(path: str | None) -> str | None:
 
 
 def _skill_read_path(name: str, params: Any) -> str | None:
-    """If a read_file targets a SKILL.md, return that path; else ``None``.
+    """If a ``read`` targets a SKILL.md, return that path; else ``None``.
 
     This is the discovery→injection follow-through: opendde's summary mode
-    tells the agent to ``read_file`` a skill's SKILL.md, and subagents (which
+    tells the agent to ``read`` a skill's SKILL.md, and subagents (which
     only get the skill *catalog*) do the same. Those reads carry the real body
     into context but look like a plain file read — re-type them to skill.read.
     """
@@ -281,9 +287,6 @@ __all__ = [
     "memory_recall",
     "memory_store",
     "memory_feedback",
-    "memory_extract",
-    "memory_profile_refresh",
-    "memory_consolidate",
     "plugin_load",
     "skill_inject_active",
     "skill_inject_skills",
@@ -371,9 +374,9 @@ def skill_inject_active(span, bound: dict[str, Any], result: Any, exc: BaseExcep
 
 
 def skill_inject_skills(span, bound: dict[str, Any], result: Any, exc: BaseException | None) -> None:
-    """``# Skills`` — emit only when gate-selected skills' bodies were rendered."""
+    """``# Skills`` — emit only when the catalogue advertised something."""
     seg_meta = (getattr(result, "meta", None) or {}) if result is not None else {}
-    ids = list(seg_meta.get("injected_skill_ids") or [])
+    ids = list(seg_meta.get("available_skill_ids") or [])
     if ids:
         _skill_inject_fill(
             span,
@@ -385,76 +388,6 @@ def skill_inject_skills(span, bound: dict[str, Any], result: Any, exc: BaseExcep
         )
     else:
         span.cancel()
-
-
-def _hit_ref(hit: Any) -> dict[str, Any]:
-    """Light, serializable view of a RouterHit candidate (avoid dumping bodies)."""
-    return {
-        "id": getattr(hit, "id", None) or getattr(hit, "skill_id", None),
-        "name": getattr(hit, "name", None),
-        "source": getattr(hit, "source", None),
-        "score": getattr(hit, "score", None),
-    }
-
-
-def skill_rewrite(span, bound: dict[str, Any], result: Any, exc: BaseException | None) -> None:
-    """``QueryRewriter.analyze`` — the need_retrieval judgment + query rewrite that
-    precedes skill retrieval. Its inner model call nests here (invocation source)."""
-    need = getattr(result, "need_retrieval", None)
-    rewritten = getattr(result, "rewritten_query", None)
-    span.set(
-        {
-            "skill.rewrite.query_preview": _preview(bound.get("query")),
-            "skill.rewrite.need_retrieval": need,
-            "skill.rewrite.rewritten": _preview(rewritten),
-        }
-    )
-    span.artifact("skill.rewrite.input", {"query": bound.get("query")})
-    span.artifact("skill.rewrite.output", {"need_retrieval": need, "rewritten_query": rewritten})
-
-
-def skill_gate(span, bound: dict[str, Any], result: Any, exc: BaseException | None) -> None:
-    """``LLMGateFilter.filter`` — narrows the skill candidates to the selected few."""
-    candidates = bound.get("candidates") or []
-    selected = result if isinstance(result, list) else []
-    span.set(
-        {
-            "skill.gate.task_preview": _preview(bound.get("task")),
-            "skill.gate.candidate_count": len(candidates),
-            "skill.gate.selected_count": len(selected),
-        }
-    )
-    span.artifact(
-        "skill.gate.input",
-        {
-            "task": bound.get("task"),
-            "candidates": [_hit_ref(h) for h in candidates],
-            "available_tools": bound.get("available_tools"),
-        },
-    )
-    span.artifact("skill.gate.output", {"selected": [_hit_ref(h) for h in selected]})
-
-
-def context_curate(span, bound: dict[str, Any], result: Any, exc: BaseException | None) -> None:
-    """``CuratorSegmentBuilder._slow_path`` — the bounded internal curator LLM loop
-    (its per-step model + tool calls nest under this one node)."""
-    seg = result
-    state = bound.get("state")
-    history = getattr(seg, "history", None) or [] if seg is not None else []
-    span.set(
-        {
-            "context.curate.produced": seg is not None,
-            "context.curate.history_len": len(history),
-        }
-    )
-    span.artifact(
-        "context.curate.input",
-        {"turn_id": bound.get("turn_id"), "session_key": getattr(state, "session_key", None)},
-    )
-    span.artifact(
-        "context.curate.output",
-        {"produced": seg is not None, "history_len": len(history), "working_state": getattr(seg, "text", None)},
-    )
 
 
 def memory_recall(span, bound: dict[str, Any], result: Any, exc: BaseException | None) -> None:
@@ -483,51 +416,29 @@ def memory_recall(span, bound: dict[str, Any], result: Any, exc: BaseException |
 
 
 def memory_store(span, bound: dict[str, Any], result: Any, exc: BaseException | None) -> None:
-    msgs = bound.get("messages_slice") or []
-    span.set({"memory.session_id": bound.get("session_key"), "memory.message_count": len(msgs)})
-    span.artifact("memory.store", {"session_id": bound.get("session_key"), "messages": msgs})
+    """One extraction-outbox entry offered to the backend.
+
+    The unit is the entry, not the turn: a turn's store can be replayed after a
+    crash, and the turn id on the span is what makes the two attempts one story.
+    """
+    entry = bound.get("entry")
+    session = getattr(entry, "session", None)
+    msgs = getattr(entry, "messages", None) or []
+    span.set(
+        {
+            "memory.session_id": session,
+            "memory.turn_id": getattr(entry, "turn_id", None),
+            "memory.message_count": len(msgs),
+        }
+    )
+    span.artifact("memory.store", {"session_id": session, "messages": msgs})
 
 
 def memory_feedback(span, bound: dict[str, Any], result: Any, exc: BaseException | None) -> None:
     span.set(
         {
             "memory.session_id": bound.get("session_key"),
-            "memory.injected": bound.get("injected_skill_ids"),
             "memory.used": bound.get("used_skill_ids"),
-        }
-    )
-
-
-def memory_extract(span, bound: dict[str, Any], result: Any, exc: BaseException | None) -> None:
-    msgs = bound.get("messages") or []
-    span.set(
-        {
-            "memory.surface": "host",
-            "memory.model": bound.get("model"),
-            "memory.message_count": len(msgs),
-            "memory.enable_foresight": bound.get("enable_foresight"),
-            "memory.annotated": bool(result),
-        }
-    )
-
-
-def memory_profile_refresh(span, bound: dict[str, Any], result: Any, exc: BaseException | None) -> None:
-    span.set(
-        {
-            "memory.model": bound.get("model"),
-            "memory.threshold": bound.get("threshold"),
-            "memory.sections_rewritten": result if isinstance(result, int) else None,
-        }
-    )
-
-
-def memory_consolidate(span, bound: dict[str, Any], result: Any, exc: BaseException | None) -> None:
-    session = bound.get("session")
-    span.set(
-        {
-            "memory.session_key": getattr(session, "key", None),
-            "memory.last_consolidated": getattr(session, "last_consolidated", None),
-            "memory.message_count": len(getattr(session, "messages", []) or []),
         }
     )
 
@@ -641,10 +552,10 @@ def tool_call(span, bound: dict[str, Any], result: Any, exc: BaseException | Non
     """Extractor for ``ToolRegistry.execute``.
 
     Retypes to ``skill.read`` when the tool is a skill tool (``use_skill`` /
-    ``read_skill``) or a ``read_file`` targeting a SKILL.md; otherwise stays
+    ``read_skill``) or a ``read`` targeting a SKILL.md; otherwise stays
     ``tool.call``. All skill accesses share the one ``skill.read`` node kind
     (the tracing standard); the originating tool is preserved in
-    ``skill.read.via_tool`` (``use_skill`` / ``read_skill`` / ``read_file``).
+    ``skill.read.via_tool`` (``use_skill`` / ``read_skill`` / ``read``).
     """
     name = bound.get("name")
     params = bound.get("params")
@@ -657,8 +568,8 @@ def tool_call(span, bound: dict[str, Any], result: Any, exc: BaseException | Non
         span.set(
             {
                 "skill.tool": name,
-                "skill.read.via_tool": "read_file",
-                "skill.injected_via": "read_file",
+                "skill.read.via_tool": "read",
+                "skill.injected_via": "read",
                 "skill.path": skill_read_path,
                 "skill.name": _skill_name_from_path(skill_read_path),
                 "skill.result_preview": _preview(result),

@@ -35,9 +35,16 @@ To update, close the TUI and run:
 uv tool upgrade opendde-harness
 ```
 
+OpenDDE Harness checks PyPI once a day and says when a newer release is out:
+in the TUI's status bar and once in its transcript at launch, and in
+`ddeharness doctor`. `ddeharness upgrade` runs the update for your kind of
+install -- `uv tool upgrade opendde-harness` for a uv tool, `pip install
+--upgrade opendde-harness` for a plain pip install; a source checkout is not
+nudged. Set `OPENDDE_HARNESS_NO_UPDATE_CHECK=1` to turn the check off.
+
 ### Install from source
 
-Install Git, uv, and Node.js 22 or newer with npm, then run:
+Install Git, uv, and Node.js 22.19 or newer with npm, then run:
 
 ```bash
 git clone https://github.com/aurekaresearch/OpenDDE-Harness.git
@@ -71,8 +78,8 @@ If `ddeharness` is not on PATH, run `uv tool update-shell` and open a new termin
 Package installation prepares the client; run `ddeharness onboard` to configure
 the LLM and compute service and prepare model assets.
 
-The release wheel includes the terminal UI. Source builds require Node.js 22 or
-newer with npm before installing the package.
+The release wheel includes the terminal UI. Source builds require Node.js 22.19
+or newer with npm before installing the package.
 
 Updates preserve configuration, results, and model data. They do not replace
 compute images or stop a running container. Existing containers keep their code

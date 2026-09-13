@@ -28,6 +28,8 @@ class SpawnTool(Tool):
     # A subagent runs its own (up to 15-iteration) loop with no internal
     # wall-clock cap, so give it a generous backstop rather than the default.
     timeout_seconds = 900.0
+    # A subagent uses the same tools this one does, so it can do anything they can.
+    external_effects = True
 
     def __init__(self, manager: "SubagentManager"):
         self._manager = manager

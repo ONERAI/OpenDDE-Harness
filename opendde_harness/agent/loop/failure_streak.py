@@ -10,6 +10,7 @@ adapting). Both live here rather than in the loop, which only does the counting.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 
 # Failure markers a plain retry would likely clear — these must NOT count toward
 # the tool-failure-loop streak (nudging on a 429 that self-heals is just noise).
@@ -74,7 +75,7 @@ def is_hard_tool_failure(result: object) -> bool:
     m = re.search(r"Exit code:\s*(-?\d+)", s)
     if m:
         return m.group(1) != "0"
-    # Real not-found failures (file / dir / path / old_text) all start with
+    # Real not-found failures (file / dir / path / oldText) all start with
     # "Error:" or carry a non-zero exit code, so those are already covered; a
     # bare "not found" scan would only risk flagging successful output that
     # merely mentions the phrase.
@@ -110,3 +111,47 @@ def loop_break_nudge(tool: str, n: int, failure: str = "other") -> str:
         "and change approach: a different tool, command, or strategy. Do not call it "
         "again unchanged."
     )
+
+
+@dataclass
+class FailureStreak:
+    """One turn's count of the same tool failing the same way, and its nudge budget.
+
+    Per turn, because the loop is a long-lived singleton: a counter on it would
+    carry one conversation's dead call into another's. ``threshold`` is how many
+    identical failures running make a loop, and ``max_nudges`` stops the nudge from
+    becoming one itself.
+    """
+
+    threshold: int = 2
+    max_nudges: int = 2
+    key: tuple[str, str] | None = None
+    streak: int = 0
+    nudges: int = 0
+
+    def observe(self, failure: tuple[str, str] | None) -> None:
+        """Count one tool result: a deterministic failure, or anything else.
+
+        A different failure from the same tool resets the count. Two different
+        errors mean the model is still adapting, and nudging it then is the
+        opposite of what the nudge is for.
+        """
+        if failure is None:
+            self.key, self.streak = None, 0
+        elif failure == self.key:
+            self.streak += 1
+        else:
+            self.key, self.streak = failure, 1
+
+    def nudge(self) -> str | None:
+        """The change-approach text when this streak has become a loop, else None.
+
+        Spends one of the turn's nudges and resets the count, so it fires once per
+        fresh streak rather than on every result after the threshold.
+        """
+        if self.key is None or self.streak < self.threshold or self.nudges >= self.max_nudges:
+            return None
+        self.nudges += 1
+        text = loop_break_nudge(self.key[0], self.streak, self.key[1])
+        self.streak = 0
+        return text

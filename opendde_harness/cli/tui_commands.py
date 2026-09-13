@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import re
 import secrets
 import shutil
 import signal
@@ -23,7 +22,7 @@ import subprocess
 import sys
 import threading
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional
 
 import typer
 
@@ -33,175 +32,21 @@ from opendde_harness.cli._log_file import (
     redirect_loguru_to_file,
     redirect_terminal_fds_to_file,
 )
+from opendde_harness.node_runtime import (
+    MIN_NODE_VERSION,
+    find_node,
+    packaged_dist_dir,
+    resolve_dist,
+    ui_tui_dir,
+)
 
 tui_app = typer.Typer(name="tui", help="Launch OpenDDE Harness native TUI (Ink+React).")
-
-# Path to the ui-tui/ source tree, relative to this file:
-# opendde_harness/cli/tui_commands.py -> ../../../ui-tui/. Only the `--dev` path (tsx from
-# source) needs this; it requires src/ + node_modules and is absent from wheels.
-_UI_TUI_DIR = Path(__file__).resolve().parent.parent.parent / "ui-tui"
-
-# Packaged location of the prebuilt, self-contained bundle inside an installed
-# wheel: opendde_harness/cli/tui_commands.py -> ../ui-tui/dist/entry.js (i.e.
-# opendde_harness/ui-tui/dist/entry.js). pyproject force-includes ui-tui/dist here so a
-# `pip`/`uv tool install` ships the TUI without a source checkout.
-_PACKAGED_DIST_ENTRY = Path(__file__).resolve().parent.parent / "ui-tui" / "dist" / "entry.js"
-
-_MIN_NODE_VERSION = (22, 0, 0)
-
-#: Read by the TUI when it launches a opendde command of its own (``provider
-#: login``, ``onboard``). Named here because the child must be this install.
-_OPENDDE_HARNESS_BIN_ENV = "OPENDDE_HARNESS_BIN"
-
-
-def own_entry_point() -> Optional[Path]:
-    """The ``opendde`` executable that started this process, if it can be named.
-
-    A console script is invoked by path, so ``argv[0]`` is the answer whenever
-    there is one; ``python -m opendde_harness`` leaves something else there, and the
-    executable's own directory holds the script in that case.
-    """
-    argv0 = Path(sys.argv[0])
-    if argv0.name in {"ddeharness", "ddeharness.exe"} and argv0.is_file():
-        return argv0.resolve()
-
-    sibling = Path(sys.executable).with_name("ddeharness.exe" if os.name == "nt" else "ddeharness")
-
-    return sibling if sibling.is_file() else None
-
-
-def child_env() -> dict[str, str]:
-    """Environment for the Node child, naming the opendde it must call back into.
-
-    The TUI runs ``ddeharness provider login`` for the user, and that writes a
-    credential. Resolved through PATH it can be a different install than the one
-    running -- one whose idea of where credentials live is its own, so the login
-    reports success and this process still sees an unauthenticated provider.
-
-    An explicit ``OPENDDE_HARNESS_BIN`` is left alone: a developer pointing it somewhere
-    means it.
-    """
-    env = os.environ.copy()
-    if not env.get(_OPENDDE_HARNESS_BIN_ENV) and (entry := own_entry_point()):
-        env[_OPENDDE_HARNESS_BIN_ENV] = str(entry)
-
-    return env
-
-
-def resolve_dist_entry() -> Optional[Path]:
-    """Locate the prebuilt ``entry.js`` bundle for production (non-dev) launch.
-
-    Tries, in order:
-      1. The packaged copy inside the installed wheel (``opendde_harness/ui-tui/dist``).
-      2. The source-tree copy a developer built locally (``ui-tui/dist``).
-
-    The bundle is self-contained (esbuild ``bundle: true``), so no sibling
-    ``node_modules`` is needed — only a Node runtime. Returns the first path
-    that exists, or ``None`` if neither does.
-    """
-    for candidate in (_PACKAGED_DIST_ENTRY, _UI_TUI_DIR / "dist" / "entry.js"):
-        if candidate.exists():
-            return candidate
-    return None
 
 
 def _stdout_isatty() -> bool:
     """Whether stdout is an interactive TTY (seam for the onboarding gate test;
     CliRunner swaps ``sys.stdout`` for a non-TTY buffer)."""
     return sys.stdout.isatty()
-
-
-def _is_windows() -> bool:
-    """Whether the host is Windows. A seam so tests can exercise the Windows
-    runtime-layout branch by patching this, instead of patching os.name — the
-    latter makes pathlib instantiate an unusable WindowsPath on POSIX hosts."""
-    return os.name == "nt"
-
-
-def find_node() -> Tuple[Optional[str], Optional[Tuple[int, int, int]]]:
-    """Find a usable node executable (>= 22).
-
-    Returns (path, version_tuple) or (None, None) if not found.
-    """
-    # Priority 1: OPENDDE_HARNESS_NODE env var — explicit override, NO fallback.
-    # When the user sets OPENDDE_HARNESS_NODE they are forcing a specific binary;
-    # if it is missing or unusable we must NOT silently fall back to
-    # venv/PATH (that would mask misconfiguration).
-    candidates: list[str] = []
-    if env_node := os.environ.get("OPENDDE_HARNESS_NODE"):
-        candidates.append(env_node)
-    else:
-        # Priority 2: active venv
-        if venv := os.environ.get("VIRTUAL_ENV"):
-            if _is_windows():
-                candidates.append(str(Path(venv) / "Scripts" / "node.exe"))
-            else:
-                candidates.append(str(Path(venv) / "bin" / "node"))
-
-        # Priority 3: PATH — enumerate EVERY node on PATH, not just the first.
-        # shutil.which returns only the first hit, so a stale < 22 node earlier
-        # on PATH (e.g. an old /usr/local/bin/node or a version-manager shim)
-        # would otherwise shadow a newer one later on PATH (e.g. a Homebrew
-        # node 26). The version filter below then picks the first usable one.
-        exe = "node.exe" if _is_windows() else "node"
-        seen_path: set[str] = set()
-        for path_dir in os.environ.get("PATH", "").split(os.pathsep):
-            if not path_dir:
-                continue
-            cand = os.path.join(path_dir, exe)
-            if cand not in seen_path and os.path.isfile(cand):
-                seen_path.add(cand)
-                candidates.append(cand)
-
-        # Priority 4: OpenDDE Harness-managed private runtime installed by the one-line
-        # installer into ~/.opendde_harness/runtime/. This is the zero-config fallback so
-        # a user who has no system Node still gets a working `ddeharness tui` after
-        # the installer provisioned a private Node here. Glob to tolerate the
-        # versioned dir name. The on-disk layout differs by OS: POSIX tarballs
-        # nest the binary under bin/ (node-v22.x.y-darwin-arm64/bin/node) while
-        # the Windows zip puts node.exe at the top level
-        # (node-v22.x.y-win-x64/node.exe) — install.ps1 provisions the latter.
-        runtime_root = Path(os.environ.get("OPENDDE_HARNESS_HOME", Path.home() / ".opendde_harness")) / "runtime"
-        if runtime_root.is_dir():
-            if _is_windows():
-                direct = runtime_root / "node" / "node.exe"
-                if direct.exists():
-                    candidates.append(str(direct))
-                candidates.extend(str(p) for p in sorted(runtime_root.glob("node-*/node.exe")))
-            else:
-                direct = runtime_root / "node" / "bin" / "node"
-                if direct.exists():
-                    candidates.append(str(direct))
-                candidates.extend(str(p) for p in sorted(runtime_root.glob("node-*/bin/node")))
-
-    # Return the first candidate that meets the minimum, in priority order.
-    # Track the highest below-minimum candidate seen so that when nothing
-    # qualifies the caller can still report the real version ("found 20.20.1,
-    # need >= 22") instead of a bare "not found".
-    best_below_min: Optional[Tuple[str, Tuple[int, int, int]]] = None
-    for node_path in candidates:
-        if not Path(node_path).exists():
-            continue
-        try:
-            proc = subprocess.run(
-                [node_path, "--version"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=True,
-            )
-            match = re.match(r"v(\d+)\.(\d+)\.(\d+)", proc.stdout.strip())
-            if not match:
-                continue
-            version = (int(match.group(1)), int(match.group(2)), int(match.group(3)))
-        except (subprocess.SubprocessError, FileNotFoundError, OSError):
-            continue
-        if version >= _MIN_NODE_VERSION:
-            return (node_path, version)
-        if best_below_min is None or version > best_below_min[1]:
-            best_below_min = (node_path, version)
-
-    return best_below_min if best_below_min is not None else (None, None)
 
 
 def run_subprocess(
@@ -308,7 +153,7 @@ def _spawn_with_rpc_pipes(
     for fd in (req_r, notif_w):
         os.set_inheritable(fd, False)
 
-    env = child_env()
+    env = os.environ.copy()
     # Inside the child these will appear as fd 3 / 4 (Popen remaps in order).
     env["OPENDDE_HARNESS_RPC_FD_REQUEST"] = "3"
     env["OPENDDE_HARNESS_RPC_FD_NOTIFY"] = "4"
@@ -369,16 +214,20 @@ def _build_tui_agent_loop():
 
     try:
         from opendde_harness.agent.loop.factory import build_agent_loop
-        from opendde_harness.cli._helpers import load_runtime_config, make_lazy_provider
+        from opendde_harness.cli._helpers import load_runtime_config, make_provider
         from opendde_harness.cli._plugin_stack import (
             build_plugin_registry,
             build_plugin_tools,
             maybe_build_memory_backend,
         )
+        from opendde_harness.providers.pool import ProviderPool
         from opendde_harness.session.manager import SessionManager
 
         config = load_runtime_config(None, None)
-        provider = make_lazy_provider(config)
+        provider = make_provider(config)
+        # Re-read per bind, not this snapshot: a credential fixed after start
+        # (an OAuth login, an edited config) must serve the next switch.
+        provider_pool = ProviderPool(lambda: load_runtime_config(None, None))
         session_manager = SessionManager(config.workspace_path)
 
         plugin_registry = build_plugin_registry(config)
@@ -400,6 +249,7 @@ def _build_tui_agent_loop():
             plugin_tools=plugin_tools,
             # TUI is always a multi-turn interactive session.
             interactive=True,
+            provider_pool=provider_pool,
         )
     except MissingCredentialsError as e:
         # Not a crash: the install simply is not finished. Surfaced as the
@@ -580,6 +430,9 @@ async def _run_rpc_server_until_done(
         scheduler=turn_scheduler,
         turn_ids=turn_ids,
         build_error=build_error,
+        # The sink the sign-in pushes its steps to: `model.login` shows pi's own
+        # flow inside the picker rather than handing over the terminal.
+        send_frame=server.send_frame,
     )
 
     serve_task = asyncio.create_task(server.serve_forever())
@@ -618,6 +471,11 @@ async def _run_rpc_server_until_done(
                     _logger.exception(
                         "tui: memory backend start failed; continuing with degraded memory path",
                     )
+                # Whatever a previous run left owed. The extraction outbox
+                # outlives the process that filled it, so the first thing a live
+                # backend does is take delivery of the turns it missed rather than
+                # wait for this session to produce one of its own.
+                agent_loop.start_extraction_drain()
                 _strip_tty_stream_handlers()
 
             asyncio.create_task(_start_backend())
@@ -687,7 +545,7 @@ def _spawn_with_rpc_socket(
     host, port = server_sock.getsockname()[:2]
 
     token = secrets.token_hex(32)
-    env = child_env()
+    env = os.environ.copy()
     env[_RPC_SOCKET_ENV] = f"{host}:{port}"
     env[_RPC_TOKEN_ENV] = token
 
@@ -862,7 +720,7 @@ def _run_rpc_session(proc, server_sock, auth_token: str, forward_signals: bool) 
 def _print_node_help(out=None) -> None:
     """Print the friendly Node-missing error message."""
     msg = (
-        "✗ TUI 启动失败：未找到 Node.js ≥ 22。\n"
+        "✗ TUI 启动失败：未找到 Node.js ≥ 22.19。\n"
         "  安装：https://nodejs.org/  或  brew install node@22  或  nvm install 22\n"
     )
     typer.echo(msg, file=out)
@@ -930,16 +788,6 @@ def tui(
         "--color",
         help="Force color output: auto | truecolor | 256 | 16 | none.",
     ),
-    print_colors: bool = typer.Option(
-        False,
-        "--print-colors",
-        help="Print the resolved color palette as swatches and exit (no TTY needed).",
-    ),
-    preview_colors: bool = typer.Option(
-        False,
-        "--preview-colors",
-        help="Preview color tokens in their real UI contexts and exit (no TTY needed).",
-    ),
 ) -> None:
     """Launch OpenDDE Harness native TUI."""
     if ctx.invoked_subcommand is not None:
@@ -947,7 +795,7 @@ def tui(
 
     node_path, version = find_node()
     if (
-        node_path is None or version is None or version < _MIN_NODE_VERSION
+        node_path is None or version is None or version < MIN_NODE_VERSION
     ) and not node_runtime.provisioning_disabled():
         from opendde_harness.cli.onboard_commands import _config_language
 
@@ -964,10 +812,10 @@ def tui(
     if node_path is None:
         _print_node_help()
         raise typer.Exit(code=1)
-    if version is None or version < _MIN_NODE_VERSION:
+    if version is None or version < MIN_NODE_VERSION:
         ver_str = ".".join(map(str, version)) if version else "<unknown>"
         typer.echo(
-            f"✗ Node 版本过低（找到 {ver_str}，需要 >= 22）。\n  请升级：nvm install 22  或  brew upgrade node\n",
+            f"✗ Node 版本过低（找到 {ver_str}，需要 >= 22.19）。\n  请升级：nvm install 22  或  brew upgrade node\n",
         )
         raise typer.Exit(code=1)
 
@@ -981,10 +829,10 @@ def tui(
 
     # `--dev` runs tsx from the source tree, so it requires the ui-tui/ checkout.
     # The production path resolves a packaged or source-built bundle separately
-    # (see resolve_dist_entry), so it must NOT hard-require the source tree —
+    # (see resolve_dist), so it must NOT hard-require the source tree —
     # a wheel install legitimately has no ui-tui/ source directory.
-    if dev and not _UI_TUI_DIR.exists():
-        print(f"✗ TUI 源码缺失（--dev 需要源码树）：{_UI_TUI_DIR}", file=sys.stderr)
+    if dev and not ui_tui_dir().exists():
+        print(f"✗ TUI 源码缺失（--dev 需要源码树）：{ui_tui_dir()}", file=sys.stderr)
         raise typer.Exit(code=2)
 
     # Color override flows to the child via env (entry.tsx -> colorTier.ts).
@@ -1000,21 +848,10 @@ def tui(
     if check:
         os.environ["OPENDDE_HARNESS_TUI_CHECK"] = "1"
 
-    # `--print-colors` / `--preview-colors` are no-IPC diagnostics: the child
-    # dumps the resolved palette (swatches / in-context) and exits. Like
-    # --check they skip the RPC handshake.
-    if print_colors:
-        os.environ["OPENDDE_HARNESS_TUI_PRINT_COLORS"] = "1"
-    if preview_colors:
-        os.environ["OPENDDE_HARNESS_TUI_COLOR_PREVIEW"] = "1"
-
-    # --check / --print-colors / --preview-colors are no-RPC, stdio-only spawns.
-    no_rpc = check or print_colors or preview_colors
-
-    # Only the interactive launch needs a configured provider: the no-RPC
-    # diagnostics never start a session (install.sh runs --check before the
-    # first onboarding).
-    if not no_rpc:
+    # `--check` is the one no-RPC, stdio-only spawn. Only the interactive
+    # launch needs a configured provider: the smoke test never starts a session
+    # (install.sh runs --check before the first onboarding).
+    if not check:
         from opendde_harness.cli.onboard_commands import ensure_ready_to_start
 
         if not ensure_ready_to_start(interactive=_stdout_isatty()):
@@ -1026,7 +863,7 @@ def tui(
     # a normal run/exit only writes INFO lifecycle records, so the path is
     # surfaced to the user only on an abnormal child exit (see below).
     log_path: Path | None = None
-    if not no_rpc:
+    if not check:
         _suppress_noisy_watchers()
         log_path = redirect_loguru_to_file(
             "tui.log",
@@ -1061,17 +898,18 @@ def tui(
         # short-circuits on OPENDDE_HARNESS_TUI_CHECK before the socket guard, so it
         # needs no RPC server; the interactive path must open the socket or
         # entry.tsx exits 2 ("OPENDDE_HARNESS_RPC_SOCKET env var required").
-        tsx_args = ["tsx", "src/entry.tsx"]
-        if no_rpc:
-            exit_code = run_subprocess(npx, tsx_args, cwd=_UI_TUI_DIR)
+        tsx_args = ["tsx", "src/entry.ts"]
+        if check:
+            exit_code = run_subprocess(npx, tsx_args, cwd=ui_tui_dir())
         else:
-            exit_code = run_subprocess_with_rpc(npx, tsx_args, cwd=_UI_TUI_DIR, log_path=log_path)
+            exit_code = run_subprocess_with_rpc(npx, tsx_args, cwd=ui_tui_dir(), log_path=log_path)
     else:
-        dist_entry = resolve_dist_entry()
+        dist_entry = resolve_dist("entry.js")
         if dist_entry is None:
             print(
-                f"✗ TUI 构建产物缺失：{_PACKAGED_DIST_ENTRY}（或源码树 {_UI_TUI_DIR / 'dist' / 'entry.js'}）\n"
-                f"  开发者请运行：cd {_UI_TUI_DIR} && npm install && npm run build\n"
+                f"✗ TUI 构建产物缺失：{packaged_dist_dir() / 'entry.js'}"
+                f"（或源码树 {ui_tui_dir() / 'dist' / 'entry.js'}）\n"
+                f"  开发者请运行：cd {ui_tui_dir()} && npm install && npm run build\n"
                 "  用户请克隆已认证的私有仓库 "
                 "https://github.com/aurekaresearch/OpenDDE-Harness-beta "
                 "并运行 ./install.sh\n",
@@ -1084,19 +922,19 @@ def tui(
         # `--check` smoke path keeps the simple stdio-only spawn so the
         # bootstrap-era tests (which don't speak JSON-RPC) still pass; the
         # interactive run path opens the RPC pipes and enforces handshake.
-        if no_rpc:
+        if check:
             exit_code = run_subprocess(node_path, [str(dist_entry)], cwd=dist_cwd)
         else:
             exit_code = run_subprocess_with_rpc(node_path, [str(dist_entry)], cwd=dist_cwd, log_path=log_path)
         if _is_abnormal_child_exit(exit_code):
             _diagnose_crash(node_path, dist_entry, dist_cwd)
 
-    if not no_rpc:
+    if not check:
         _release_compute()
 
     # tui.log stays silent on a clean run; surface it only when the child
     # exited abnormally (see _is_abnormal_child_exit).
-    if not no_rpc and _is_abnormal_child_exit(exit_code):
+    if not check and _is_abnormal_child_exit(exit_code):
         typer.echo(f"📝 TUI logs → {log_path} (exit {exit_code})", err=True)
 
     raise typer.Exit(code=exit_code)

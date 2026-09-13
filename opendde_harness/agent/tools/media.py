@@ -24,12 +24,13 @@ import io
 from pathlib import Path
 from typing import Any
 
-from opendde_harness.utils.helpers import ContentPart, estimate_image_tokens, image_block, is_image_part, text_block
+from opendde_harness.providers.messages import image_block, is_image, text_block
+from opendde_harness.utils.helpers import estimate_image_tokens
 
 # Formats every target accepts inline. A raster format Pillow can decode (BMP,
 # TIFF, ICO) is converted to JPEG rather than rejected. Formats Pillow cannot
 # decode are not images as far as this module is concerned -- SVG is XML and HEIC
-# needs pillow-heif -- and read_file falls back to reading them as text.
+# needs pillow-heif -- and ``read`` falls back to reading them as text.
 INLINE_MIME_TYPES = frozenset({"image/jpeg", "image/png", "image/gif", "image/webp"})
 
 MAX_DIMENSION_PX = 2000
@@ -122,17 +123,13 @@ def prepare_image(data: bytes, mime: str) -> tuple[bytes, str, dict[str, Any]]:
     )
 
 
-def to_data_uri(payload: bytes, mime: str) -> str:
-    return f"data:{mime};base64,{base64.b64encode(payload).decode('ascii')}"
-
-
-def blocks_from_mcp_content(content: list[Any]) -> tuple[str, list[ContentPart]]:
+def blocks_from_mcp_content(content: list[Any]) -> tuple[str, list[dict[str, Any]]]:
     """Convert MCP ``CallToolResult.content`` to ``(model_text, blocks)``.
 
     MCP is the one place a *typed* content model already exists in this codebase
-    -- ``mcp.types`` ships runtime-validated pydantic models -- but its image
-    shape (``{type:"image", data, mimeType}``) is not the OpenAI wire shape, so it
-    has to be translated rather than passed through.
+    -- ``mcp.types`` ships runtime-validated pydantic models -- and its image
+    shape (``{type:"image", data, mimeType}``) is the one pi carries, so the
+    bytes pass straight through.
 
     ``blocks`` is empty when the result is text-only, so a text MCP tool keeps
     returning a plain string exactly as before.
@@ -140,7 +137,7 @@ def blocks_from_mcp_content(content: list[Any]) -> tuple[str, list[ContentPart]]
     from mcp import types
 
     texts: list[str] = []
-    blocks: list[ContentPart] = []
+    blocks: list[dict[str, Any]] = []
     for block in content:
         if isinstance(block, types.TextContent):
             texts.append(block.text)
@@ -149,7 +146,7 @@ def blocks_from_mcp_content(content: list[Any]) -> tuple[str, list[ContentPart]]
             note = f"[image from MCP tool: {block.mimeType}]"
             texts.append(note)
             blocks.append(text_block(note))
-            blocks.append(image_block(to_data_uri_from_b64(block.data, block.mimeType)))
+            blocks.append(image_block(block.data, block.mimeType))
         else:
             # Audio, resource links, embedded resources. OpenDDE Harness has no input path
             # for these, but they must never be str()'d -- a pydantic repr would
@@ -160,13 +157,8 @@ def blocks_from_mcp_content(content: list[Any]) -> tuple[str, list[ContentPart]]
             texts.append(note)
             blocks.append(text_block(note))
 
-    has_image = any(is_image_part(b) for b in blocks)
+    has_image = any(is_image(b) for b in blocks)
     return "\n".join(texts), (blocks if has_image else [])
-
-
-def to_data_uri_from_b64(b64: str, mime: str) -> str:
-    """Wrap an already-base64 payload (MCP hands them over pre-encoded)."""
-    return f"data:{mime};base64,{b64}"
 
 
 def describe_image(path: Path, meta: dict[str, Any]) -> str:

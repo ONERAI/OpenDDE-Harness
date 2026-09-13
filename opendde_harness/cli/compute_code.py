@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import importlib.metadata
 import json
+import logging
 import os
 import re
 import shutil
@@ -17,10 +18,14 @@ from typing import Any, BinaryIO
 
 from rich.console import Console
 
+from opendde_harness.cli import _download
 from opendde_harness.cli._download import DownloadError, download_file, progress
 from opendde_harness.cli.compute_assets import shared_asset_plan, source_revisions
 from opendde_harness.cli.compute_environment import SUBPROCESS_TIMEOUT, environment_digest, load_environment
 from opendde_harness.plugin.protein_design.core.asset_paths import harness_weights_path
+
+#: Stdlib logging, not loguru: the compute container loads this module too.
+logger = logging.getLogger(__name__)
 
 MANIFEST = "runtime-code.json"
 EXTERNAL_MARKER = '"""Pinned upstream tool sources prepared by ddeharness compute prepare."""\n'
@@ -190,7 +195,7 @@ def _extract_source(
 
 def _download_source(name: str, revision: str, archive: Path, label: str, console: Console, position: str) -> None:
     url = f"https://codeload.github.com/{REPOSITORIES[name]}/tar.gz/{revision}"
-    print(f"Preparing tool sources{f' ({position})' if position else ''}: {label} from {url}", flush=True)
+    _download.report(f"Preparing tool sources{f' ({position})' if position else ''}: {label} from {url}")
     partial = archive.parent / f".{archive.name[: -len('.tar.gz')]}.part"
     try:
         download_file([url], partial, description=label, console=console, max_bytes=128 * 1024 * 1024, deadline_s=900)
@@ -244,7 +249,7 @@ def _prepare_upstream(
         archive = sources_dir / f"{name}-{revision}.tar.gz"
         cached = archive.is_file() and archive.stat().st_size > 0
         if cached:
-            print(f"Reusing cached source: {label}", flush=True)
+            _download.report(f"Reusing cached source: {label}")
         else:
             _download_source(name, revision, archive, label, console, position)
         try:
@@ -286,7 +291,7 @@ def _reuse_snapshot(name: str, revision: str, destination: Path, cache_root: Pat
         except OSError:
             shutil.rmtree(destination, ignore_errors=True)
             shutil.copytree(source, destination)
-        print(f"Reusing tool sources from {snapshot.name}: {name} ({revision[:12]})", flush=True)
+        _download.report(f"Reusing tool sources from {snapshot.name}: {name} ({revision[:12]})")
         return True
     return False
 
@@ -328,9 +333,9 @@ def prune_runtime_code(cache_root: Path, current: Path, *, keep: int = 2) -> lis
         try:
             shutil.rmtree(snapshot)
         except OSError as exc:
-            print(f"Could not remove stale runtime code: {snapshot} ({exc})", flush=True)
+            _download.report(f"Could not remove stale runtime code: {snapshot} ({exc})")
             continue
-        print(f"Removed stale runtime code: {snapshot}", flush=True)
+        logger.debug("removed stale runtime code: %s", snapshot)
         removed.append(snapshot)
     return removed
 
@@ -348,7 +353,7 @@ def prepare_runtime_code(
     destination = _code_destination(cache_root, identity)
     if destination.exists() or destination.is_symlink():
         verify_runtime_code(destination, identity)
-        print(f"Reusing verified runtime code: {destination}", flush=True)
+        logger.debug("reusing verified runtime code: %s", destination)
         return destination
     cache_root.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".prepare-", dir=cache_root) as temporary:
@@ -407,6 +412,6 @@ def prepare_runtime_code(
             if not destination.is_dir():
                 raise
             verify_runtime_code(destination, identity)
-    print(f"Runtime code ready: {destination}", flush=True)
+    _download.report(f"Runtime code ready: {destination}")
     prune_runtime_code(cache_root, destination)
     return destination

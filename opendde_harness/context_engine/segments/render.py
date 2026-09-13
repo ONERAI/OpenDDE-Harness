@@ -20,8 +20,9 @@ from loguru import logger
 
 from opendde_harness import __logo__
 from opendde_harness.plugin.active import active_registry
+from opendde_harness.providers.messages import image_block, text_block
 from opendde_harness.security.trust import wrap_untrusted
-from opendde_harness.utils.helpers import detect_image_mime, image_block
+from opendde_harness.utils.helpers import detect_image_mime
 
 # Ceilings on what one message may carry. ``prepare_image`` caps each image on
 # its own (1568 tokens, 4.5MB of base64); nothing capped the whole message, and a
@@ -37,11 +38,12 @@ _MAX_IMAGE_BYTES = 64 * 1024 * 1024
 # Enough for every magic number ``detect_image_mime`` looks for.
 _SNIFF_BYTES = 64
 # What to say when the model can reach the file itself. Named rather than
-# interpolated from ``describe_tool``: read_file is always registered, so unlike
+# interpolated from ``describe_tool``: ``read`` is always registered, so unlike
 # the description tool this hint is never a promise the model cannot keep.
-_READ_FILE_HINT = " — use the read_file tool to see it"
+_READ_FILE_HINT = " — use the read tool to see it"
 
 if TYPE_CHECKING:
+    from opendde_harness.context_engine.project_instructions import InstructionFile
     from opendde_harness.memory_engine.backend import Memory
 
 # L4 pillar layout — agent identity/behavior live under agent_memory;
@@ -56,21 +58,16 @@ BOOTSTRAP_FILES = [
 RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
 
 
-def _language_directive() -> str:
+def _language_directive(language: str) -> str:
     """A reply-language line for the system prompt, driven by ``config.language``.
 
     Empty for English (default behaviour unchanged); for Chinese it tells the
-    model to answer in Simplified Chinese unless the user writes otherwise.
-    Reads config lazily and never raises — a config problem must not break
-    prompt assembly.
+    model to answer in Simplified Chinese unless the user writes otherwise. The
+    value is the turn's, read once by the loop -- rendering never reads config,
+    so one turn cannot be rendered against another's settings (or pay for the
+    read three times over).
     """
-    try:
-        from opendde_harness.config.loader import load_config
-
-        lang = load_config().language
-    except Exception:
-        return ""
-    if lang == "zh":
+    if language == "zh":
         return (
             "\nAlways respond in Simplified Chinese (简体中文), "
             "unless the user explicitly writes in another language.\n"
@@ -78,57 +75,19 @@ def _language_directive() -> str:
     return ""
 
 
-def _resolved_model_id() -> str:
-    """The routed model id (gateway/provider prefix applied) from config.
-
-    Delegates the storage-to-wire conversion to ``providers.wire`` instead
-    of constructing a provider — that would import litellm and mutate env
-    vars during prompt assembly. Reads config lazily and never raises;
-    ``""`` means "unknown" and the identity block skips the line.
-    """
-    try:
-        from opendde_harness.config.loader import load_config
-        from opendde_harness.providers.registry import find_by_name, find_gateway
-        from opendde_harness.providers.wire import wire_model
-
-        config = load_config()
-        model = config.agents.defaults.model
-        provider_name = config.get_provider_name(model)
-        gateway = find_gateway(
-            provider_name,
-            config.get_api_key(model),
-            config.get_api_base(model),
-        )
-        # spec mirrors the non-LiteLLM call sites (codex / azure strip their
-        # own prefix on the wire); a gateway still decides alone when set.
-        return wire_model(model, spec=find_by_name(provider_name), gateway=gateway)
-    except Exception:
-        return ""
-
-
-def _long_term_memory_enabled() -> bool:
-    """Whether the workspace has a long-term memory backend behind it.
-
-    Mirrors ``maybe_build_memory_backend``: a ``None`` backend means no
-    profile or episodic file is ever written, so the workspace block must
-    not point the model at paths that will not exist. Reads config lazily
-    and never raises -- an unreadable config drops the two lines rather
-    than breaking prompt assembly.
-    """
-    try:
-        from opendde_harness.config.loader import load_config
-
-        return load_config().memory.backend is not None
-    except Exception:
-        return False
-
-
-def identity_text(workspace: Path, model: str | None = None) -> str:
+def identity_text(
+    workspace: Path,
+    model: str | None = None,
+    *,
+    language: str = "en",
+    long_term_memory: bool = False,
+) -> str:
     """Segment 1 — the core identity / runtime block.
 
-    ``model`` is the resolved routed model id (full ``provider/model``
-    form) told to the model so it never guesses its own identity from
-    pretraining. ``None`` (the default) resolves it lazily from config.
+    ``model`` is the resolved routed model id (full ``provider/model`` form)
+    told to the model so it never guesses its own identity from pretraining;
+    ``None`` omits the line. ``language`` and ``long_term_memory`` are the
+    turn's, passed in rather than read from config here.
 
     The self-description line and the product-scope blocks come from
     plugin ``prompt_segments``; the host owns only the runtime frame.
@@ -136,8 +95,7 @@ def identity_text(workspace: Path, model: str | None = None) -> str:
     workspace_path = str(workspace.expanduser().resolve())
     system = platform.system()
     runtime = f"{'macOS' if system == 'Darwin' else system} {platform.machine()}, Python {platform.python_version()}"
-    resolved_model = model if model is not None else _resolved_model_id()
-    model_line = f"\nYou are running on model: {resolved_model}." if resolved_model else ""
+    model_line = f"\nYou are running on model: {model}." if model else ""
 
     if system == "Windows":
         platform_policy = """## Platform Policy (Windows)
@@ -155,7 +113,7 @@ def identity_text(workspace: Path, model: str | None = None) -> str:
         f"Your workspace is at: {workspace_path}",
         f"- Custom skills: {workspace_path}/skills/{{skill-name}}/SKILL.md",
     ]
-    if _long_term_memory_enabled():
+    if long_term_memory:
         workspace_lines += [
             f"- User profile: {workspace_path}/user_memory/profile/user.md",
             f"- Episodic log: {workspace_path}/user_memory/episodic/episodes.md "
@@ -170,7 +128,7 @@ def identity_text(workspace: Path, model: str | None = None) -> str:
     return f"""# OpenDDE Harness {__logo__}
 
 {identity}
-{_language_directive()}
+{_language_directive(language)}
 {scope}## Runtime
 {runtime}{model_line}
 
@@ -200,6 +158,39 @@ def load_bootstrap_files(workspace: Path, bootstrap_files: list[str] | None = No
             heading = Path(filename).name
             parts.append(f"## {heading}\n\n{content}")
     return "\n\n".join(parts) if parts else ""
+
+
+def project_instruction_files(
+    workspace: Path,
+    cwd: Path | None = None,
+    session_key: str = "",
+) -> "list[InstructionFile]":
+    """Segment 3 — the AGENTS.md / ODH.md files in scope, outermost first.
+
+    A workspace that lists one of these among its own bootstrap files has
+    already had it rendered by segment 2, so it is excluded here rather than
+    sent twice.
+
+    ``session_key`` is which conversation is asking: it owns the on/off state
+    and the record of what each file held when this conversation first saw it.
+    """
+    from opendde_harness.context_engine import project_instructions
+
+    already = {workspace / name for name in BOOTSTRAP_FILES}
+
+    return project_instructions.current(cwd, session_key=session_key, already_loaded=already)
+
+
+def render_project_instructions(files: "list[InstructionFile]") -> str:
+    """Segment 3's text, shared by the request path and the estimator.
+
+    Deliberately *not* passed through :func:`wrap_untrusted`: an untrusted
+    fence tells the model that what follows is data somebody else produced and
+    must not be obeyed, which is the opposite of what these files are.
+    """
+    from opendde_harness.context_engine import project_instructions
+
+    return project_instructions.render(files)
 
 
 def render_recalled_memory(memories: "list[Memory] | None") -> str:
@@ -277,9 +268,9 @@ def build_user_content(
 ) -> str | list[dict[str, Any]]:
     """User message content with attachments.
 
-    Images are inlined as base64 ``image_url`` blocks so a vision-capable model
+    Images are inlined as base64 pi ``image`` blocks so a vision-capable model
     sees them directly, downscaled and recompressed first by the same
-    preprocessing ``read_file`` uses: a phone photo is several megabytes and
+    preprocessing the ``read`` tool uses: a phone photo is several megabytes and
     thousands of patch tokens, and every target either refuses it or downsizes it
     server-side and bills for the original. Returns a plain ``str`` when there
     are no image blocks.
@@ -332,7 +323,7 @@ def build_user_content(
                 is_image = bool(mime and mime.startswith("image/"))
                 if not is_image:
                     # No fallback hint when there is no description tool. The
-                    # obvious candidate, read_file, decodes text and images and
+                    # obvious candidate, ``read``, decodes text and images and
                     # errors on a real PDF ("'utf-8' codec can't decode byte
                     # 0xff"), so naming it here would just be a different
                     # instruction the model cannot follow.
@@ -347,7 +338,7 @@ def build_user_content(
                     notes.append(f"[Image: {p.name} (path: {p}) — you cannot see images directly{hint}]")
                     continue
                 if size > _MAX_IMAGE_BYTES:
-                    # Past the blind check, so this model can see: read_file is
+                    # Past the blind check, so this model can see: ``read`` is
                     # the tool that would hand it the picture, and it downscales
                     # rather than refusing on size.
                     notes.append(
@@ -355,7 +346,7 @@ def build_user_content(
                     )
                     continue
                 if len(images) >= _MAX_INLINE_IMAGES or inlined_bytes >= _MAX_INLINE_BASE64_BYTES:
-                    # ``read_file``, not the description tool: this model can
+                    # ``read``, not the description tool: this model can
                     # see, so the useful next step is to fetch the picture
                     # itself in a later turn.
                     notes.append(
@@ -373,13 +364,13 @@ def build_user_content(
         block = _inline_image(raw, mime, p, notes)
         if block is not None:
             images.append(block)
-            inlined_bytes += len(block.get("image_url", {}).get("url", ""))
+            inlined_bytes += len(block["data"])
     body = text
     if notes:
         body = (f"{text}\n\n" if text else "") + "\n".join(notes)
     if not images:
         return body
-    return images + [{"type": "text", "text": body}]
+    return [*images, text_block(body)]
 
 
 def _inline_image(raw: bytes, mime: str, path: Path, notes: list[str]) -> dict[str, Any] | None:
@@ -402,6 +393,5 @@ def _inline_image(raw: bytes, mime: str, path: Path, notes: list[str]) -> dict[s
     detail = f"{meta['width']}x{meta['height']}px"
     if meta.get("resized"):
         detail += f", downscaled from {meta['original_width']}x{meta['original_height']}"
-    notes.append(f"[Image: {path.name} (path: {path}) | {detail} — re-read it with read_file if you need another look]")
-    b64 = base64.b64encode(payload).decode()
-    return image_block(f"data:{out_mime};base64,{b64}")
+    notes.append(f"[Image: {path.name} (path: {path}) | {detail} — re-read it with read if you need another look]")
+    return image_block(base64.b64encode(payload).decode(), out_mime)

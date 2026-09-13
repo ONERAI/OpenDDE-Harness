@@ -1,17 +1,12 @@
-"""SkillForge primitives — local-pool storage, retrieval, and feedback types.
+"""SkillForge primitives — the local pool: storage, retrieval, shared types.
 
-Phase B deletions: ``Retrieval`` (local PyTorch matmul) + ``Reranker`` +
-``SqliteStore`` + ``SqliteSkillRegistry`` + sync + ``skill_library/``
-offline tooling were removed. Mass-library retrieval is now the remote
-:class:`MassSkillSource` HTTP client under
-:mod:`opendde_harness.memory_engine.skill_forge`. The ``SkillService``
-aggregate + its ``select`` / LLM-gate / query-rewriter retrieval path
-were retired into :class:`LocalSkillCatalog` (under ``skill_forge``)
-once :class:`SkillForgeRouter` became the live retrieval path. The no-op
-``SkillEvolver`` seam was removed once skill feedback moved to the
-:class:`MemoryBackend` plugin (``backend.feedback`` / ``backend.store``).
+File access, rendering and the blocklist live one level up, in
+:class:`LocalSkillCatalog` under :mod:`opendde_harness.memory_engine.skill_forge`;
+fusion across sources lives in :class:`SkillForgeRouter` beside it. Skill
+feedback belongs to the :class:`MemoryBackend` plugin
+(``backend.feedback`` / ``backend.store``), not here.
 
-What remains here is the LOCAL-pool primitive layer:
+What this package is, the LOCAL-pool primitive layer:
 
 - :class:`SkillRegistry` — workspace + builtin SKILL.md scanner
 - :class:`LocalPool` — BM25 over the registry

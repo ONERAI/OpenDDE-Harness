@@ -6,7 +6,7 @@ Per-session subscription registry with a coalesce loop:
 - Each subscription owns a bounded asyncio.Queue (capacity 512)
 - 16ms coalesce loop merges consecutive `token.delta` events into one frame
 - A full queue briefly backpressures the producer instead of dropping a burst
-- A persistently stalled queue emits error(code=-32016) and closes
+- A persistently stalled queue closes, then emits error(code=-32016) best-effort
 - Non-token events pass through preserving order
 
 Owned by the RPC server; passed to `register_turn_methods(dispatcher, emitter)`.
@@ -25,6 +25,15 @@ from loguru import logger
 COALESCE_WINDOW_S = 0.016
 QUEUE_CAPACITY = 512
 QUEUE_PUT_TIMEOUT_S = 1.0
+
+# How long the overflow notice may spend trying to reach a peer that has
+# already stopped reading.
+#
+# The subscription is retired before this is sent, so the notice is the last
+# courtesy rather than part of the close. Writes queue behind the server's
+# write lock and a stalled peer never releases it, so this wait is bounded and
+# its failure is ignored: the subscription is gone either way.
+OVERFLOW_NOTIFY_TIMEOUT_S = 1.0
 
 
 @dataclass
@@ -174,7 +183,19 @@ class SubscriptionEmitter:
             self._mark_closed(sub)
 
     async def _close_overflow(self, sub: Subscription) -> None:
-        """Emit -32016 overflow notification, then close the subscription.
+        """Close the overflowing subscription, then try to say why.
+
+        The close comes first, and it must: the queue is full because the
+        coalescer is stuck in a write, and that write holds the server's write
+        lock. Sending the notice before retiring the subscription therefore
+        waited for the lock the stalled subscription itself was holding —
+        nothing closed, the producer stayed blocked in ``emit``, and every
+        other RPC write queued behind the same lock. ``_mark_closed`` cancels
+        the coalesce task, which unwinds its ``async with`` and frees the lock.
+
+        The notice is then best-effort under a bounded wait. A peer that has
+        stopped reading will not receive it, and the subscription is already
+        gone.
 
         Code -32016 from the extension range (-32016..-32049). Originally
         spec'd as -32010 in early drafts — collides with the live
@@ -182,31 +203,33 @@ class SubscriptionEmitter:
         """
         if sub.closed:
             return
+        self._mark_closed(sub)
         try:
-            await self._send_frame(
-                {
-                    "jsonrpc": "2.0",
-                    "method": "event",
-                    "params": {
-                        "subscription_id": sub.sub_id,
-                        "event": {
-                            "type": "error",
-                            "payload": {
-                                "code": -32016,
-                                "message": "subscription_capacity_exceeded",
-                                "reason": "internal",
+            await asyncio.wait_for(
+                self._send_frame(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "event",
+                        "params": {
+                            "subscription_id": sub.sub_id,
+                            "event": {
+                                "type": "error",
+                                "payload": {
+                                    "code": -32016,
+                                    "message": "subscription_capacity_exceeded",
+                                    "reason": "internal",
+                                },
                             },
                         },
-                    },
-                }
+                    }
+                ),
+                OVERFLOW_NOTIFY_TIMEOUT_S,
             )
         except Exception:
-            logger.exception(
-                "failed to send overflow notification sub_id={}",
+            logger.warning(
+                "overflow notification did not reach the peer sub_id={}; subscription already closed",
                 sub.sub_id,
             )
-        finally:
-            self._mark_closed(sub)
 
 
 def _merge_consecutive_token_deltas(
@@ -243,6 +266,7 @@ def _merge_consecutive_token_deltas(
 
 __all__ = [
     "COALESCE_WINDOW_S",
+    "OVERFLOW_NOTIFY_TIMEOUT_S",
     "QUEUE_CAPACITY",
     "QUEUE_PUT_TIMEOUT_S",
     "SendFrame",

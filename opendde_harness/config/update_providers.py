@@ -1,220 +1,135 @@
-"""Atomic operations for LLM provider config sections.
+"""Atomic operations for the ``providers`` section of ``config.json``.
 
-This module is the ONLY write path for provider configuration. All entry
-points (CLI commands, future wizard, future REPL slash) must call
-functions defined here. Direct ``load_config`` / ``save_config`` on the
-providers section is forbidden -- see plan rule.
+This module is the ONLY write path for provider configuration. All entry points
+(CLI commands, the wizard, the TUI's RPC) must call functions defined here.
+Direct ``load_config`` / ``save_config`` on the providers section is forbidden.
 
-OAuth providers have a separate auth path via
-``provider_commands._LOGIN_HANDLERS`` and keep their credentials in files under
-``~/.opendde_harness/oauth``, not in ``config.json``. ``set_provider_fields`` refuses to
-write ``api_key`` for those providers; callers must invoke ``provider login`` for
-that. ``reset_provider`` handles both cases: schema-default rewrite for config
-fields, plus deleting the credential files when the provider has
-``is_oauth=True``.
+The section is pi's ``models.json`` shape: a map from pi provider id to a
+provider declaration, and one entry is there because somebody wrote it. That
+makes every read here an exact dictionary lookup -- there are no aliases, no
+camelCase-versus-snake_case spellings and no always-present empty blocks, which
+is what the reconciliation this file used to carry was for.
+
+A provider whose credential is a sign-in has a separate auth path --
+``provider login``, which runs pi-ai's own flow through the model service -- and
+its grant lives in the service's credential store, not in ``config.json``.
+``set_provider_fields`` refuses to write ``apiKey`` for those unless the same
+write turns the sign-in off, which is how a key replaces a sign-in.
+``reset_provider`` handles both: it signs the provider out when the entry named
+a sign-in, then deletes the entry.
 """
 
 from __future__ import annotations
 
-import os
+import asyncio
 from pathlib import Path
 from typing import Any
 
-import httpx
 from loguru import logger
-from pydantic import BaseModel, ValidationError
-from pydantic.alias_generators import to_camel
+from pydantic import ValidationError
 
 from opendde_harness.config._fields import (
     coerce_value,
     flatten_fields,
     flatten_instance,
-    is_model_class,
-    is_secret_field,
     set_nested,
-    unwrap_optional,
     walk_nested_path,
     write_json_atomic,
 )
 from opendde_harness.config.loader import get_config_path, read_raw_or_raise
-from opendde_harness.config.schema import ProviderConfig, ProviderEndpoint, ProvidersConfig
-from opendde_harness.providers.endpoints import provider_endpoints
-from opendde_harness.providers.registry import (
-    CRED_LOCAL,
-    ProviderSpec,
-    canonical_provider_name,
-    credential_kind,
-    endpoints_unsupported_reason,
-    find_by_name,
-    names_same_provider,
-    normalize_provider_name,
-)
-
-
-def _overlay(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
-    """Merge two spellings of one section, letting a set value beat an unset one.
-
-    Blindly preferring the later spelling let an empty `apiKey` from a
-    placeholder section erase the key the user had actually written under the
-    other spelling.
-    """
-    merged = dict(base)
-    merged.update({k: v for k, v in overlay.items() if v not in ("", None, [], {})})
-    return merged
-
+from opendde_harness.config.schema import ModelEntry, ProviderEntry, ProvidersConfig
+from opendde_harness.providers import model_id, pi_ids
 
 # ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
 
 
-def _provider_names() -> list[str]:
-    """Return provider field names declared on ``ProvidersConfig``."""
-    out: list[str] = []
-    for fname, finfo in ProvidersConfig.model_fields.items():
-        ann = unwrap_optional(finfo.annotation)
-        if is_model_class(ann):
-            out.append(fname)
-    return out
+def configured_provider_names(data: dict[str, Any]) -> list[str]:
+    """Every provider this config holds an entry for, in the file's own order.
 
-
-def _listable_provider_names(data: dict[str, Any]) -> list[str]:
-    """Declared providers, plus any others the config actually holds.
-
-    A vendor configured by name alone would otherwise be invisible to callers of
-    ``list_providers`` -- ``provider list`` and the startup gate that decides
-    whether the wizard has to run -- while the runtime routes to it happily.
-    Reporting it as unconfigured is what sends a user who has set it up straight
-    back into a wizard that declines to configure it.
-
+    There is no set of "declared" providers to list beside them any more: pi's
+    built-in ids are what the wizard offers (:data:`pi_ids.BUILTIN`), and the
+    config holds the ones that were chosen.
     """
-    declared = _provider_names()
-    # Sections are stored camelCase ("azureOpenai"), so compare on the snake form
-    # or every declared provider looks like an unknown extra.
-    known = {n for name in declared for n in (name, to_camel(name))}
-    stored = data.get("providers") or {}
-    extra = [
-        name
-        for name, section in stored.items()
-        if isinstance(section, dict)
-        and name not in known
-        and canonical_provider_name(name) not in known
-        and normalize_provider_name(name) not in known
-    ]
-    return declared + sorted(extra)
+    stored = data.get("providers")
+    if not isinstance(stored, dict):
+        return []
+    return [name for name, entry in stored.items() if isinstance(entry, dict)]
 
 
-def _litellm_knows(name: str, *, authoritative: bool = True) -> bool | None:
-    """Whether LiteLLM speaks to this vendor, or None when it cannot be asked.
+def _refuse_unwritable(provider: str) -> None:
+    """Stop before an entry is written for a name that can never be one.
 
-    Three states, not two. Answering False when LiteLLM is merely unavailable
-    would tell the user their provider name is wrong when it may well be right.
-    Raising instead was worse: only one of the five call sites caught it, so the
-    rest turned an unavailable dependency into a bare traceback. None makes
-    every caller confront the third case at the point it has to decide.
-
-    A snapshot of LiteLLM's names answers the common case for free. Importing
-    LiteLLM costs about two seconds, which a command that is about to call a
-    model pays anyway and a command that only reports configuration should not.
-    So ``authoritative=False`` stops at the snapshot -- suitable where a wrong
-    answer means one row missing from a report -- while the default falls
-    through to LiteLLM itself when the snapshot has no entry, so a vendor added
-    in a newer LiteLLM than the snapshot can still be configured.
-
-    Comparison is normalized on both sides: LiteLLM hyphenates a few vendors
-    ("nano-gpt") while config sections and model-id prefixes are underscored, so
-    an exact match rejects the very spelling this function tells users to write.
+    A provider this project removed is gone whatever is written for it, and a
+    string that is not a provider id at all cannot be a key. A near-miss for a
+    pi id is deliberately *not* refused here: it is a perfectly good name for a
+    provider this config declares, and the one case where it is a mistake --
+    naming it with no address -- is refused by :func:`_commit` with the
+    schema's own sentence, which already says which id was probably meant.
     """
-    from opendde_harness.providers.litellm_provider_names import LITELLM_PROVIDER_NAMES
+    reason = pi_ids.removed_message(provider)
+    if reason:
+        raise KeyError(f"'{provider}' is no longer supported. {reason}")
+    if not provider or "/" in provider or provider != provider.strip():
+        raise KeyError(f"'{provider}' is not a provider id: a pi provider id carries no slash and no spaces.")
 
-    normalized = normalize_provider_name(name)
-    if normalized in {normalize_provider_name(n) for n in LITELLM_PROVIDER_NAMES}:
-        return True
-    if not authoritative:
-        return False
 
-    from opendde_harness.providers.litellm_setup import import_litellm
+def _entry_dict(data: dict[str, Any], provider: str) -> dict[str, Any]:
+    """This provider's entry as raw JSON, or ``{}`` when there is none."""
+    stored = data.get("providers")
+    entry = stored.get(provider) if isinstance(stored, dict) else None
+    return dict(entry) if isinstance(entry, dict) else {}
 
+
+def _entry(data: dict[str, Any], provider: str) -> ProviderEntry:
+    """This provider's entry, parsed; a fresh one when it is absent or broken."""
     try:
-        litellm = import_litellm()
-        providers = litellm.provider_list
-    except Exception:
-        return None
-    known = {normalize_provider_name(str(getattr(p, "value", p))) for p in providers}
-    return normalized in known
+        return ProviderEntry.model_validate(_entry_dict(data, provider))
+    except ValidationError:
+        return ProviderEntry()
 
 
-def _provider_schema_cls(name: str, *, authoritative: bool = True) -> type[BaseModel]:
-    """Look up the Pydantic class for a provider, e.g. ``'gemini' -> GeminiProviderConfig``.
+def _dump(entry: ProviderEntry) -> dict[str, Any]:
+    """One entry as the file holds it: pi's spelling, and only what was said.
 
-    ``authoritative=False`` keeps the lookup off the LiteLLM import path; see
-    ``_litellm_knows``. Only reporting may pass it.
+    ``exclude_defaults`` because this is the shape the user reads and edits.
+    Writing every field a fresh entry carries put ``"apiKey": ""`` and
+    ``"models": []`` under a provider that signs in, which is the always-present
+    empty block the previous shape was criticised for, one level down.
     """
-    field = ProvidersConfig.model_fields.get(name)
-    if field is None:
-        # A vendor with no spec of ours is still configurable when LiteLLM knows
-        # it -- the plain section is all it needs. Anything LiteLLM has never
-        # heard of is a typo, and saying so beats writing a section that will
-        # never be read.
-        if _litellm_knows(name, authoritative=authoritative) is not False:
-            # Includes "cannot say": refusing a name we failed to verify would
-            # block a valid provider, while accepting one at worst writes a
-            # section nothing reads. The lesser harm is to accept.
-            return ProviderConfig
-        raise KeyError(
-            f"Unknown provider '{name}'. Available providers: {sorted(_provider_names())}. "
-            "Many more vendors are supported -- try the name the vendor uses for itself."
-        )
-    ann = unwrap_optional(field.annotation)
-    if not is_model_class(ann):
-        raise KeyError(f"'{name}' is not a provider section. Available providers: {sorted(_provider_names())}")
-    return ann
+    return entry.model_dump(by_alias=True, exclude_defaults=True)
 
 
-def _provider_spec(name: str) -> ProviderSpec | None:
-    """Look up ``ProviderSpec``, or None for a vendor we carry no spec for."""
-    return find_by_name(name)
+def _commit(data: dict[str, Any], provider: str, entry: ProviderEntry, path: Path) -> None:
+    """Write one entry, having checked the whole section still loads.
 
-
-def _provider_aliases(name: str) -> tuple[str, ...]:
-    """Former names of ``name`` as they may still appear in config.json."""
-    spec = find_by_name(name)
-    return spec.name_aliases if spec else ()
-
-
-def _raw_section(data: dict[str, Any], name: str) -> dict[str, Any]:
-    """Read a provider's raw section, folding in any pre-rename section.
-
-    Both names can hold half the settings; taking whichever is non-empty would
-    drop the other's fields on the next write. Current name wins per field.
-    """
-    providers = data.get("providers") or {}
-    section: dict[str, Any] = {}
-    # Spelling-insensitive, exactly like `ProvidersConfig.get`: a section written
-    # as LiteLLM spells it ("nano-gpt") or as this model serializes it
-    # ("nanoGpt") is the same section, and the management surface reading only
-    # the underscored key is how a key the runtime happily uses became
-    # invisible to `provider get/set`.
-    for want in (*_provider_aliases(name), name):
-        for key, older in providers.items():
-            if names_same_provider(key, want) and isinstance(older, dict):
-                section = _overlay(section, older)
-    return section
-
-
-def _write_raw_section(data: dict[str, Any], name: str, section: dict[str, Any]) -> None:
-    """Write a provider's section under its current name, retiring older keys.
-
-    Retires every key that names the same provider, not just declared aliases:
-    `_raw_section` folds spellings together on read, so leaving the old spelling
-    behind would produce two sections for one provider -- the next read merges
-    them and the loser's fields reappear after being removed.
+    The section, not just the entry: a provider pi does not ship needs an
+    address and a protocol, and that is a rule about the key an entry is filed
+    under, which only :class:`ProvidersConfig` can see. Validating the entry
+    alone let a write succeed and the next ``load_config`` refuse the file --
+    the one failure a single write path exists to make impossible.
     """
     providers = data.setdefault("providers", {})
-    wanted = (*_provider_aliases(name), name)
-    for key in [k for k in providers if any(names_same_provider(k, w) for w in wanted)]:
-        providers.pop(key, None)
-    providers[name] = section
+    providers[provider] = _dump(entry)
+    try:
+        ProvidersConfig.model_validate(providers)
+    except ValidationError as exc:
+        providers.pop(provider, None)
+        raise ValueError(_first_message(exc)) from exc
+    write_json_atomic(path, data)
+
+
+def _first_message(exc: ValidationError) -> str:
+    """The first error's own sentence, without the input it was raised about.
+
+    Pydantic's string form quotes the rejected value, and the rejected value
+    here is a providers section holding the user's keys.
+    """
+    for error in exc.errors():
+        message = str(error.get("msg") or "")
+        return message.removeprefix("Value error, ")
+    return "the providers section is not valid"
 
 
 def _redact(value: Any) -> Any:
@@ -232,129 +147,61 @@ def _redact(value: Any) -> Any:
 def _redact_headers(headers: dict[str, str] | None) -> dict[str, str] | None:
     """Redact each header's value, keeping the key names visible.
 
-    ``extra_headers`` can carry a secret (an auth header some gateways need
-    alongside the key) -- masking the whole dict as one ``****set****`` string
-    would also hide which headers are configured, so each value is redacted on
-    its own, the same rule every other secret field follows.
+    ``headers`` can carry a secret (an auth header some gateways need alongside
+    the key) -- masking the whole dict as one ``****set****`` string would also
+    hide which headers are configured, so each value is redacted on its own, the
+    same rule every other secret field follows.
     """
     if headers is None:
         return None
     return {key: _redact(value) for key, value in headers.items()}
 
 
-def _redact_nested_model(instance: BaseModel) -> BaseModel:
-    """Redact this model's own secret fields, by the same rule as the flat ones.
-
-    ``_flatten_instance`` only recurses into ``BaseModel`` fields, not into a
-    ``list[BaseModel]`` field like ``ProviderConfig.endpoints`` -- so a caller
-    that walks ``specs`` (field-name keyed) never sees a per-endpoint field and
-    can't redact it. This is applied to each list element instead.
-
-    ``extra_headers`` gets its own rule rather than ``_is_secret_field``'s: it
-    is a dict of values, not one, and masking the whole thing would also hide
-    which headers are configured -- see ``_redact_headers``.
-    """
-    updates = {
-        fname: _redact(getattr(instance, fname))
-        for fname, finfo in type(instance).model_fields.items()
-        if is_secret_field(fname, finfo)
-    }
-    if "extra_headers" in type(instance).model_fields:
-        updates["extra_headers"] = _redact_headers(getattr(instance, "extra_headers", None))
-    return instance.model_copy(update=updates) if updates else instance
-
-
-#: Copilot's credentials are two files LiteLLM owns, not one: the device-flow
-#: access token and the short-lived API key it is exchanged for.
-_COPILOT_TOKEN_FILES = ("access-token", "api-key.json")
-
-
-def _oauth_token_path(provider_name: str) -> Path:
-    """Resolve where this provider's credential lives under OpenDDE Harness's own directory.
-
-    Every family is asked of the module that writes it, so this cannot drift from
-    what a login leaves behind. Deriving it a second time here is what wrote
-    ``openai_codex`` under one name and read it under another -- and each family
-    has a way to override its directory, so a second derivation is wrong exactly
-    when a user has taken one.
-    """
-    from opendde_harness.providers.auth import credential_files
-
-    return credential_files(provider_name)[0]
-
-
-def _copilot_token_dir() -> Path:
-    """The directory LiteLLM's Copilot authenticator reads and writes.
-
-    ``import_litellm`` points ``GITHUB_COPILOT_TOKEN_DIR`` at OpenDDE Harness's own
-    directory before LiteLLM is imported; reading the same variable here keeps
-    one answer even when a user has set it themselves.
-    """
-    from opendde_harness.config.paths import get_oauth_dir
-
-    token_dir = os.environ.get("GITHUB_COPILOT_TOKEN_DIR")
-    return Path(token_dir).expanduser() if token_dir else get_oauth_dir() / "github_copilot"
-
-
-def _oauth_credentials_present(provider_name: str) -> bool:
-    """Are this provider's credentials on disk and readable as credentials?
-
-    A file at the right path is not evidence: a truncated write passes
-    ``exists()`` and fails on the first request. What each family's own reader
-    accepts is the answer.
-
-    Expiry is not part of it -- an expired token with a refresh token is usable.
-    Nor is acceptance, which takes a request: that is ``provider test``.
-    """
-    if provider_name in {"minimax_global", "minimax_cn"}:
-        from opendde_harness.providers.minimax_oauth import load_token
-
-        return load_token("global" if provider_name == "minimax_global" else "cn") is not None
-
-    if provider_name == "openai_codex":
-        from opendde_harness.providers.chatgpt_token import stored_credentials
-
-        return stored_credentials() is not None
-
-    if provider_name == "github_copilot":
-        # LiteLLM stores the device token as bare text, so "parses" is only
-        # "holds something".
-        try:
-            return bool(_oauth_token_path(provider_name).read_text(encoding="utf-8").strip())
-        except OSError:
-            return False
-
-    return _oauth_token_path(provider_name).exists()
-
-
-def oauth_credential_files(provider_name: str) -> list[Path]:
-    """Every file a sign-in for this provider can leave behind.
-
-    Two callers, one list. Disconnect has to clear all of them -- Copilot's API key
-    outlives the access token it came from, so deleting the token alone leaves a
-    working credential -- and a sign-in has to restrict all of them, for the same
-    reason in the other direction.
-    """
-    from opendde_harness.providers.auth import credential_files
-
-    return credential_files(provider_name)
-
-
-# ---------------------------------------------------------------------------
-# Public API: reflection
-# ---------------------------------------------------------------------------
-
-
-def provider_field_specs(name: str) -> dict[str, dict[str, Any]]:
-    """Reflect a provider schema into a flat ``path -> spec`` map.
+def provider_field_specs(provider: str = "") -> dict[str, dict[str, Any]]:
+    """Reflect the provider entry schema into a flat ``path -> spec`` map.
 
     Each entry has keys: ``type``, ``default``, ``is_secret``, ``description``.
-    Used by CLI parsers, the ``provider show`` command, and ``get_provider_config``
-    to know which fields exist and which to redact.
+    Used by CLI parsers, the ``provider show`` command, and
+    :func:`get_provider_config` to know which fields exist and which to redact.
+    One schema for every provider now, so the name is accepted and ignored.
     """
-    name = canonical_provider_name(name)
-    cls = _provider_schema_cls(name)
-    return flatten_fields(cls)
+    del provider
+    return flatten_fields(ProviderEntry)
+
+
+def unread_fields(provider: str) -> dict[str, str]:
+    """Fields an entry may carry that this provider's route never reads.
+
+    One schema serves every provider, so an entry offers fields that mean
+    nothing for the way this particular one is reached. Reflecting the schema
+    alone offered ``--api-key``, ``--base-url`` and ``--api`` for a provider that
+    signs in -- which refuses the first, ignores the second by design so a
+    configured address cannot redirect an account's token, and refuses the third
+    because pi owns its protocol. For a built-in the last two are pi's to state,
+    not ours.
+
+    Keyed by field, valued by why.
+    """
+    entry = ProviderEntry()
+    try:
+        entry = _entry(read_raw_or_raise(get_config_path()), provider)
+    except Exception:  # noqa: BLE001 - a report path; an unreadable config just has no entry
+        pass
+    from opendde_harness.providers.auth import CRED_OAUTH, credential_kind
+
+    if credential_kind(provider, entry) == CRED_OAUTH:
+        sign_in = f"ddeharness provider login {provider}"
+        return {
+            "api_key": f"this provider signs in -- run `{sign_in}`",
+            "base_url": "this route's address is fixed by the grant",
+            "api": "this route speaks its own protocol",
+        }
+    if pi_ids.is_builtin(provider):
+        return {
+            "base_url": f"pi carries {provider}'s address",
+            "api": f"pi carries {provider}'s protocol",
+        }
+    return {}
 
 
 # ---------------------------------------------------------------------------
@@ -363,135 +210,107 @@ def provider_field_specs(name: str) -> dict[str, dict[str, Any]]:
 
 
 def list_providers(*, config_path: Path | None = None) -> list[dict[str, Any]]:
-    """Reflect every provider declared on ``ProvidersConfig`` + current status.
+    """Every provider this config configures, with its current status.
 
-    Returns one dict per provider:
+    Returns one dict per entry:
 
-    - ``name``               registry / config field name
-    - ``display_name``       human-readable label from the registry
-    - ``is_oauth`` / ``is_local`` / ``is_gateway``  registry flags
-    - ``configured``         True iff key set (or token file present for OAuth,
-                             or api_base set for local)
-    - ``api_key_redacted``   ``****set****`` / ``(empty)`` / ``(not needed for local)``
-    - ``api_base``           current value (or ``None`` if untouched)
+    - ``name``               the pi provider id it is filed under
+    - ``display_name``       the entry's own name, else pi's, else the id
+    - ``is_oauth``           the entry names a sign-in
+    - ``is_builtin``         pi ships this provider
+    - ``configured``         :func:`providers.auth.credential_status` says yes
+    - ``credential_state``   what pi's store holds for a sign-in ("oauth", or
+                             "invalid" when the file is present and unreadable),
+                             empty for every other kind
+    - ``api_key_redacted``   ``****set****`` / ``(empty)`` / ``OAuth token`` / ...
+    - ``base_url``           the declared address, or None
     """
+    from opendde_harness.providers.auth import credential_status
+    from opendde_harness.providers.pi_credentials import KIND_INVALID, stored_kind
+
     path = config_path or get_config_path()
     data = read_raw_or_raise(path)
 
     out: list[dict[str, Any]] = []
-    for fname in _listable_provider_names(data):
-        try:
-            # Reporting: a stale snapshot costs one row here, whereas importing
-            # LiteLLM to render a table costs every caller two seconds.
-            cls = _provider_schema_cls(fname, authoritative=False)
-        except (KeyError, RuntimeError):
-            # A key we cannot resolve to a provider is a typo, and listing is a
-            # read-only report: skipping it keeps `provider list` and the startup
-            # gate working, where raising would leave the user unable to start
-            # OpenDDE Harness or even reach the wizard that would fix the file. RuntimeError
-            # covers "LiteLLM unavailable, so we cannot say" -- reporting is not
-            # the place to fail on that either.
-            continue
-        # Through _raw_section, so a provider still stored under its pre-rename
-        # key reads as configured here and not just at runtime.
-        section = _raw_section(data, fname)
-        try:
-            instance = cls.model_validate(section)
-        except ValidationError:
-            instance = cls()
+    for provider in configured_provider_names(data):
+        entry = _entry(data, provider)
+        is_oauth = entry.login == "oauth"
+        status = credential_status(provider, entry, include_external=True)
 
-        spec = find_by_name(fname)
-        is_oauth = bool(spec and spec.is_oauth)
-        is_local = bool(spec and spec.is_local)
-        is_gateway = bool(spec and spec.is_gateway)
-        display_name = spec.label if spec else fname.replace("_", " ").title()
-
-        api_key = getattr(instance, "api_key", "") or ""
-        api_base = getattr(instance, "api_base", None)
-        api_key_list = list(getattr(instance, "api_key_list", []) or [])
-        endpoints = list(getattr(instance, "endpoints", []) or [])
-
-        # One rule for every gate: this used to accept a Gemini section holding
-        # only `api_key_list` that routing then skipped and startup refused.
-        from opendde_harness.providers.auth import credential_status
-
-        configured = credential_status(fname, instance, spec=spec, include_external=True).ok
+        # "Signed out" and "the file is there and unreadable" are different
+        # answers, and reporting the second as the first told someone whose
+        # store was damaged that they had simply never signed in.
+        credential_state = stored_kind(provider) if is_oauth else ""
         if is_oauth:
-            api_key_redacted = "OAuth token" if configured else "(empty)"
-        # Mirrors the reader's own precedence (endpoints > api_key_list > flat,
-        # see `provider_endpoints`): a stale flat key left behind by an
-        # `endpoints` migration must not display as "****set****" while
-        # `configured` -- decided the same way `credential_status` decides it,
-        # off the endpoints list -- says otherwise. Checked before the flat/list
-        # branch below, which used to run first and made this branch, and the
-        # "(N endpoints)" it reports, unreachable whenever a flat key lingered.
-        # Local deployments reach here too: keyless endpoints are their normal
-        # shape, so the count must not read as a misconfiguration.
-        elif endpoints:
-            suffix = f"({len(endpoints)} endpoints)"
-            if is_local:
-                api_key_redacted = f"(not needed for local) {suffix}"
-            elif any(ep.api_key for ep in endpoints):
-                api_key_redacted = f"****set**** {suffix}"
+            if status.ok:
+                api_key_redacted = "OAuth token"
             else:
-                api_key_redacted = f"(empty) {suffix}"
-        elif is_local:
-            api_key_redacted = "(not needed for local)" if not api_key else "****set****"
-        elif api_key or api_key_list:
+                api_key_redacted = "(unreadable)" if credential_state == KIND_INVALID else "(empty)"
+        elif entry.api_key:
             api_key_redacted = "****set****"
+        elif status.ok and status.source == "environment":
+            api_key_redacted = "(from the environment)"
+        elif status.ok and status.source == "store":
+            api_key_redacted = "(in the credential store)"
+        elif status.ok:
+            api_key_redacted = "(not needed)"
         else:
             api_key_redacted = "(empty)"
 
         out.append(
             {
-                "name": fname,
-                "display_name": display_name,
+                "name": provider,
+                "display_name": pi_ids.display_name(provider, entry.name),
                 "is_oauth": is_oauth,
-                "is_local": is_local,
-                "is_gateway": is_gateway,
-                "configured": configured,
+                "is_builtin": pi_ids.is_builtin(provider),
+                "configured": status.ok,
+                "credential_state": credential_state,
                 "api_key_redacted": api_key_redacted,
-                "api_base": api_base,
+                "base_url": entry.base_url or None,
             }
         )
     return out
 
 
 def get_provider_config(
-    name: str,
+    provider: str,
     *,
     redact_secrets: bool = True,
     config_path: Path | None = None,
 ) -> dict[str, Any]:
-    """Return one provider's configuration as a flat ``path -> value`` dict.
+    """Return one provider's entry as a flat ``path -> value`` dict.
 
     Secret fields render as ``'****set****'`` / ``'(empty)'`` by default. Pass
-    ``redact_secrets=False`` to get plaintext (used by ``test_provider`` to
-    actually call the provider's ``/v1/models`` endpoint).
+    ``redact_secrets=False`` for plaintext.
     """
-    name = canonical_provider_name(name)
-    cls = _provider_schema_cls(name)
+    _refuse_unwritable(provider)
     path = config_path or get_config_path()
-    data = read_raw_or_raise(path)
-    raw_section = _raw_section(data, name)
+    entry = _entry(read_raw_or_raise(path), provider)
 
-    try:
-        instance = cls.model_validate(raw_section)
-    except ValidationError:
-        instance = cls()
-
-    specs = provider_field_specs(name)
-    flat = flatten_instance(instance)
+    specs = provider_field_specs()
+    flat = flatten_instance(entry)
     out: dict[str, Any] = {}
-    for path_key, spec in specs.items():
-        val = flat.get(path_key)
-        if redact_secrets and spec["is_secret"]:
-            out[path_key] = _redact(val)
-        elif redact_secrets and isinstance(val, list) and val and isinstance(val[0], BaseModel):
-            out[path_key] = [_redact_nested_model(item) for item in val]
-        else:
-            out[path_key] = val
+    for key, spec in specs.items():
+        value = flat.get(key)
+        if key == "models":
+            # Rows are objects; a flat map is for display and for the CLI's
+            # `--field value` surface, so name the models rather than dumping
+            # their rows. The rows themselves are read through `model_rows`.
+            value = entry.model_ids
+        out[key] = _redact(value) if redact_secrets and spec["is_secret"] else value
     return out
+
+
+def model_rows(provider: str, *, config_path: Path | None = None) -> list[dict[str, Any]]:
+    """Every declared model of this provider, as the rows the config holds.
+
+    A model written as a bare id comes back as a row of just its id, so callers
+    reading facts about a model do not have to know which of the two ways it was
+    written in.
+    """
+    path = config_path or get_config_path()
+    entry = _entry(read_raw_or_raise(path), provider)
+    return [row.model_dump(by_alias=True, exclude_none=True) for row in entry.rows()]
 
 
 # ---------------------------------------------------------------------------
@@ -500,384 +319,248 @@ def get_provider_config(
 
 
 def set_provider_fields(
-    name: str,
+    provider: str,
     fields: dict[str, Any],
     *,
     config_path: Path | None = None,
 ) -> dict[str, Any]:
-    """Patch specific fields on a provider. Returns ``{path: previous_value}``.
+    """Patch specific fields on a provider entry. Returns ``{path: previous_value}``.
+
+    Creates the entry when there is none: writing a field for a provider is how
+    one is configured, and there is no always-present empty block to patch.
 
     Raises:
-        KeyError: unknown provider name or unknown field path.
-        RuntimeError: attempting to set ``api_key`` / ``api_key_list`` on an
-            OAuth provider — callers should use ``provider login`` instead.
-        ValidationError: a field value violates the provider's Pydantic schema.
+        KeyError: a name no entry can be written for, or an unknown field path.
+        RuntimeError: setting ``api_key`` on an entry that names a sign-in
+            without turning the sign-in off in the same write.
+        ValidationError: a value the entry schema rejects, including a declared
+            provider left without ``baseUrl`` or ``api``.
     """
-    name = canonical_provider_name(name)
+    _refuse_unwritable(provider)
     if not fields:
         return {}
 
-    cls = _provider_schema_cls(name)
-    spec = _provider_spec(name)
-    field_specs = provider_field_specs(name)
-
+    field_specs = provider_field_specs()
     unknown = [k for k in fields if k not in field_specs]
     if unknown:
-        raise KeyError(
-            f"Unknown field(s) {unknown} for provider '{name}'. Available fields: {sorted(field_specs.keys())}"
-        )
-
-    if spec and spec.is_oauth:
-        # Credential fields only, per the docstring above -- not everything the
-        # display faces redact: extra_headers is secret to *show* but is no
-        # credential, and `provider login` would not write it anyway.
-        forbidden = [k for k in fields if k in ("api_key", "api_key_list")]
-        if forbidden:
-            raise RuntimeError(
-                f"Provider '{name}' uses OAuth — cannot set credential fields "
-                f"{forbidden} directly. Run: ddeharness provider login "
-                f"{name.replace('_', '-')}"
-            )
+        raise KeyError(f"Unknown field(s) {unknown} for provider '{provider}'. Available fields: {sorted(field_specs)}")
 
     path = config_path or get_config_path()
     data = read_raw_or_raise(path)
-    raw_section = _raw_section(data, name)
+    current = _entry(data, provider)
 
-    try:
-        current = cls.model_validate(raw_section)
-    except ValidationError:
-        current = cls()
+    # Judged on the entry as it will stand: a key written together with
+    # ``login: None`` is a key replacing a sign-in, which is how pi's own "Sign
+    # in with an API key" lands on a provider that was signed in to.
+    if fields.get("login", current.login) == "oauth" and fields.get("api_key"):
+        raise RuntimeError(
+            f"Provider '{provider}' signs in -- cannot set api_key directly. Run: ddeharness provider login {provider}"
+        )
 
     working = current.model_dump()
-
     prev: dict[str, Any] = {}
-    for path_key, raw_val in fields.items():
-        leaf_cls, leaf_field = walk_nested_path(cls, path_key)
-        leaf_info = leaf_cls.model_fields[leaf_field]
-        coerced = coerce_value(raw_val, leaf_info.annotation)
-        if path_key == "models" and isinstance(coerced, list):
-            # The third way a model id gets written down, and the one that used
-            # to skip the contract: `provider set --models x` stored a bare id
-            # while the picker and the wizard stored a qualified one. Identity
-            # still matched, so nothing broke -- which is exactly how the two
-            # spellings coexisted last time, until a delete silently matched
-            # neither.
-            from opendde_harness.providers.wire import stored_model_id
+    for key, raw in fields.items():
+        leaf_cls, leaf_field = walk_nested_path(ProviderEntry, key)
+        coerced = coerce_value(raw, leaf_cls.model_fields[leaf_field].annotation)
+        if key == "models" and isinstance(coerced, list):
+            # pi's ``models`` holds the ids the endpoint serves, with no
+            # provider prefix: the prefix is the key this entry is filed under.
+            # A caller holding a qualified id (the picker, the wizard) hands it
+            # over as it has it, and this is the one place that strips it -- the
+            # third write path is how two spellings of one model used to land in
+            # one list.
+            coerced = [_model_value(provider, m) for m in coerced]
+        prev[key] = set_nested(key, coerced, working)
 
-            coerced = [stored_model_id(name, str(m)) for m in coerced]
-        prev[path_key] = set_nested(path_key, coerced, working)
-
-    validated = cls.model_validate(working)
-
-    _write_raw_section(data, name, validated.model_dump(by_alias=True))
-    write_json_atomic(path, data)
+    _commit(data, provider, ProviderEntry.model_validate(working), path)
     return prev
 
 
-def serves_default_model(name: str, *, config_path: Path | None = None) -> bool:
+def _model_value(provider: str, model: Any) -> Any:
+    """One ``models`` element, with a prefix naming this provider stripped."""
+    if isinstance(model, dict):
+        row = dict(model)
+        row["id"] = model_id.display(provider, str(row.get("id") or ""))
+        return row
+    return model_id.display(provider, str(model))
+
+
+def serves_default_model(provider: str, *, config_path: Path | None = None) -> bool:
     """Is this provider the one that answers the configured default model?
 
-    Resetting it clears the credential and leaves the model id behind, so the
-    config still names a provider that can no longer answer -- and the startup
-    gate reads that as "not set up" and runs the wizard. Both doors that reset a
-    provider ask this so they can say so before it happens.
+    Removing its entry leaves the model id behind, so the config still names a
+    provider that can no longer answer -- and the startup gate reads that as
+    "not set up" and runs the wizard. Both doors that reset a provider ask this
+    so they can say so before it happens.
     """
     from opendde_harness.config.loader import load_config
 
     try:
         config = load_config(config_path) if config_path else load_config()
-        model = config.agents.defaults.model
-        return bool(model) and config.get_provider_name(str(model)) == canonical_provider_name(name)
-    except Exception:
-        # A config that cannot be resolved has no default worth protecting, and
-        # this is a warning path: it must never be the reason a reset fails.
+        return model_id.provider_of(config.agents.defaults.model) == provider
+    except Exception:  # noqa: BLE001 - a warning path; never the reason a reset fails
         return False
 
 
 def reset_provider(
-    name: str,
+    provider: str,
     *,
     config_path: Path | None = None,
 ) -> None:
-    """Restore a provider to schema defaults. Key preserved; values reset.
+    """Sign a provider out when its entry named a sign-in, then remove the entry.
 
-    Two cleanup paths run automatically, dispatched on ``ProviderSpec.is_oauth``:
+    Removal rather than a rewrite to schema defaults: an entry exists because
+    somebody wrote it, and an entry emptied of its address and key is not a
+    provider with nothing configured -- for a declared one it is not even a
+    valid entry. So "reset" is "un-configure", which is what every caller meant.
 
-    1. **Config fields** — always rewritten to whatever a fresh Pydantic
-       instance produces (``api_key=""``, ``api_base=None``,
-       ``api_key_list=[]`` for Gemini, etc.). For OAuth providers those are
-       already at defaults, so the write is a no-op for them but harmless.
+    The sign-out comes first and is not caught: an entry removed while the grant
+    stays stored is a sign-in the config has forgotten about and the store has
+    not, and the caller would have been told it had signed out.
 
-    2. **OAuth credential files** (``is_oauth=True``) — unlinked from disk so the
-       user is effectively logged out. Every file a sign-in can leave behind
-       goes, Copilot's API key included. Idempotent: ``missing_ok`` so reset can
-       run multiple times without raising.
-
-    Callers don't need to know which case applies — one mental model covers
-    both API-key and OAuth providers.
+    For synchronous callers -- the CLI, the wizard -- which run their own loop
+    for the sign-out. Inside a running loop (the TUI's RPC), await
+    :func:`provider_logout` and then call :func:`remove_provider_entry`.
     """
-    name = canonical_provider_name(name)
-    cls = _provider_schema_cls(name)
-    spec = _provider_spec(name)
+    path = config_path or get_config_path()
+    if _entry(read_raw_or_raise(path), provider).login == "oauth":
+        from opendde_harness.providers.pi_service import run_then_shutdown
 
+        run_then_shutdown(provider_logout(provider))
+    remove_provider_entry(provider, config_path=path)
+
+
+def remove_provider_entry(provider: str, *, config_path: Path | None = None) -> None:
+    """Remove a provider's entry from the section. The write half of a reset."""
+    _refuse_unwritable(provider)
     path = config_path or get_config_path()
     data = read_raw_or_raise(path)
-    _write_raw_section(data, name, cls().model_dump(by_alias=True))
+    _entry(data, provider)
+
+    stored = data.get("providers")
+    if isinstance(stored, dict):
+        stored.pop(provider, None)
     write_json_atomic(path, data)
-
-    if spec and spec.is_oauth:
-        try:
-            if name in {"minimax_global", "minimax_cn"}:
-                from opendde_harness.providers.minimax_oauth import delete_token
-
-                delete_token("global" if name == "minimax_global" else "cn")
-
-            for stale in oauth_credential_files(name):
-                stale.unlink(missing_ok=True)
-        except OSError as exc:
-            logger.warning(
-                "update_providers: failed to unlink OAuth token for {}: {}",
-                name,
-                exc,
-            )
-
-    logger.info("update_providers: {} reset to defaults", name)
+    logger.info("update_providers: {} removed from the providers section", provider)
 
 
-def _load_provider_models(name: str, data: dict[str, Any]) -> tuple[type, list[str]]:
-    cls = _provider_schema_cls(name)
-    section = _raw_section(data, name)
-    try:
-        instance = cls.model_validate(section)
-    except ValidationError:
-        instance = cls()
-    return cls, list(getattr(instance, "models", []) or [])
+async def provider_logout(provider: str) -> bool:
+    """Forget this provider's stored sign-in. True when there was one.
+
+    The delete runs inside the process's model service, which owns pi's
+    credential store: it is the process that refreshes a rotated token, so it
+    is the one whose writes this has to be serialised with. The process's own
+    service, on the loop that owns it -- a second child on another loop would
+    write the same file from its own snapshot, and ``get_service`` refuses to
+    take over a service a running loop is streaming through.
+    """
+    from opendde_harness.config.loader import load_config
+    from opendde_harness.providers.pi_service import get_service
+
+    service = await get_service(load_config())
+    reply = await service.logout(provider)
+    return bool(reply.get("forgotten"))
 
 
 def add_provider_model(
-    name: str,
+    provider: str,
     model: str,
     *,
     config_path: Path | None = None,
 ) -> list[str]:
-    """Append ``model`` to a provider's curated ``models`` list (idempotent).
+    """Append ``model`` to a provider's ``models`` list (idempotent).
 
-    Returns the new model list. Raises KeyError for an unknown provider.
+    Returns the new list of model ids. A prefix naming this provider is stripped
+    first: pi's ``models`` holds the ids the endpoint serves.
     """
-    from opendde_harness.providers.wire import merge_key
-
-    name = canonical_provider_name(name)
+    _refuse_unwritable(provider)
     path = config_path or get_config_path()
     data = read_raw_or_raise(path)
-    cls, models = _load_provider_models(name, data)
-    # By identity, not by string: the same model written two ways used to land
-    # in the list twice, and neither entry could then be removed by the other's
-    # spelling.
-    if merge_key(name, model) not in {merge_key(name, m) for m in models}:
-        models.append(model)
-        section = _raw_section(data, name)
-        section["models"] = models
-        validated = cls.model_validate(section)
-        _write_raw_section(data, name, validated.model_dump(by_alias=True))
-        write_json_atomic(path, data)
-    return models
+    entry = _entry(data, provider)
+
+    wanted = model_id.display(provider, model)
+    if wanted and wanted not in entry.model_ids:
+        working = entry.model_dump()
+        working["models"] = [*(working.get("models") or []), wanted]
+        validated = ProviderEntry.model_validate(working)
+        _commit(data, provider, validated, path)
+        return validated.model_ids
+    return entry.model_ids
 
 
 def remove_provider_model(
-    name: str,
+    provider: str,
     model: str,
     *,
     config_path: Path | None = None,
 ) -> list[str]:
-    """Remove ``model`` from a provider's curated ``models`` list (no-op if absent).
+    """Remove ``model`` from a provider's ``models`` list (no-op if absent).
 
-    Returns the new model list. Raises KeyError for an unknown provider.
+    Returns the new list of model ids. Accepts the id either way round -- bare
+    as the list holds it, or qualified as the picker and the config's default
+    spell it.
     """
-    from opendde_harness.providers.wire import merge_key
-
-    name = canonical_provider_name(name)
+    _refuse_unwritable(provider)
     path = config_path or get_config_path()
     data = read_raw_or_raise(path)
-    cls, models = _load_provider_models(name, data)
-    # Whatever spelling the caller holds removes every spelling of that model:
-    # the write paths used to disagree, so a list could hold one model twice.
-    target = merge_key(name, model)
-    if target in {merge_key(name, m) for m in models}:
-        models = [m for m in models if merge_key(name, m) != target]
-        section = _raw_section(data, name)
-        section["models"] = models
-        validated = cls.model_validate(section)
-        _write_raw_section(data, name, validated.model_dump(by_alias=True))
-        write_json_atomic(path, data)
-    return models
+    entry = _entry(data, provider)
+
+    wanted = model_id.display(provider, model)
+    if wanted in entry.model_ids:
+        working = entry.model_dump()
+        working["models"] = [m for m in entry.models if (m if isinstance(m, str) else m.id) != wanted]
+        validated = ProviderEntry.model_validate(working)
+        _commit(data, provider, validated, path)
+        return validated.model_ids
+    return entry.model_ids
 
 
-def set_model_overlay(
-    name: str,
+def set_model_row(
+    provider: str,
     model: str,
     fields: dict[str, Any],
     *,
     config_path: Path | None = None,
 ) -> dict[str, Any]:
-    """Patch one model's ``modelOverlay`` entry under a provider.
+    """Patch one model's row inside a provider's ``models`` list.
 
-    Matched by identity (``wire.merge_key``) so a declaration written against
-    a bare id is updated rather than duplicated; a new entry is keyed by the
-    stored spelling. Returns the entry as stored. Raises KeyError for an
-    unknown provider or field, ValidationError for a value the overlay rejects.
+    A model listed as a bare id becomes a row; a model not listed at all is
+    added as one. Returns the row as stored. Raises KeyError for an unknown
+    provider or field, ValidationError for a value the row rejects.
     """
-    from opendde_harness.config.schema import ModelOverlay
-    from opendde_harness.providers.wire import merge_key, stored_model_id
-
-    name = canonical_provider_name(name)
-    cls = _provider_schema_cls(name)
-    unknown = [k for k in fields if k not in ModelOverlay.model_fields]
+    _refuse_unwritable(provider)
+    unknown = [k for k in fields if k not in ModelEntry.model_fields or k == "id"]
     if unknown:
-        raise KeyError(f"Unknown overlay field(s) {unknown}. Available: {sorted(ModelOverlay.model_fields)}")
+        available = sorted(k for k in ModelEntry.model_fields if k != "id")
+        raise KeyError(f"Unknown model field(s) {unknown}. Available: {available}")
 
     path = config_path or get_config_path()
     data = read_raw_or_raise(path)
-    # A section that no longer validates is left alone: falling back to the
-    # defaults and writing them back erased the key, base URL and models to
-    # change one overlay field.
-    instance = cls.model_validate(_raw_section(data, name))
+    # An entry that no longer validates is left alone: falling back to the
+    # defaults and writing them back erased the key, the address and the models
+    # to change one model's row.
+    entry = ProviderEntry.model_validate(_entry_dict(data, provider))
 
-    overlays = dict(getattr(instance, "model_overlay", None) or {})
-    target = merge_key(name, model)
-    key = next((k for k in overlays if merge_key(name, k) == target), stored_model_id(name, model))
-    current = overlays.get(key, ModelOverlay()).model_dump()
-    coerced = {k: coerce_value(v, ModelOverlay.model_fields[k].annotation) for k, v in fields.items()}
-    entry = ModelOverlay.model_validate({**current, **coerced})
-    overlays[key] = entry
+    wanted = model_id.display(provider, model)
+    coerced = {k: coerce_value(v, ModelEntry.model_fields[k].annotation) for k, v in fields.items()}
 
-    working = instance.model_dump()
-    working["model_overlay"] = {k: v.model_dump() for k, v in overlays.items()}
-    validated = cls.model_validate(working)
-    _write_raw_section(data, name, validated.model_dump(by_alias=True))
-    write_json_atomic(path, data)
-    return entry.model_dump(by_alias=True, exclude_none=True)
+    rows: list[Any] = []
+    written: ModelEntry | None = None
+    for element in entry.models:
+        current = ModelEntry(id=element) if isinstance(element, str) else element
+        if current.id != wanted:
+            rows.append(element)
+            continue
+        written = ModelEntry.model_validate({**current.model_dump(), **coerced})
+        rows.append(written)
+    if written is None:
+        written = ModelEntry.model_validate({"id": wanted, **coerced})
+        rows.append(written)
 
-
-def _load_provider_endpoints(name: str, data: dict[str, Any]) -> tuple[type, list[ProviderEndpoint]]:
-    """Deliberately lets ValidationError out instead of falling back to ``cls()``.
-
-    A section that no longer validates (say, a hand-edited duplicate label)
-    already stops ``Config.model_validate`` -- OpenDDE Harness will not start on it. The
-    endpoint commands are the user's likeliest self-rescue there, and a swallow
-    here made them see an empty list and then *write it back*, wiping every
-    real endpoint in the section. A loud error names the problem instead.
-    """
-    cls = _provider_schema_cls(name)
-    section = _raw_section(data, name)
-    instance = cls.model_validate(section)
-    return cls, list(getattr(instance, "endpoints", []) or [])
-
-
-def add_provider_endpoint(
-    name: str,
-    *,
-    label: str,
-    api_key: str = "",
-    api_base: str | None = None,
-    extra_headers: dict[str, str] | None = None,
-    config_path: Path | None = None,
-) -> list[ProviderEndpoint]:
-    """Add or replace one entry in a provider's ``endpoints`` list, keyed by ``label``.
-
-    ``label`` is the idempotency key ``ProviderEndpoint`` declares it as: an
-    existing entry with that label is replaced wholesale, not merged field by
-    field, so re-running this with a rotated ``api_key`` is how the rotation
-    gets written. A new label appends.
-
-    Returns the new endpoint list. Raises KeyError for an unknown provider,
-    RuntimeError for one that ``endpoints_unsupported_reason`` rejects (Codex,
-    MiniMax OAuth, Azure, or any OAuth section) -- the same rejection
-    ``make_provider`` applies at build time, applied here before the write
-    rather than left for that later failure to catch. Also RuntimeError for an
-    empty ``api_key`` on a provider whose credential shape needs one --
-    derived from the registry (``credential_kind``), not a hardcoded vendor
-    list, so a local/keyless deployment (``hosted_vllm``, ``ollama_chat``, ...)
-    keeps writing a keyless endpoint while every key-based provider gets the
-    same rejection the CLI and the TUI picker both need.
-    """
-    name = canonical_provider_name(name)
-    reason = endpoints_unsupported_reason(name)
-    if reason:
-        raise RuntimeError(reason)
-    if not api_key and credential_kind(name) != CRED_LOCAL:
-        raise RuntimeError(
-            f"{name} needs an api_key -- only a local, keyless deployment can add an endpoint without one"
-        )
-    path = config_path or get_config_path()
-    data = read_raw_or_raise(path)
-    cls, endpoints = _load_provider_endpoints(name, data)
-
-    new_endpoint = ProviderEndpoint(label=label, api_key=api_key, api_base=api_base, extra_headers=extra_headers)
-    updated = [new_endpoint if ep.label == label else ep for ep in endpoints]
-    if not any(ep.label == label for ep in endpoints):
-        updated.append(new_endpoint)
-
-    section = _raw_section(data, name)
-    section["endpoints"] = [ep.model_dump(by_alias=True) for ep in updated]
-    validated = cls.model_validate(section)
-    _write_raw_section(data, name, validated.model_dump(by_alias=True))
-    write_json_atomic(path, data)
-    return updated
-
-
-def remove_provider_endpoint(
-    name: str,
-    label: str,
-    *,
-    config_path: Path | None = None,
-) -> list[ProviderEndpoint]:
-    """Remove one endpoint by ``label`` (no-op if absent, mirrors ``remove_provider_model``).
-
-    Returns the new endpoint list. Raises KeyError for an unknown provider.
-    """
-    name = canonical_provider_name(name)
-    path = config_path or get_config_path()
-    data = read_raw_or_raise(path)
-    cls, endpoints = _load_provider_endpoints(name, data)
-
-    remaining = [ep for ep in endpoints if ep.label != label]
-    if len(remaining) != len(endpoints):
-        section = _raw_section(data, name)
-        section["endpoints"] = [ep.model_dump(by_alias=True) for ep in remaining]
-        validated = cls.model_validate(section)
-        _write_raw_section(data, name, validated.model_dump(by_alias=True))
-        write_json_atomic(path, data)
-    return remaining
-
-
-def list_provider_endpoints(name: str, *, config_path: Path | None = None) -> list[dict[str, Any]]:
-    """List a provider's ``endpoints``, secrets redacted for display.
-
-    Returns one dict per endpoint: ``label``, ``api_key`` (``****set****`` /
-    ``(empty)``, same rule as every other secret field), ``api_base``,
-    ``extra_headers`` (values redacted the same way, keys left visible -- see
-    ``_redact_headers``). ``api_base``/``extra_headers`` are the resolved
-    values each request would actually use -- an entry that names none of its
-    own shows the section's flat value it inherits (see
-    ``provider_endpoints``), not an empty field the user reads as "did not
-    take". Raises KeyError for an unknown provider.
-    """
-    name = canonical_provider_name(name)
-    path = config_path or get_config_path()
-    data = read_raw_or_raise(path)
-    cls, endpoints = _load_provider_endpoints(name, data)
-    if not endpoints:
-        return []
-    section = cls.model_validate(_raw_section(data, name))
-    return [
-        {
-            "label": ep.label,
-            "api_key": _redact(ep.api_key),
-            "api_base": ep.api_base,
-            "extra_headers": _redact_headers(ep.extra_headers),
-        }
-        for ep in provider_endpoints(section)
-    ]
+    working = entry.model_dump()
+    working["models"] = [r if isinstance(r, str) else r.model_dump() for r in rows]
+    _commit(data, provider, ProviderEntry.model_validate(working), path)
+    return written.model_dump(by_alias=True, exclude_none=True)
 
 
 # ---------------------------------------------------------------------------
@@ -885,492 +568,202 @@ def list_provider_endpoints(name: str, *, config_path: Path | None = None) -> li
 # ---------------------------------------------------------------------------
 
 
-# Maps HTTP status → user-facing status keyword used by the CLI hint table.
-_HTTP_STATUS_MAP: dict[int, str] = {
-    200: "valid",
-    401: "invalid_key",
-    402: "no_credits",
-    403: "invalid_key",
-    429: "rate_limited",
-}
+#: What the check asks the model for. Short on purpose: this is a reachability
+#: question, and a long prompt only makes it a more expensive one.
+_TEST_PROMPT = "Reply with the single word OK."
+
+#: The ceiling the check names. A model with no declared ceiling is refused by
+#: the service unless the request carries one, so this is not optional.
+_TEST_MAX_TOKENS = 16
 
 
 def test_provider(
-    name: str,
+    provider: str,
     *,
-    timeout_s: int = 10,
+    timeout_s: int = 60,
     config_path: Path | None = None,
-    transport: httpx.BaseTransport | None = None,
 ) -> dict[str, Any]:
-    """Verify a provider's credentials via a free GET request to ``/v1/models``.
+    """Is this provider reachable, and does the credential work?
 
-    Why ``/v1/models`` rather than a chat completion (same rationale as
-    hermes-agent's ``doctor._probe_apikey_provider``):
+    Two questions, both asked of the model service, which is the thing that will
+    be doing the sending:
 
-    - Zero token cost — metadata endpoint, not LLM-generated content.
-    - No charge to the user, doesn't burn inference quota.
-    - Supported by virtually every OpenAI-compatible provider (the 18 we
-      ship today).
-    - No "which test model?" maintenance burden.
+    1. ``auth`` -- does pi resolve a credential for this provider at all, and
+       from where. An entry the service does not even carry (no address, no
+       models) answers here.
+    2. one ``stream`` of a few tokens on the provider's own default model. What
+       is reported is the first event: anything that is not an error proves the
+       vendor accepted the credential and answered, and the stream is dropped
+       there rather than run to the end.
 
-    Behavior:
+    Returns a dict and never raises:
 
-    1. Look up the provider's ``api_key`` or provider-specific OAuth access
-       token and ``api_base``
-       (falling back to ``ProviderSpec.default_api_base`` when unset).
-    2. ``GET {api_base}/v1/models`` with ``Authorization: Bearer {key}``.
-    3. Map status code → keyword (see ``_HTTP_STATUS_MAP``). Unknown codes
-       render as ``http_{code}``. Network errors → ``network_error``.
-
-    Returns a dict, never raises. ``transport`` is injectable so unit tests
-    can mount an ``httpx.MockTransport`` without touching real network.
-    """
-    name = canonical_provider_name(name)
-
-    try:
-        spec = _provider_spec(name)
-        cls = _provider_schema_cls(name)
-    except KeyError as exc:
-        return {
-            "ok": False,
-            "status": "unknown_provider",
-            "elapsed_ms": 0,
-            "http_status": None,
-            "models_count": None,
-            "model_ids": None,
-            "error": str(exc),
-        }
-
-    path = config_path or get_config_path()
-    data = read_raw_or_raise(path)
-    raw_section = _raw_section(data, name)
-    try:
-        instance = cls.model_validate(raw_section)
-    except ValidationError:
-        instance = cls()
-
-    # Same source as the request path (`provider_endpoints`), not a second
-    # read of the flat fields -- an endpoints-only or `api_key_list` section
-    # has no usable flat `api_key`, and reading that field here reported
-    # `not_configured` on a section the runtime could already serve. The first
-    # endpoint that actually holds a key is the one a request would use; none
-    # holding one falls back to the first endpoint's address, matching what a
-    # section with no endpoints at all (a single resolved entry echoing the
-    # flat fields) already gave local/keyless providers.
-    endpoints = provider_endpoints(instance)
-    endpoint = next((ep for ep in endpoints if ep.api_key), endpoints[0] if endpoints else None)
-    api_key = endpoint.api_key if endpoint else ""
-    api_base = (endpoint.api_base if endpoint else None) or (spec.default_api_base if spec else "") or ""
-    derived_api_base = False
-
-    # Before the token fetch below, which asks a question this backend does not
-    # answer: its catalogue is the credential check.
-    if spec and spec.name == "openai_codex":
-        return _probe_codex_catalog(timeout_s=timeout_s)
-
-    if spec and spec.name == "github_copilot":
-        return _probe_copilot_seat(timeout_s=timeout_s, transport=transport)
-
-    if spec and spec.is_oauth:
-        try:
-            if spec.name in {"minimax_global", "minimax_cn"}:
-                from opendde_harness.providers.minimax_oauth import get_token
-
-                token = get_token("global" if spec.name == "minimax_global" else "cn")
-                oauth_access = token.access
-                api_base = token.resource_url
-            else:
-                # A new family must add its own branch: defaulting to another
-                # family's reads the wrong credential and can start its device flow.
-                raise RuntimeError(f"{spec.label} has no credential check here yet")
-        except ImportError:
-            return {
-                "ok": False,
-                "status": "oauth_token_missing",
-                "elapsed_ms": 0,
-                "http_status": None,
-                "models_count": None,
-                "model_ids": None,
-                "error": "OAuth support is not installed",
-            }
-        except Exception as exc:
-            return {
-                "ok": False,
-                "status": "oauth_token_missing",
-                "elapsed_ms": 0,
-                "http_status": None,
-                "models_count": None,
-                "model_ids": None,
-                "error": str(exc),
-            }
-        if not oauth_access:
-            return {
-                "ok": False,
-                "status": "oauth_token_missing",
-                "elapsed_ms": 0,
-                "http_status": None,
-                "models_count": None,
-                "model_ids": None,
-                "error": "no OAuth token stored",
-            }
-        api_key = oauth_access
-
-    if not api_key and not (spec and spec.is_local):
-        return {
-            "ok": False,
-            "status": "not_configured",
-            "elapsed_ms": 0,
-            "http_status": None,
-            "models_count": None,
-            "model_ids": None,
-            "error": "api_key is empty",
-        }
-
-    if not api_base:
-        # Asked here and not above: the branches in between return for the
-        # families whose credential check is not an HTTP ping, and one of them
-        # is Copilot -- whose driver starts a GitHub device flow when LiteLLM is
-        # asked to resolve it. Deriving eagerly put that flow before the branch
-        # that avoids it and hung `provider test github-copilot` on that login.
-        # Derived rather than declared, and tracked as such: a 404 from an
-        # address we guessed says the vendor has no models route there, while a
-        # 404 from one the user typed is a typo they need to see.
-        api_base = _litellm_api_base(spec)
-        derived_api_base = bool(api_base)
-
-    if not api_base:
-        # No address, and for most of these there is nothing the user could have
-        # supplied: the endpoint is compiled into the vendor's SDK, so there is
-        # no `/models` to ping. Reporting `not_configured` told seven correctly
-        # configured providers they were not set up, and pointed at a key they
-        # had already set. Say what is true instead -- the credential is present
-        # and this probe cannot reach the vendor.
-        needs_user_address = bool(spec and (spec.is_local or spec.name == "azure_openai"))
-        return {
-            "ok": False,
-            "status": "not_configured" if needs_user_address else "no_probe_endpoint",
-            "elapsed_ms": 0,
-            "http_status": None,
-            "models_count": None,
-            "model_ids": None,
-            "error": (
-                "api_base is empty and provider has no default"
-                if needs_user_address
-                else "credential present; this vendor publishes no models endpoint to ping"
-            ),
-        }
-
-    url = api_base.rstrip("/") + "/models"
-    if "/v1" not in api_base:
-        url = api_base.rstrip("/") + "/v1/models"
-
-    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-    if spec and spec.name in {"minimax_global", "minimax_cn"} and api_key:
-        headers["x-api-key"] = api_key
-
-    result = _probe_models_endpoint(url, headers, timeout_s=timeout_s, transport=transport)
-    if derived_api_base and result.get("status") == "http_404":
-        # The address LiteLLM sends completions to is not always where the
-        # catalogue lives -- DeepSeek's is `/beta`, which has no `/models`. A 404
-        # never says anything about the credential, so reporting a failure here
-        # would be the same lie in a new spelling.
-        return {
-            **result,
-            "ok": False,
-            "status": "no_probe_endpoint",
-            "error": "credential present; this vendor publishes no models endpoint to ping",
-        }
-    return result
-
-
-def _litellm_api_base(spec: Any) -> str:
-    """The endpoint LiteLLM would send this vendor's request to, or "".
-
-    Asked rather than tabulated: LiteLLM already knows, because it is the thing
-    that does the sending, and a second copy of these addresses is a second thing
-    to keep current. It answers for four of the ten providers that ship no
-    default; the rest compile the address into the vendor SDK and there is
-    nothing to return.
-    """
-    if spec is None:
-        return ""
-    if spec.is_oauth:
-        # Asked before the id is built, because building it can hide the answer:
-        # `wire_model` strips the provider name entirely for the codex and azure
-        # shapes, so the guard below would be handed a bare "probe-model" and see
-        # nothing to object to. An OAuth provider's credential check is its own
-        # flow, never a models ping, so there is nothing here for it either way.
-        return ""
-
-    from opendde_harness.providers.rates import _may_prompt
-    from opendde_harness.providers.wire import stored_model_id, wire_model
-
-    # Asked of the stored form, not the wire form, for the same reason.
-    stored = stored_model_id(spec.name, "probe-model")
-    if _may_prompt(stored):
-        # Resolving one of these resolves its credentials on the way, and with no
-        # token file that prints a device code and blocks. One answer to "can this
-        # be handed to LiteLLM" for every caller -- see providers.rates.
-        return ""
-    try:
-        from opendde_harness.providers.litellm_setup import import_litellm
-
-        _, _, _, base = import_litellm().get_llm_provider(model=wire_model(stored, spec=spec))
-    except Exception:
-        return ""
-    return base or ""
-
-
-def _probe_models_endpoint(
-    url: str,
-    headers: dict[str, str],
-    *,
-    timeout_s: float,
-    transport: httpx.BaseTransport | None,
-) -> dict[str, Any]:
-    """GET a models endpoint and report the result in the probe's vocabulary.
-
-    What to ask and what to send is the caller's answer. A vendor that refuses the
-    request every other one accepts is the reason there is more than one caller;
-    how the answer is reported is the same for all of them.
+    - ``ok``            the model answered
+    - ``status``        ``valid``, or why not (see the CLI's hint table)
+    - ``elapsed_ms``    how long the two requests took
+    - ``model``         the model that was asked
+    - ``models_count`` / ``model_ids``  what the service serves for this provider
+    - ``error``         one line of detail, or None
     """
     import time
 
     start = time.monotonic()
-    client_kwargs: dict[str, Any] = {"timeout": timeout_s}
-    if transport is not None:
-        client_kwargs["transport"] = transport
 
     try:
-        with httpx.Client(**client_kwargs) as client:
-            resp = client.get(url, headers=headers)
-    except httpx.HTTPError as exc:
-        return {
-            "ok": False,
-            "status": "network_error",
-            "elapsed_ms": int((time.monotonic() - start) * 1000),
-            "http_status": None,
-            "models_count": None,
-            "model_ids": None,
-            "error": str(exc),
-        }
+        _refuse_unwritable(provider)
+    except (KeyError, RuntimeError) as exc:
+        return _test_result(False, "unknown_provider", start, error=str(exc))
 
-    elapsed_ms = int((time.monotonic() - start) * 1000)
-    status_keyword = _HTTP_STATUS_MAP.get(resp.status_code, f"http_{resp.status_code}")
+    try:
+        from opendde_harness.config.loader import load_config
 
-    models_count: int | None = None
-    model_ids: list[str] | None = None
-    if resp.status_code == 200:
-        try:
-            payload = resp.json()
-            data = payload.get("data") if isinstance(payload, dict) else None
-            if isinstance(data, list):
-                models_count = len(data)
-                ids: list[str] = []
-                for item in data:
-                    if isinstance(item, dict):
-                        mid = item.get("id") or item.get("name")
-                        if isinstance(mid, str) and mid:
-                            ids.append(mid)
-                model_ids = ids
-        except Exception:
-            models_count = None
-            model_ids = None
+        config = load_config(config_path) if config_path else load_config()
+    except Exception as exc:  # noqa: BLE001 - reported, not raised
+        return _test_result(False, "config_unreadable", start, error=str(exc))
+
+    try:
+        from opendde_harness.providers.pi_service import run_then_shutdown
+
+        return run_then_shutdown(_check_through_the_service(provider, config, start, timeout_s))
+    except Exception as exc:  # noqa: BLE001 - reported, not raised
+        from opendde_harness.providers.model_service import ModelServiceError
+
+        if isinstance(exc, ModelServiceError):
+            return _test_result(False, exc.code, start, error=str(exc))
+        logger.debug("provider test: {} failed", provider, exc_info=True)
+        return _test_result(False, "service_unavailable", start, error=str(exc))
+
+
+def _test_result(
+    ok: bool,
+    status: str,
+    start: float,
+    *,
+    error: str | None = None,
+    model: str = "",
+    model_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    import time
 
     return {
-        "ok": resp.status_code == 200,
-        "status": status_keyword,
-        "elapsed_ms": elapsed_ms,
-        "http_status": resp.status_code,
-        "models_count": models_count,
+        "ok": ok,
+        "status": status,
+        "elapsed_ms": int((time.monotonic() - start) * 1000),
+        "model": model,
+        "models_count": len(model_ids) if model_ids is not None else None,
         "model_ids": model_ids,
-        "error": None if resp.status_code == 200 else f"HTTP {resp.status_code}",
+        "error": error,
     }
 
 
-def _probe_copilot_seat(*, timeout_s: float, transport: httpx.BaseTransport | None) -> dict[str, Any]:
-    """Verify a Copilot seat the way its backend accepts being asked.
+async def _check_through_the_service(provider: str, config: Any, start: float, timeout_s: int) -> dict[str, Any]:
+    from opendde_harness.providers.pi_service import get_service
 
-    Nothing about this one fits the generic probe. The endpoint arrives with the
-    credential rather than from the registry, so the generic path answered
-    "api_base is empty and provider has no default" without ever asking. And the
-    endpoint refuses a request carrying only an ``Authorization`` header: the
-    driver sends a set of editor headers on every call, which is what tells the
-    backend an editor is asking, so one header would report a working seat as a
-    bad credential. Both come from the driver rather than from a guess here.
-    """
-    if not _oauth_credentials_present("github_copilot"):
-        return {
-            "ok": False,
-            "status": "oauth_token_missing",
-            "elapsed_ms": 0,
-            "http_status": None,
-            "models_count": None,
-            "model_ids": None,
-            "error": "no credentials found -- run `ddeharness provider login github-copilot`",
-        }
+    service = await get_service(config)
 
-    from opendde_harness.providers.litellm_setup import import_litellm
+    report = await service.auth()
+    entry = next((p for p in report.get("providers") or () if p.get("id") == provider), None)
+    if entry is None:
+        # Not in the service's provider set: the entry supplies nothing it could
+        # be declared from. `provider show` lists what it still needs.
+        return _test_result(
+            False,
+            "not_served",
+            start,
+            error=f"{provider} is not configured well enough to be declared -- "
+            f"run `ddeharness provider show {provider}`",
+        )
+    if not entry.get("configured"):
+        return _test_result(False, "not_configured", start, error=entry.get("error") or "no credential resolved")
 
-    import_litellm()  # points the authenticator at opendde's OAuth directory
-    from litellm.llms.github_copilot.authenticator import Authenticator
-    from litellm.llms.github_copilot.common_utils import get_copilot_default_headers
+    served = [m for m in await service.models() if m.get("provider") == provider]
+    model_ids = [str(m.get("id")) for m in served]
+    model = _model_to_check(provider, config, model_ids)
+    if not model:
+        return _test_result(
+            False,
+            "no_model",
+            start,
+            error=f"{provider} serves no model -- add one with `ddeharness provider set {provider} --models <id>`",
+            model_ids=model_ids,
+        )
 
+    context = {"messages": [{"role": "user", "content": _TEST_PROMPT, "timestamp": 0}]}
+    options = {"maxTokens": _TEST_MAX_TOKENS}
+    events = service.stream(provider, model, context, options)
     try:
-        authenticator = Authenticator()
-        # Exchanges the stored device token for an API key when the cached one has
-        # expired, so this is where a revoked seat surfaces.
-        api_key = authenticator.get_api_key()
-        api_base = authenticator.get_api_base()
-    except Exception as exc:  # noqa: BLE001 - reported, not raised
-        return {
-            "ok": False,
-            "status": "oauth_token_missing",
-            "elapsed_ms": 0,
-            "http_status": None,
-            "models_count": None,
-            "model_ids": None,
-            "error": str(exc),
-        }
-
-    if not api_key:
-        return {
-            "ok": False,
-            "status": "oauth_token_missing",
-            "elapsed_ms": 0,
-            "http_status": None,
-            "models_count": None,
-            "model_ids": None,
-            "error": "no OAuth token stored",
-        }
-
-    if not api_base:
-        return {
-            "ok": False,
-            "status": "oauth_token_missing",
-            "elapsed_ms": 0,
-            "http_status": None,
-            "models_count": None,
-            "model_ids": None,
-            "error": "the credential names no API endpoint -- run `ddeharness provider login github-copilot`",
-        }
-
-    return _probe_models_endpoint(
-        api_base.rstrip("/") + "/models",
-        get_copilot_default_headers(api_key),
-        timeout_s=timeout_s,
-        transport=transport,
+        async with asyncio.timeout(timeout_s):
+            async for event in events:
+                kind = event.get("type")
+                if kind == "start":
+                    continue
+                if kind == "error":
+                    failure = event.get("error") or {}
+                    return _test_result(
+                        False,
+                        str(event.get("code") or "error"),
+                        start,
+                        error=str(failure.get("errorMessage") or "the provider refused the request"),
+                        model=model,
+                        model_ids=model_ids,
+                    )
+                return _test_result(True, "valid", start, model=model, model_ids=model_ids)
+    except TimeoutError:
+        return _test_result(
+            False,
+            "timeout",
+            start,
+            error=f"no answer within {timeout_s}s",
+            model=model,
+            model_ids=model_ids,
+        )
+    finally:
+        await events.aclose()
+    return _test_result(
+        False, "no_answer", start, error="the stream ended without an event", model=model, model_ids=model_ids
     )
 
 
-def _probe_codex_catalog(*, timeout_s: float) -> dict[str, Any]:
-    """Verify a Codex credential the way the backend will accept being asked.
+def _model_to_check(provider: str, config: Any, served: list[str]) -> str:
+    """Which of this provider's models the check asks: the configured default.
 
-    The generic probe requests ``{api_base}/v1/models``, which this backend does
-    not serve: a valid OAuth credential came back refused, reading as a bad key.
-    Its catalogue endpoint is both the credential check and the answer to what the
-    account may use.
+    The default model first, when this provider is the one serving it -- that is
+    the model a turn would run -- then the curated shortlist's first entry, then
+    whatever the service lists first. Matched on the bare id, because the service
+    is asked for the id the endpoint serves.
     """
-    import time
+    from opendde_harness.providers.common_models import common_models_for
 
-    from opendde_harness.providers.chatgpt_token import stored_credentials
-    from opendde_harness.providers.codex_catalog import account_models, reset_cache
-
-    start = time.monotonic()
-    reset_cache()  # a probe reports on now, not on what a picker asked minutes ago
-
-    if stored_credentials() is None:
-        return {
-            "ok": False,
-            "status": "oauth_token_missing",
-            "elapsed_ms": 0,
-            "http_status": None,
-            "models_count": None,
-            "model_ids": None,
-            "error": "no credentials found -- run `ddeharness provider login openai-codex`",
-        }
-
-    # Strict, so a failure is reported rather than flattened into an empty list --
-    # and sorted into the one thing the user can do about it. The recovery menus
-    # offer signing in again on one status and Retry on the other, so a credential
-    # problem reported as a network one strands the user on a screen that cannot
-    # fix it. Two ways to arrive at "sign in again": the token could not be
-    # produced at all, and the endpoint refused the one that was.
-    #
-    # The split is not clean and does not claim to be -- the driver wraps a network
-    # failure during refresh in the same error as a revoked token -- so it sorts by
-    # which action has a chance of helping, and both messages name both causes.
+    if not served:
+        return ""
+    candidates: list[str] = []
     try:
-        models = account_models(timeout=timeout_s, strict=True)
-    except RuntimeError as exc:
-        return {
-            "ok": False,
-            "status": "oauth_token_missing",
-            "elapsed_ms": int((time.monotonic() - start) * 1000),
-            "http_status": None,
-            "models_count": None,
-            "model_ids": None,
-            "error": str(exc),
-        }
-    except httpx.HTTPStatusError as exc:
-        refused = exc.response.status_code in (401, 403)
-        return {
-            "ok": False,
-            "status": "oauth_token_missing" if refused else "network_error",
-            "elapsed_ms": int((time.monotonic() - start) * 1000),
-            "http_status": exc.response.status_code,
-            "models_count": None,
-            "model_ids": None,
-            "error": (
-                f"the account refused this credential ({exc.response.status_code}) -- "
-                "run `ddeharness provider login openai-codex`"
-                if refused
-                else str(exc)
-            ),
-        }
-    except Exception as exc:  # noqa: BLE001 - reported, not raised
-        return {
-            "ok": False,
-            "status": "network_error",
-            "elapsed_ms": int((time.monotonic() - start) * 1000),
-            "http_status": None,
-            "models_count": None,
-            "model_ids": None,
-            "error": str(exc),
-        }
-
-    elapsed_ms = int((time.monotonic() - start) * 1000)
-    if not models:
-        return {
-            "ok": False,
-            "status": "oauth_token_missing",
-            "elapsed_ms": elapsed_ms,
-            "http_status": None,
-            "models_count": 0,
-            "model_ids": [],
-            "error": "the account offers no models -- the credential may have been revoked; "
-            "run `ddeharness provider login openai-codex`",
-        }
-
-    return {
-        "ok": True,
-        "status": "valid",
-        "elapsed_ms": elapsed_ms,
-        "http_status": 200,
-        "models_count": len(models),
-        "model_ids": list(models),
-        "error": None,
-    }
+        if model_id.provider_of(config.agents.defaults.model) == provider:
+            candidates.append(str(config.agents.defaults.model))
+    except Exception:  # noqa: BLE001 - a config that cannot answer just has no preference
+        pass
+    candidates.extend(common_models_for(provider))
+    for candidate in candidates:
+        bare = model_id.display(provider, candidate)
+        if bare in served:
+            return bare
+    return served[0]
 
 
 __all__ = [
-    "provider_field_specs",
-    "list_providers",
+    "add_provider_model",
+    "configured_provider_names",
     "get_provider_config",
-    "set_provider_fields",
+    "list_providers",
+    "model_rows",
+    "provider_field_specs",
+    "provider_logout",
+    "remove_provider_entry",
+    "remove_provider_model",
     "reset_provider",
-    "add_provider_endpoint",
-    "remove_provider_endpoint",
-    "list_provider_endpoints",
+    "serves_default_model",
+    "set_model_row",
+    "set_provider_fields",
     "test_provider",
+    "unread_fields",
 ]

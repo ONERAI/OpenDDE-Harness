@@ -6,7 +6,8 @@ CLI startup, see :mod:`opendde_harness.tracing`); this command only launches the
 that reads the captured spans from ``~/.opendde_harness/traces``.
 
 ``ddeharness tracing`` (bare) lazily starts the viewer if it is not already running,
-then opens the browser. It reuses opendde's own Node discovery (:func:`find_node`),
+then opens the browser. It reuses opendde's own Node discovery
+(:func:`opendde_harness.node_runtime.find_node`),
 so it needs the same Node >= 22 that ``ddeharness tui`` already requires.
 
 The background viewer's pid + port are recorded in ``<state_dir>/viewer.pid``
@@ -180,7 +181,7 @@ def _stop_viewer() -> None:
 
 
 def _resolve_node() -> str:
-    from opendde_harness.cli.tui_commands import find_node
+    from opendde_harness.node_runtime import find_node
 
     node, _version = find_node()
     if not node:

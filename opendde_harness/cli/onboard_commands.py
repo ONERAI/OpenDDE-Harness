@@ -4,50 +4,56 @@ Goal: get a new user from ``pip install`` to a working agent in a few
 minutes, without ever opening ``~/.opendde_harness/config.json`` or
 the memory root's config toml.
 
-Steps (mirrors ``my_docs/temp/onboard-flow.mermaid``):
-  0. Welcome
-  1. LLM provider (required; multi-provider, in-step connectivity + test probe)
-  2. Persistent Memory (optional; llm required once enabled,
-     rerank/multimodal optional)
+Steps:
+  0. Language
+  1. LLM provider (required; the TUI's ``/login`` at a terminal, then the
+     connectivity check, the default model and a test message)
+  2. Long-term memory (optional; one question -- it runs on the default model)
   3. Protein Design compute and folding configuration
-  4. Cold-start import from other AI tools (optional)
+  4. Web search (optional)
   5. Done
 
-All writes go through the ``update_providers`` / ``update`` /
-``update_memory`` ops libraries — this module owns the UX layer,
-not config-schema knowledge.
+Step 1 writes through the gateway's own handlers (``tui_rpc.methods.model``),
+which is what makes it the same flow as the TUI's; every other write goes
+through the ``update_providers`` / ``update`` ops libraries. This module owns
+the UX layer, not config-schema knowledge. The long-term memory step is the
+memory plugin's own (``plugin.memory.longterm.onboard``); this module only
+calls it.
 
 Navigation: questionary 2.1.1 has no first-class cross-screen "back", so the
-wizard is a screen state machine and back is expressed as a ``0) back``
-sentinel choice on the screens that support it (Step 1 <-> language pick);
-Steps 2 through 4 are optional (re-run
+wizard is a screen state machine and back is expressed as a ``Back`` row on
+the screens that support it; Steps 2 through 4 are optional (re-run
 ``onboard`` to change them). Ctrl+C exits at any point, keeping whatever was
 already written.
 """
 
 from __future__ import annotations
 
+import asyncio
+import queue
 import sys
-from typing import Any, Callable, Optional
+import threading
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Callable, Optional
+from uuid import uuid4
 
 import typer
 from rich.console import Console
-from rich.panel import Panel
 
-from opendde_harness.cli import onboard_memory
+from opendde_harness.cli import _choice
+from opendde_harness.cli import _chrome as chrome
 from opendde_harness.cli._helpers import (
     DEFAULT_PROBE_MESSAGE,
     print_probe_troubleshooting,
     send_probe,
 )
 from opendde_harness.cli._theme import POINTER, QMARK
-from opendde_harness.providers.registry import (
-    CRED_ENDPOINT,
-    CRED_LOCAL,
-    CRED_OAUTH,
-    credential_kind,
-)
-from opendde_harness.providers.wire import stored_model_id
+from opendde_harness.providers import login_flow, model_id, pi_ids
+from opendde_harness.providers.auth import CRED_ENDPOINT, CRED_KEY, CRED_OAUTH, credential_kind
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from concurrent.futures import Future
+    from typing import Coroutine, Iterator
 
 
 class _ThemedConsole(Console):
@@ -73,7 +79,7 @@ class _ThemedConsole(Console):
 
 console = _ThemedConsole()
 
-_TOTAL_STEPS = 3
+_TOTAL_STEPS = 4
 
 # Sentinel returned by a screen function to ask the runner to go back one
 # screen; ``None`` from a picker means Ctrl+C (exit).
@@ -103,84 +109,28 @@ def _t(en: str, zh: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Curated provider catalogue surfaced in Step 1's picker.
+# Step 1 -- pi's /login, at the terminal.
+#
+# The flow is the TUI's ``/login`` (``ui-tui/src/selectors/authSelector.ts``),
+# which is pi's: the authentication method, then the provider, then the sign-in
+# or the key. It runs against the gateway's own handlers
+# (``tui_rpc.methods.model``), so what the wizard can connect is what the TUI
+# can, by construction; and its words are :mod:`providers.login_flow`'s, which
+# is where they are written once for this side and held to the TUI's.
+#
+# Models are not chosen here, as they are not in ``/login``. What the wizard
+# adds after a provider is connected is its own: a check that the provider
+# answers, the default model, and a test message -- the things a first run has
+# to settle before the TUI can open at all.
 # ---------------------------------------------------------------------------
 
-
-# Sentinel entries the picker renders as its own step rather than a provider.
-_PICK_LITELLM_VENDOR = "__litellm_vendor__"
-
-# Providers offered during onboarding, grouped by authentication method.
-_CURATED_GROUPS: list[dict[str, Any]] = [
-    {
-        "kind": "api_key",
-        "providers": [
-            {
-                "name": "openrouter",
-                "label": "OpenRouter",
-                "label_zh": "OpenRouter",
-            },
-            {"name": "openai", "label": "OpenAI", "label_zh": "OpenAI"},
-            {"name": "anthropic", "label": "Anthropic", "label_zh": "Anthropic"},
-            {"name": "gemini", "label": "Gemini", "label_zh": "Gemini"},
-            {
-                "name": "minimax",
-                "label": "MiniMax",
-                "label_zh": "MiniMax",
-            },
-            {"name": "deepseek", "label": "DeepSeek", "label_zh": "DeepSeek"},
-            {"name": "zai", "label": "GLM", "label_zh": "GLM"},
-            {"name": "dashscope", "label": "DashScope", "label_zh": "阿里云百炼"},
-            {"name": "moonshot", "label": "Kimi", "label_zh": "Kimi"},
-            {"name": "volcengine", "label": "VolcEngine", "label_zh": "火山方舟"},
-            {"name": "siliconflow", "label": "SiliconFlow", "label_zh": "硅基流动"},
-            {"name": "groq", "label": "Groq", "label_zh": "Groq"},
-            {"name": "aihubmix", "label": "AiHubMix", "label_zh": "AiHubMix"},
-            {"name": "azure_openai", "label": "Azure OpenAI", "label_zh": "Azure OpenAI"},
-        ],
-    },
-    {
-        "kind": "oauth",
-        "providers": [
-            {
-                "name": "github_copilot",
-                "label": "GitHub Copilot (OAuth)",
-                "label_zh": "GitHub Copilot(OAuth 登录)",
-            },
-            {"name": "openai_codex", "label": "OpenAI Codex (OAuth)", "label_zh": "OpenAI Codex(OAuth 登录)"},
-        ],
-    },
-    {
-        "kind": "local",
-        "providers": [
-            {"name": "ollama_chat", "label": "Ollama (local)", "label_zh": "Ollama(本地)"},
-            {"name": "hosted_vllm", "label": "vLLM / self-hosted", "label_zh": "vLLM / 自托管"},
-        ],
-    },
-    {
-        "kind": "fallback",
-        "providers": [
-            {
-                "name": _PICK_LITELLM_VENDOR,
-                "label": "Another supported vendor (type to search)",
-                "label_zh": "其他支持的厂商(输入可搜索)",
-            },
-            {
-                "name": "custom",
-                "label": "Self-hosted OpenAI-compatible endpoint",
-                "label_zh": "自建 OpenAI 兼容端点",
-            },
-        ],
-    },
-]
-
-# Flat view for callers that only need "which providers does the wizard offer".
-_CURATED_PROVIDERS: list[dict[str, Any]] = [
-    entry for group in _CURATED_GROUPS for entry in group["providers"] if entry["name"] != _PICK_LITELLM_VENDOR
-]
+#: The provider list's one row that is not a provider: declaring an endpoint
+#: the gateway has never heard of. Ours, and the one thing in the flow that is
+#: not pi's; it sits under the key method because an endpoint is reached by one.
+_DECLARE_ENDPOINT = object()
 
 _QUESTIONARY_INSTALL_HINT = (
-    "[red]Missing dependency:[/red] [accent]questionary[/accent] is required for "
+    "[error]Missing dependency:[/error] [accent]questionary[/accent] is required for "
     "interactive onboarding.\n"
     "Install it with: [accent]uv add 'questionary>=2.0,<3.0'[/accent]\n"
     "Or re-run with [accent]--non-interactive[/accent] plus the relevant flags."
@@ -248,35 +198,18 @@ def _pick_language() -> None:
     ``set_language`` in :func:`_run_wizard_body`.
     """
     global _LANG
-    questionary = _require_questionary()
-    from opendde_harness.cli._styles import OPENDDE_HARNESS_STYLE
 
-    # Framed like the other screens (bilingual, since no language is chosen yet)
-    # so it reads as the wizard's first step, not a bare floating list.
-    console.print()
-    console.print(
-        Panel(
-            "[heading]Let's set up OpenDDE Harness — first, choose your language.[/heading]\n"
-            "[dim]开始配置 OpenDDE Harness — 请先选择语言。[/dim]",
-            title="[bold][accent]OpenDDE Harness setup[/accent][/bold]",
-            title_align="left",
-            border_style="border",
-            padding=(1, 2),
-        )
-    )
-    console.print("  [dim]↑↓ select · Enter confirm · Ctrl+C quit[/dim]")
+    # The lockup the TUI opens with, then the ask. Bilingual, since no language
+    # is chosen yet.
+    chrome.lockup(console)
+    chrome.caption(console, "Setup · 配置向导")
     console.print()
 
-    picked = questionary.select(
+    picked = _choice.row(
         "Language / 语言",
-        choices=[
-            questionary.Choice("English", value="en"),
-            questionary.Choice("中文(简体)", value="zh"),
-        ],
+        [("English", "en"), ("中文(简体)", "zh")],
         default=_LANG,  # preselect the saved language on a re-run
-        style=OPENDDE_HARNESS_STYLE,
-        qmark=_QMARK,
-    ).ask()
+    )
     if picked is None:
         raise typer.Exit(1)
     _LANG = picked
@@ -288,21 +221,7 @@ def _pick_language() -> None:
 
 
 def _step_header(n: int, title: str) -> None:
-    # Progress dots: filled for done/current steps, hollow for upcoming ones.
-    dots = " ".join("[accent]●[/accent]" if i <= n else "[grey37]○[/grey37]" for i in range(1, _TOTAL_STEPS + 1))
-    console.print()
-    console.print(
-        Panel(
-            f"[heading]{title}[/heading]",
-            title=f"[bold][accent]{_t('Step', '步骤')} {n}/{_TOTAL_STEPS}[/accent][/bold]",
-            title_align="left",
-            subtitle=dots,
-            subtitle_align="right",
-            border_style="border",
-            padding=(0, 2),
-        )
-    )
-    console.print()  # breathing room between the header and the step's prompts
+    chrome.step(console, number=n, total=_TOTAL_STEPS, title=title, word=_t("Step", "步骤"))
 
 
 def _check_tty_or_die(non_interactive: bool) -> None:
@@ -311,7 +230,7 @@ def _check_tty_or_die(non_interactive: bool) -> None:
         return
     if not sys.stdout.isatty():
         console.print(
-            "[red]Non-interactive terminal detected.[/red]\n"
+            "[error]Non-interactive terminal detected.[/error]\n"
             "Re-run with: "
             "[accent]ddeharness onboard --non-interactive --provider <name> --api-key <key>[/accent]"
         )
@@ -345,13 +264,12 @@ def _is_config_populated() -> bool:
     satisfied: a default model plus credentials for whoever answers it. Either
     alone is not enough to talk to a model.
 
-    Which provider answers is not re-derived here. The config already resolves
-    it -- honoring an explicit ``agents.defaults.provider``, then prefix over
-    keyword, and declining to fall back to an OAuth provider -- and a second
-    derivation from the model-id prefix is how this gate came to disagree with
-    ``ddeharness status`` about a signed-in provider. What is left to ask is whether
-    that provider's credentials are actually on disk, which is the one thing the
-    resolver takes on trust for the OAuth families.
+    Which provider answers is not re-derived here. The model id's prefix is the
+    whole rule and the config is what applies it, so the config is asked --
+    re-splitting the id in this gate is how it came to disagree with
+    ``ddeharness status`` about a signed-in provider. What is left to ask is
+    whether that provider's credentials are actually on disk, which is the one
+    thing routing takes on trust for a sign-in.
     """
     from opendde_harness.config.loader import load_config
 
@@ -371,46 +289,96 @@ def _is_config_populated() -> bool:
     return bool(serving and serving in _configured_providers())
 
 
-def _handle_existing_config(*, reset: bool, yes: bool, non_interactive: bool) -> None:
-    """Guard against silently overwriting an existing config in non-interactive
-    runs.
+def _reusable_config() -> bool:
+    """Whether the configuration on disk is one this build can carry forward.
 
-    Interactive runs always fall through into the structured wizard: every step
-    defaults to "Keep current" for already-set values, so pressing Enter all the
-    way through is equivalent to skipping, and changing any value reconfigures
-    just that one. No separate skip/redo/quit screen — it would drop the wizard's
-    welcome banner and step framing.
+    The rule is the shape, not the release. A build that did not change
+    ``config.json``'s shape has nothing to regenerate, and a run of the wizard
+    to fix one step should not cost the other three -- which is what starting
+    clean every time cost. A shape this build does not know is not migrated
+    (this program never migrates): it is moved aside and the run starts clean.
+
+    Unreadable counts as not reusable. A file too damaged to parse cannot be
+    reused field by field, and the wizard is a better answer than a traceback.
     """
-    if reset:
-        return
-    if not _is_config_populated():
-        return
+    from opendde_harness.config.loader import get_config_path
+    from opendde_harness.config.schema import CONFIG_SCHEMA_VERSION
 
-    if non_interactive:
-        if yes:
-            console.print("[dim]Existing config detected; --yes set, proceeding with overwrite.[/dim]")
-            return
-        console.print(
-            "[red]Existing config detected.[/red] Pass [accent]--reset[/accent] (or "
-            "[accent]--yes[/accent]) to overwrite, or edit in place with "
-            "[accent]ddeharness provider set[/accent]."
+    if not get_config_path().exists():
+        return False
+    try:
+        written = _load_raw_config().get("schemaVersion")
+    except Exception:  # noqa: BLE001 - the read path raises on a damaged file
+        return False
+    return written == CONFIG_SCHEMA_VERSION
+
+
+def _retire_existing_setup() -> Optional[Path]:
+    """Move every configuration file aside so the wizard starts from nothing.
+
+    The wizard writes every section it walks, so a run over old files left
+    behind whatever those files carried and this run did not touch -- a retired
+    field, a provider shape from an earlier release, a default model naming an
+    entry that was removed, a checkpoint chosen by a build before the first
+    release -- and the next load refused the whole file for it, or a later step
+    quietly kept the value. Nothing is inherited now: the main config, the
+    migration log, the prepared-assets record, the compute service's record of
+    its container, and the memory service's own settings all move into one
+    ``backup-<timestamp>/`` beside them, and a memory server running on the old
+    settings is stopped first. Weights, the workspace (sessions, memory notes),
+    task records and sign-in grants are not configuration and stay where they
+    are.
+    """
+    import shutil
+    from datetime import datetime
+
+    from opendde_harness.config.loader import get_config_path
+    from opendde_harness.config.paths import get_data_dir
+    from opendde_harness.plugin.memory.longterm import _library, _server
+    from opendde_harness.plugin.memory.longterm.settings import memory_root
+
+    data = get_data_dir()
+    memory = memory_root()
+    candidates = [
+        get_config_path(),
+        data / "config.migrations.json",
+        data / "compute-assets.json",
+        data / "compute" / "local.json",
+        data / "compute" / "local.lock",
+        memory / _library.CONFIG_FILENAME,
+        memory / _library.OME_CONFIG_FILENAME,
+    ]
+    present = [path for path in candidates if path.exists()]
+    if not present:
+        return None
+    if any(path.parent == memory for path in present):
+        try:
+            _server.stop_recorded_server(memory)
+        except Exception:  # noqa: BLE001 - a server that will not stop is not a reason to keep its settings
+            pass
+    backup = data / f"backup-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    moved: list[str] = []
+    for path in present:
+        relative = path.relative_to(data) if path.is_relative_to(data) else Path(path.name)
+        target = backup / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(path), str(target))
+        moved.append(relative.as_posix())
+    console.print(
+        _t(
+            f"  [dim]Previous configuration moved to {backup.name}/ ({', '.join(moved)}); this run starts clean.[/dim]",
+            f"  [dim]原有配置已移到 {backup.name}/（{', '.join(moved)}）；本次从空白开始。[/dim]",
         )
-        raise typer.Exit(2)
-    # Interactive: fall through to the wizard (per-step "Keep current" handles
-    # the existing config gracefully).
+    )
+    return backup
 
 
 def _bootstrap_empty_config() -> None:
     """Make sure ``~/.opendde_harness/config.json`` + workspace dir exist before we patch.
 
-    We seed the user-facing extension defaults (memory / plugins / skillForge),
-    including ``memory.backend = "longterm"`` (the schema default). The memory service
-    degrades gracefully when its models aren't configured yet (empty recall + a
-    warning, never a crash), so an enabled-but-modelless install is safe. The
-    wizard's Step 2 — and its skip / non-interactive guard — resolve the backend
-    back to ``None`` when the user opts out or never configures the one required
-    model (``_memory_enabled`` gates on the llm role being present, not just the
-    backend name; embedding and rerank only cost recall quality).
+    We seed the user-facing extension defaults (memory / plugins / skillForge).
+    The wizard's memory step then sets ``memory.backend`` to the bundled backend
+    or to ``None``, per the one question it asks.
 
     Seeding runs on EVERY onboard, not just a brand-new config: the writer is
     ``setdefault``-based (non-clobbering), so it backfills these blocks into a
@@ -425,365 +393,113 @@ def _bootstrap_empty_config() -> None:
     path = get_config_path()
     if not path.exists():
         save_config(load_config())  # writes default Config() to disk
-    onboard_memory._init_extension_block_defaults()
+    from opendde_harness.config.update import init_extension_block_defaults
+
+    init_extension_block_defaults()
     workspace = get_workspace_path()
     workspace.mkdir(parents=True, exist_ok=True)
-    sync_workspace_templates(workspace)
+    # Silent: the wizard is mid-screen, and which template files it copied is
+    # its own bookkeeping rather than something the user chose.
+    sync_workspace_templates(workspace, silent=True)
 
 
 # ---------------------------------------------------------------------------
-# Step 1 — provider primitives (reused verbatim from the 3-step wizard)
+# Step 1 — provider primitives
 # ---------------------------------------------------------------------------
 
 
 def _provider_label(name: str) -> str:
-    """Display label for a provider, falling back to the registry's display_name."""
-    for entry in _CURATED_PROVIDERS:
-        if entry["name"] == name:
-            return _t(entry["label"], entry.get("label_zh", entry["label"]))
-    try:
-        from opendde_harness.providers.registry import find_by_name
+    """What to call this provider on screen: pi's own name for it, else the id.
 
-        spec = find_by_name(name)
-        return spec.label if spec else name
-    except Exception:
-        return name
+    Nothing is invented and nothing is translated -- a provider id has one
+    spelling worldwide and so does a vendor's name, so both languages show the
+    same word. A provider this config declares has no pi name, and its id is
+    the name the user chose for it, which is the right thing to show.
+    """
+    return pi_ids.display_name(name)
 
 
 def _validate_provider_name(name: str) -> str:
-    """Resolve a user-supplied provider name (kebab or snake) to a registry key.
+    """Resolve a provider name typed by hand to the id its entry is written under.
 
-    A vendor LiteLLM routes to but OpenDDE Harness carries no spec for is configurable
-    too: the wizard has no default model or OAuth flow to offer it, but it does
-    not need one -- the credentials go in under the vendor's name and the model
-    list comes from the vendor itself. Callers must therefore treat the spec as
-    optional metadata, not as permission.
+    There is nothing to normalize: a pi provider id has exactly one spelling,
+    and a name that is not one names a provider this config declares -- which is
+    a perfectly good answer, since that is how a self-hosted server is reached.
+    The one case worth stopping for is a near-miss of a pi id: written as given
+    it would declare a provider nobody serves, and then be refused for having no
+    address, which is a true sentence about the wrong problem.
+    ``auth.key_refusal`` is what says which name that is.
     """
-    from opendde_harness.config.update_providers import provider_field_specs
-    from opendde_harness.providers.registry import find_by_name, normalize_provider_name
+    from opendde_harness.providers.auth import key_refusal
 
-    candidate = name.replace("-", "_")
-    try:
-        provider_field_specs(candidate)
-    except KeyError as exc:
-        raise typer.BadParameter(str(exc))
-    spec = find_by_name(candidate)
-    if spec is None:
-        # No spec, but provider_field_specs above already confirmed LiteLLM
-        # routes to it, which is all configuring it takes.
-        return normalize_provider_name(candidate)
-    # Return the current name: everything downstream compares and stores by it,
-    # and a former name would have the wizard reading one section and writing
-    # another.
-    return spec.name
+    candidate = (name or "").strip()
+    removed = pi_ids.removed_message(candidate)
+    if removed:
+        raise typer.BadParameter(removed)
+    refusal = key_refusal(candidate)
+    if refusal:
+        raise typer.BadParameter(refusal)
+    if not candidate or "/" in candidate or any(c.isspace() for c in candidate):
+        raise typer.BadParameter(
+            f"{name!r} is not a provider id: an id carries no slash and no spaces, "
+            "because it is the prefix every one of that provider's model ids starts with."
+        )
+    return candidate
 
 
-def _back_placeholder(allow_back: bool, label: Optional[str] = None) -> Any:
-    """A faint in-field placeholder telling the user what an empty submit does.
+def _stored_entry(provider: str) -> Optional[dict[str, Any]]:
+    """This provider's entry as flat plaintext fields, or ``None`` when it has none.
 
-    Rendered greyed inside the input (via prompt_toolkit's ``placeholder``),
-    it disappears the moment they type and leaves nothing behind once the
-    prompt is answered. Returns ``None`` when back isn't offered. ``label``
-    overrides the default "go back" wording for prompts where an empty submit
-    means something else (e.g. cancelling rather than rewinding a step).
+    "No entry" and "an entry with nothing in it" are different states: an entry
+    exists because somebody wrote it, so a provider without one has never been
+    configured -- and that is exactly what a rollback has to be able to put back.
     """
-    if not allow_back:
+    from opendde_harness.config.update_providers import get_provider_config
+
+    stored = _load_raw_config().get("providers")
+    if not isinstance(stored, dict) or provider not in stored:
         return None
-    return [("fg:#6c6c6c italic", label or _t("empty ↵ to go back", "留空回车返回上一步"))]
+    entry = get_provider_config(provider, redact_secrets=False)
+    # The flat view names the models and drops what each row declares. A
+    # rollback has to put a row back as it stood, so the list comes from the
+    # file itself -- writing back the flattened names would quietly turn every
+    # row into a bare id and lose the context window somebody typed.
+    models = stored[provider].get("models")
+    if isinstance(models, list):
+        entry["models"] = models
+    return entry
 
 
-def _collect_fields(prompts: list[Callable[[], Any]]) -> Optional[list[Any]]:
-    """Run text-prompt callables in order with empty-submit = back.
+def _stored_kind(provider: str) -> str:
+    """How this provider is reached, derived from what is stored for it.
 
-    Each callable prompts one field and returns its value, or ``_BACK`` (an
-    empty submit) to rewind one field. Backing out of the first field returns
-    ``None`` so the caller can rewind to the preceding screen. Returns the list
-    of collected values on success.
+    One question, asked of the entry rather than of a table of ours:
+    ``auth.credential_kind`` reads the entry's own ``login`` and whether pi
+    ships the id, and every branch the wizard takes about an already-configured
+    provider -- which field to re-prompt, what a failure offers, what "remove"
+    clears -- follows from it. Answering it independently at each of those sites
+    is what used to make them disagree.
     """
-    values: list[Any] = []
-    i = 0
-    while i < len(prompts):
-        value = prompts[i]()
-        if value is _BACK:
-            if i == 0:
-                return None
-            values.pop()
-            i -= 1
-            continue
-        if i < len(values):
-            values[i] = value
-        else:
-            values.append(value)
-        i += 1
-    return values
+    return credential_kind(provider, _stored_entry(provider))
 
 
-def _select_provider_row() -> Optional[str]:
-    """Render the grouped provider list once and return the raw choice.
+def _is_declared(provider: str) -> bool:
+    """Does this config say where the provider is, rather than pi?
 
-    Separate from `_select_provider` so backing out of the vendor sub-list can
-    show this list again rather than unwinding the whole step.
+    A different question from :func:`_stored_kind`, which answers what credential
+    to ask for. ``baseUrl`` is what tells the two kinds apart -- the schema's own
+    rule -- and what follows from it is: the address is ours to re-prompt, and
+    the entry's ``models`` list is that provider's whole catalogue, so a model
+    chosen here has to join it. That stays true of the one built-in id
+    configured this way, Azure, whose resource belongs to the tenant and whose
+    deployment names pi has never heard of.
     """
-    questionary = _require_questionary()
-    from opendde_harness.cli._styles import OPENDDE_HARNESS_STYLE
-
-    choices: list[Any] = []
-    for group in _CURATED_GROUPS:
-        # A rule between groups, so the API-key providers, the OAuth ones, the
-        # local deployments and the two fallbacks read as four decisions rather
-        # than one list of twenty.
-        if choices:
-            choices.append(questionary.Separator())
-        for entry in group["providers"]:
-            choices.append(
-                questionary.Choice(
-                    _t(entry["label"], entry.get("label_zh", entry["label"])),
-                    value=entry["name"],
-                )
-            )
-    choices.append(questionary.Separator())
-    choices.append(questionary.Choice(_t("Back", "返回"), value=_BACK))
-
-    return questionary.select(
-        _t("Provider:", "服务商:"),
-        choices=choices,
-        style=OPENDDE_HARNESS_STYLE,
-        qmark=_QMARK,
-    ).ask()  # None on Ctrl+C
+    return bool((_stored_entry(provider) or {}).get("base_url"))
 
 
-def _select_provider() -> Optional[str]:
-    """Interactive provider picker built from the curated catalogue.
-
-    Returns the provider name, ``_BACK`` if the user chose the back sentinel,
-    or ``None`` on Ctrl+C.
-    """
-    picked = _select_provider_row()
-    while picked == _PICK_LITELLM_VENDOR:
-        # Second step rather than a hundred more rows: LiteLLM routes to far more
-        # vendors than anyone wants to scroll, and typing the name is how someone
-        # who already knows which one they want gets there.
-        #
-        # Backing out of it returns to this list, not out of the step: the user
-        # opened a sub-list, so empty-submit means "close the sub-list". Passing
-        # its _BACK straight up sent them to the language screen instead.
-        typed = _prompt_litellm_vendor()
-        if typed is None:
-            return None
-        if typed is not _BACK:
-            return typed
-        picked = _select_provider_row()
-    return picked  # _BACK on back, None on Ctrl+C
-
-
-def _litellm_vendor_choices() -> list[str]:
-    """Vendor names for the second step: the ones the picker does not already show.
-
-    Read from the packaged snapshot rather than LiteLLM itself, so offering them
-    costs no import on a path that only renders choices.
-    """
-    from opendde_harness.providers.litellm_provider_names import LITELLM_PROVIDER_NAMES
-    from opendde_harness.providers.registry import find_by_name, normalize_provider_name
-
-    # Every name a listed provider answers to, not just the one shown: LiteLLM
-    # knows "ollama" and "vllm", which are the pre-rename spellings of two rows
-    # already on the list, so matching on the displayed name alone offered them
-    # a second time under a name that resolves to the same section.
-    already_listed: set[str] = set()
-    for entry in _CURATED_PROVIDERS:
-        spec = find_by_name(entry["name"])
-        already_listed |= set(spec.route_names) if spec else {normalize_provider_name(entry["name"])}
-    return sorted(n for n in LITELLM_PROVIDER_NAMES if normalize_provider_name(n) not in already_listed)
-
-
-def _prompt_litellm_vendor() -> Optional[str]:
-    """Ask for a vendor by name, completing against the ones LiteLLM routes to.
-
-    Returns the provider name, ``_BACK`` to rewind to the picker, or ``None`` on
-    Ctrl+C. The names come from the packaged snapshot, so offering them costs no
-    LiteLLM import.
-    """
-    questionary = _require_questionary()
-    from opendde_harness.cli._styles import OPENDDE_HARNESS_STYLE
-    from opendde_harness.providers.registry import normalize_provider_name
-
-    choices = _litellm_vendor_choices()
-
-    typed = questionary.autocomplete(
-        _t(
-            f"Vendor name ({len(choices)} supported - type to search, Tab to complete, empty to go back):",
-            f"厂商名(支持 {len(choices)} 家 — 输入可搜索,Tab 补全,留空返回):",
-        ),
-        choices=choices,
-        style=OPENDDE_HARNESS_STYLE,
-        qmark=_QMARK,
-        ignore_case=True,
-        match_middle=True,
-    ).ask()
-    if typed is None:
-        return None
-    typed = typed.strip()
-    if not typed:
-        return _BACK
-    # Validation happens where the name is used, not here: the caller runs it
-    # through the same gate the --provider flag goes through, which is what turns
-    # a typo into a message instead of a traceback.
-    return normalize_provider_name(typed)
-
-
-def _prompt_api_key(provider: str, *, allow_back: bool = False, back_label: Optional[str] = None) -> Any:
-    """Ask for an API key (hidden input). Returns ``_BACK`` on empty submit
-    when ``allow_back`` is set, else the key string. ``back_label`` overrides
-    the empty-submit hint for callers where it cancels rather than rewinds."""
-    questionary = _require_questionary()
-    from opendde_harness.cli._styles import OPENDDE_HARNESS_STYLE
-
-    def _validate(v: str) -> Any:
-        if allow_back and v == "":
-            return True  # a truly-empty submit is the back/cancel signal
-        return (
-            True
-            if len(v.strip()) >= 8
-            else _t(
-                "API key looks off (empty or too short) — please re-enter (≥ 8 chars).",
-                "API Key 看起来不对(过短或为空),请重新输入(至少 8 位)。",
-            )
-        )
-
-    key = questionary.password(
-        _t("Paste your API key:", "粘贴你的 API Key:"),
-        validate=_validate,
-        placeholder=_back_placeholder(allow_back, back_label),
-        style=OPENDDE_HARNESS_STYLE,
-        qmark=_QMARK,
-    ).ask()
-    if key is None:
-        raise typer.Exit(1)
-    key = key.strip()
-    if allow_back and key == "":
-        return _BACK
-    if not key:
-        raise typer.Exit(1)
-    return key
-
-
-def _prompt_local_api_base(spec: Any, *, current: str = "", allow_back: bool = False) -> Any:
-    """Ask a local deployment for its server URL. Returns ``_BACK`` on empty submit.
-
-    A local deployment is reached by address, not by key -- there is nothing to
-    authenticate against a server the user is running.
-
-    The field is seeded with the address already configured, falling back to the
-    registry default for a first-time setup. Seeding the default unconditionally
-    meant reconfiguring a server at some other address offered localhost, and
-    pressing Enter to move on replaced a working address with it.
-    """
-    questionary = _require_questionary()
-    from opendde_harness.cli._styles import OPENDDE_HARNESS_STYLE
-
-    def _validate(v: str) -> Any:
-        if allow_back and v.strip() == "":
-            return True
-        return (
-            True
-            if v.strip().startswith(("http://", "https://"))
-            else _t("URL must start with http:// or https://", "地址需以 http:// 或 https:// 开头")
-        )
-
-    url = questionary.text(
-        _t(f"{spec.label} server URL:", f"{spec.label} 服务地址:"),
-        default=current or spec.default_api_base or "",
-        validate=_validate,
-        placeholder=_back_placeholder(allow_back),
-        style=OPENDDE_HARNESS_STYLE,
-        qmark=_QMARK,
-    ).ask()
-    if url is None:
-        # Ctrl+C quits, like the sibling credential prompts. Returning None left
-        # each caller to decide what it meant, and they did not agree.
-        raise typer.Exit(1)
-    url = url.strip()
-    if allow_back and not url:
-        return _BACK
-    return url
-
-
-def _prompt_base_url(default: str = "https://", *, allow_back: bool = False) -> Any:
-    """Ask for an OpenAI-compatible base URL (used by the 'custom' provider).
-    Returns ``_BACK`` on empty submit when ``allow_back`` is set."""
-    questionary = _require_questionary()
-    from opendde_harness.cli._styles import OPENDDE_HARNESS_STYLE
-
-    # With back enabled, don't seed a default — an empty field must be reachable
-    # so the user can submit nothing to rewind.
-    seed = "" if allow_back else default
-
-    def _validate(v: str) -> Any:
-        if allow_back and v == "":
-            return True
-        return (
-            True
-            if v.startswith(("http://", "https://"))
-            else _t("URL must start with http:// or https://", "地址需以 http:// 或 https:// 开头")
-        )
-
-    url = questionary.text(
-        _t("Base URL (must include /v1):", "Base URL(需包含 /v1):"),
-        default=seed,
-        validate=_validate,
-        placeholder=_back_placeholder(allow_back),
-        style=OPENDDE_HARNESS_STYLE,
-        qmark=_QMARK,
-    ).ask()
-    if url is None:
-        raise typer.Exit(1)
-    url = url.strip()
-    if allow_back and url == "":
-        return _BACK
-    if not url:
-        raise typer.Exit(1)
-    return url
-
-
-def _prompt_wire(*, allow_back: bool = False) -> Any:
-    """Ask which wire a custom endpoint serves. Returns ``_BACK`` when backing out.
-
-    Asked rather than probed: neither wire can be told from an address, and a
-    wrong one is a hard error on every request. Chat Completions is first and
-    default because it is what nearly every relay implements.
-    """
-    questionary = _require_questionary()
-    from opendde_harness.cli._styles import OPENDDE_HARNESS_STYLE
-
-    choices: list[Any] = [
-        questionary.Choice(
-            _t(
-                "Chat Completions  (POST /v1/chat/completions, most relays)",
-                "Chat Completions(POST /v1/chat/completions,多数中转支持)",
-            ),
-            value="chat",
-        ),
-        questionary.Choice(
-            _t("Responses  (POST /v1/responses, OpenAI-native)", "Responses(POST /v1/responses,OpenAI 原生)"),
-            value="responses",
-        ),
-    ]
-    if allow_back:
-        choices.append(questionary.Choice(_t("Back", "返回"), value=_BACK))
-    chosen = questionary.select(
-        _t("Wire protocol the endpoint serves:", "端点支持的接口协议:"),
-        choices=choices,
-        style=OPENDDE_HARNESS_STYLE,
-        qmark=_QMARK,
-    ).ask()
-    if chosen is None:
-        raise typer.Exit(1)
-    return chosen
-
-
-def _prompt_custom_model(*, allow_back: bool = False) -> Any:
-    """Select manual model entry for an endpoint without a model catalogue."""
-    return _select_model_id([], allow_back=allow_back)
+def _split_ids(raw: str) -> list[str]:
+    """A comma-separated answer as a list of ids, in the order it was typed."""
+    return list(dict.fromkeys(part.strip() for part in raw.split(",") if part.strip()))
 
 
 def _select_model_id(
@@ -797,18 +513,17 @@ def _select_model_id(
 ) -> Any:
     """Show an expanded, searchable model list with explicit manual entry.
 
-    Rows are titled with the vendor's own id: the provider was chosen one step
-    earlier, so prefixing every row with it says nothing. The value behind each
-    row is the qualified id that gets stored.
+    Rows are titled with the id the endpoint serves: the provider was chosen one
+    step earlier, so repeating its name on every row says nothing. The value
+    behind each row is the qualified id that gets stored.
     """
     questionary = _require_questionary()
     from opendde_harness.cli._styles import OPENDDE_HARNESS_STYLE
-    from opendde_harness.providers.wire import display_model_id
 
     models = list(dict.fromkeys(model.strip() for model in models if model.strip()))
     selected_default = default_model if default_model in models else next(iter(models), _MANUAL_MODEL)
     listed = [
-        questionary.Choice(display_model_id(provider, model) if provider else model, value=model) for model in models
+        questionary.Choice(model_id.display(provider, model) if provider else model, value=model) for model in models
     ]
     manual = questionary.Choice(_t("Enter a model name", "手动输入模型名称"), value=_MANUAL_MODEL)
     choices: list[Any] = [manual, *listed] if manual_first else [*listed, manual]
@@ -835,7 +550,7 @@ def _select_model_id(
         chosen = questionary.text(
             _t("Model name:", "模型名称:"),
             default=default_model or "",
-            placeholder=_back_placeholder(True, _t("empty ↵ to return to the list", "留空回车返回模型列表")),
+            placeholder=_placeholder(_t("empty ↵ to return to the list", "留空回车返回模型列表")),
             style=OPENDDE_HARNESS_STYLE,
             qmark=_QMARK,
         ).ask()
@@ -845,141 +560,646 @@ def _select_model_id(
             return chosen.strip()
 
 
-def _run_oauth_login(provider: str) -> bool:
-    """Dispatch the OAuth login handler registered by ``provider_commands``.
-
-    Returns ``True`` on success. A login that fails (the handler raises
-    ``typer.Exit`` or any error) returns ``False`` so the caller can offer a
-    retry / back menu instead of tearing the whole wizard down. A genuine
-    Ctrl+C (``KeyboardInterrupt``) is left to propagate as a quit.
-    """
-    from opendde_harness.cli.provider_commands import _LOGIN_HANDLERS
-    from opendde_harness.providers.registry import find_by_name
-
-    spec = find_by_name(provider)
-    if credential_kind(provider) != CRED_OAUTH:
-        console.print(
-            _t(
-                f"  [red]✗ {provider} is not an OAuth provider.[/red]",
-                f"  [red]✗ {provider} 不是 OAuth 服务商。[/red]",
-            )
-        )
-        raise typer.Exit(1)
-    handler = _LOGIN_HANDLERS.get(spec.name)
-    if not handler:
-        console.print(
-            _t(
-                f"  [red]✗ No login handler registered for {provider}.[/red]",
-                f"  [red]✗ 未为 {provider} 注册登录处理器。[/red]",
-            )
-        )
-        raise typer.Exit(1)
-    console.print(
-        _t(
-            f"  [accent]Starting OAuth login for {spec.label}…[/accent]\n",
-            f"  [accent]正在为 {spec.label} 启动 OAuth 登录…[/accent]\n",
-        )
-    )
-    console.print(
-        _t(
-            "  [dim]A browser window / link will open — finish the sign-in there, "
-            "then come back here. This waits until you're done.[/dim]\n",
-            "  [dim]会打开浏览器窗口 / 链接 — 在那里完成登录后回到这里;这里会一直等到你完成。[/dim]\n",
-        )
-    )
-    try:
-        handler()
-    except typer.Exit as exc:
-        # Handlers signal a failed login with Exit(1); Exit(0) (if any) is success.
-        if exc.exit_code:
-            return False
-    except Exception as exc:  # network / browser / token errors — recoverable
-        console.print(
-            _t(
-                f"  [yellow]✗ Login didn't complete: {exc}[/yellow]",
-                f"  [yellow]✗ 登录未完成:{exc}[/yellow]",
-            )
-        )
-        return False
-    return True
-
-
 def _verify_provider(provider: str, *, skip_test: bool = False) -> tuple[bool, str, Optional[list[str]]]:
-    """Hit ``GET /v1/models`` to verify the credentials we just stored.
+    """Ask the provider for a few tokens, to verify what was just stored.
 
     Returns ``(ok, status, model_ids)``. ``status`` is one of the ops-library
-    failure codes (``invalid_key`` / ``no_credits`` / ``rate_limited`` /
-    ``network_error`` / …) and drives the failure submenu's wording.
+    failure codes (``not_configured`` / ``auth`` / ``timeout`` / …) and drives
+    the failure submenu's wording; ``model_ids`` is what the model layer serves
+    for this provider -- bare ids, as the endpoint serves them -- which the model
+    step offers as suggestions.
+
+    It used to be a free ``GET /v1/models``, which told the truth about a key and
+    nothing about the path a turn takes: seven of the vendors publish no such
+    route, and the wizard had a whole branch for saying so and skipping. This
+    asks the model layer the question the wizard is actually asking -- can this
+    provider answer -- and pays a handful of tokens for it.
     """
     from opendde_harness.config.update_providers import test_provider as probe
 
-    # A local deployment has no key to verify -- what is being checked is that
-    # the address answers, and saying "API key" there describes a field the user
-    # was never asked for.
-    if credential_kind(provider) == CRED_LOCAL:
-        console.print(_t("  [dim]⏳ Reaching the server…[/dim]", "  [dim]⏳ 正在连接服务…[/dim]"))
+    # Worded by what the provider is reached by. A declared endpoint may hold no
+    # key at all, and "verifying your API key" there describes a field the user
+    # was never asked for; a sign-in's credential is not in this file.
+    kind = _stored_kind(provider)
+    if kind == CRED_ENDPOINT:
+        label = _t("Reaching the endpoint…", "正在连接端点…")
+    elif kind == CRED_OAUTH:
+        label = _t("Checking the sign-in…", "正在检查登录状态…")
     else:
-        console.print(_t("  [dim]⏳ Verifying your API key…[/dim]", "  [dim]⏳ 正在验证 API Key…[/dim]"))
-    result = probe(provider)
+        label = _t("Verifying your API key…", "正在验证 API Key…")
+    with chrome.working(console, label):
+        result = probe(provider)
     if result["ok"]:
         models = result.get("models_count")
-        suffix = _t(f" ({models} models available)", f"(共 {models} 个可用模型)") if models else ""
-        console.print(_t(f"  [green]✓ Connected!{suffix}[/green]", f"  [green]✓ 连接成功!{suffix}[/green]"))
+        suffix = _t(f" ({models} models available)", f"（共 {models} 个可用模型）") if models else ""
+        chrome.done(console, _t(f"Connected!{suffix}", f"连接成功！{suffix}"))
         return True, "valid", result.get("model_ids")
 
     status = result.get("status", "unknown")
-    # Some direct providers (openai / anthropic / deepseek / gemini) ship no
-    # base URL and rely on the SDK's built-in endpoint, so there's nothing to
-    # hit for a GET /v1/models pre-check. That's NOT a real auth failure: skip
-    # the pre-check (the test message sent later exercises real connectivity via
-    # litellm) instead of dumping the user into the failure submenu.
-    #
-    # `no_probe_endpoint` is the probe saying exactly this. It used to say
-    # `not_configured` with "api_base" in the text, which is why the old
-    # condition read that way -- and a rename this caller does not follow puts
-    # every one of those providers into the failure submenu on the first step
-    # of onboarding.
-    if status == "no_probe_endpoint" or (status == "not_configured" and "api_base" in (result.get("error") or "")):
-        if skip_test:
-            console.print(
-                _t(
-                    "  [dim]Skipping the model-list pre-check (this provider has no public /models endpoint); connectivity is not tested (--skip-test).[/dim]",
-                    "  [dim]跳过模型列表预检(该服务商无公开 /models 端点);未做连通测试(--skip-test)。[/dim]",
-                )
+    if status in {"no_node", "no_bundle"} and skip_test:
+        # The model layer is not runnable here, and the user asked for no
+        # connectivity test. Refusing a key that may be perfectly good, over a
+        # check they declined, is the wizard failing on its own machinery.
+        console.print(
+            _t(
+                "  [dim]Skipping the connectivity check (the model service is not runnable here) (--skip-test).[/dim]",
+                "  [dim]跳过连通性检查(此机器无法运行模型服务)(--skip-test)。[/dim]",
             )
-        else:
-            console.print(
-                _t(
-                    "  [dim]Skipping the model-list pre-check (this provider has no public /models endpoint); the test message below will confirm connectivity.[/dim]",
-                    "  [dim]跳过模型列表预检(该服务商无公开 /models 端点);稍后的测试消息会验证连通。[/dim]",
-                )
-            )
+        )
         return True, "skipped", None
     hint_map = {
-        "invalid_key": _t(
-            "Auth failed: the API key is invalid — check for typos / stray spaces.",
-            "鉴权失败:API Key 无效 — 检查有无拼写错误或多余空格。",
+        "auth": _t(
+            "Auth failed: the API key was refused — check for typos / stray spaces.",
+            "鉴权失败:API Key 被拒绝 — 检查有无拼写错误或多余空格。",
         ),
-        "no_credits": _t(
-            "Account out of credits or not provisioned — top up and retry.",
-            "账户余额不足或未开通 — 充值后重试。",
+        "not_configured": _t(
+            "No credential reached the provider — the key was not stored where it is read.",
+            "服务商没有收到凭据 — Key 未写入被读取的位置。",
         ),
-        "rate_limited": _t(
-            "Rate limited — wait a bit and retry, or switch provider.",
-            "触发限流 — 稍等后重试,或更换服务商。",
+        "not_served": _t(
+            "This entry is not complete enough to be used — it needs an address and a model.",
+            "该配置还不完整 — 需要地址和模型。",
         ),
-        "network_error": _t(
-            "Network error reaching the provider — check network / proxy / VPN.",
-            "连接服务商时网络出错 — 检查网络 / 代理 / VPN。",
+        "no_model": _t(
+            "No model is configured for this provider — name one and retry.",
+            "该服务商尚未配置模型 — 填写一个后重试。",
         ),
-        "oauth_token_missing": _t(
-            f"Run: ddeharness provider login {provider.replace('_', '-')}",
-            f"请运行:ddeharness provider login {provider.replace('_', '-')}",
+        "timeout": _t(
+            "No answer in time — check network / proxy / VPN.",
+            "超时未响应 — 检查网络 / 代理 / VPN。",
+        ),
+        "oauth": _t(
+            f"Run: ddeharness provider login {provider}",
+            f"请运行:ddeharness provider login {provider}",
+        ),
+        "no_node": _t(
+            "The model service needs Node — run `ddeharness doctor`.",
+            "模型服务需要 Node — 运行 `ddeharness doctor`。",
+        ),
+        "no_bundle": _t(
+            "The model service is not built — run `npm run build` in ui-tui/.",
+            "模型服务尚未构建 — 在 ui-tui/ 中运行 `npm run build`。",
         ),
     }
     msg = hint_map.get(status, _t(f"Verification failed: {status}", f"验证失败:{status}"))
-    console.print(f"  [yellow]✗ {msg}[/yellow]" + (f"  [dim]{result['error']}[/dim]" if result.get("error") else ""))
+    console.print(f"  [warn]✗ {msg}[/warn]" + (f"  [dim]{result['error']}[/dim]" if result.get("error") else ""))
     return False, status, None
+
+
+# ---------------------------------------------------------------------------
+# Step 1 -- the flow itself
+# ---------------------------------------------------------------------------
+
+
+def _flow(text: login_flow.Text, **fields: Any) -> str:
+    """One of the flow's sentences, in the wizard's language, filled in."""
+    return _t(*text).format(**fields)
+
+
+class _Gateway:
+    """The gateway's handlers, on a loop of their own beside the prompts.
+
+    The handlers are coroutines, and a prompt blocks the thread it runs on. So
+    the handlers get a loop on a worker thread and the prompts keep the main
+    thread -- where Ctrl+C lands, and where every other prompt of the wizard
+    runs. A sign-in's steps cross over through :meth:`pushed`, the way
+    ``login.step`` frames reach the TUI, and the thread ends the model service
+    it started before it stops, on the loop that owns the child's pipes.
+    """
+
+    def __init__(self) -> None:
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(target=self._loop.run_forever, name="onboard-gateway", daemon=True)
+        self._frames: queue.Queue[Any] = queue.Queue()
+        #: The handlers started here, so what is still running can be ended.
+        self._started: list[Future[Any]] = []
+        self._thread.start()
+
+    def __enter__(self) -> "_Gateway":
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        from opendde_harness.providers.pi_service import shutdown_service
+
+        # A handler still running -- a sign-in left at Ctrl+C -- is ended
+        # first, which is what stops a device-code poll at the vendor. Only
+        # those: the loop also carries the model service's own tasks, and a
+        # shutdown that finds its reader cancelled under it ends cancelled too.
+        for running in self._started:
+            running.cancel()
+        try:
+            self.call(shutdown_service())
+        finally:
+            self._loop.call_soon_threadsafe(self._loop.stop)
+            self._thread.join()
+            self._loop.close()
+
+    def call(self, coro: "Coroutine[Any, Any, Any]") -> Any:
+        """Run one handler to its answer, on the loop, and wait here for it."""
+        return self.start(coro).result()
+
+    def start(self, coro: "Coroutine[Any, Any, Any]") -> "Future[Any]":
+        """Start one handler on the loop; its steps arrive through :meth:`pushed`."""
+        started = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        self._started.append(started)
+        return started
+
+    async def push(self, frame: dict[str, Any]) -> None:
+        """What the gateway would send the TUI: kept for the main thread to show."""
+        self._frames.put(frame)
+
+    def pushed(self, running: "Future[Any]") -> "Iterator[dict[str, Any]]":
+        """Every frame pushed while ``running`` runs, in order, and then no more."""
+        running.add_done_callback(lambda _done: self._frames.put(None))
+        while True:
+            frame = self._frames.get()
+            if frame is None:
+                return
+            yield frame
+
+
+def _refusal(exc: Exception) -> str:
+    """What a refused handler said: its own sentence, never its payload."""
+    from opendde_harness.tui_rpc.errors import RpcError
+
+    return exc.detail if isinstance(exc, RpcError) and exc.detail else str(exc)
+
+
+def _connect_interactive(named: Optional[str] = None) -> tuple[str, list[str]]:
+    """pi's ``/login`` at the terminal: a method, a provider, a sign-in or a key.
+
+    Returns the connected provider and, for an endpoint declared here, the
+    models it was found to serve; every other provider's list is the model
+    layer's to report at the check that follows. ``named`` is ``--provider``,
+    which goes straight to that provider the way ``/login <provider>`` does.
+    """
+    from opendde_harness.tui_rpc.methods.model import model_options
+
+    with _Gateway() as gateway:
+        with chrome.working(console, _flow(login_flow.LOADING_PROVIDERS)):
+            rows = gateway.call(model_options({"include_catalog": False}))["providers"]
+
+        if named:
+            outcome = _connect_named(gateway, rows, named)
+            if outcome is not _BACK:
+                return outcome
+
+        while True:
+            method = _ask_method()
+            while True:
+                picked = _select_provider(rows, method)
+                if picked is _BACK:
+                    break
+                if picked is _DECLARE_ENDPOINT:
+                    outcome = _declare_endpoint(gateway)
+                elif method == CRED_OAUTH:
+                    outcome = _sign_in(gateway, picked)
+                else:
+                    outcome = _connect_with_key(gateway, picked)
+                if outcome is not _BACK:
+                    return outcome
+
+
+def _connect_named(gateway: _Gateway, rows: list[dict[str, Any]], named: str) -> Any:
+    """``/login <provider>``: straight to the one it names.
+
+    One way in goes straight to it; both ask pi's question first, titled with
+    the provider's name and worded with its own label where pi wrote one. A
+    name no row carries falls through to the list, as the TUI's does.
+    """
+    wanted = named.strip().lower()
+    row = next((row for row in rows if wanted in (row["slug"].lower(), row["name"].lower())), None)
+    if row is None:
+        return _BACK
+    methods = login_flow.login_methods(row)
+    if not methods:
+        return _BACK
+    method = methods[0]
+    if len(methods) > 1:
+        method = _choice.row(
+            _flow(login_flow.SELECT_METHOD_FOR, name=row["name"]),
+            [
+                (row.get("login_label") or _flow(login_flow.SIGN_IN_WITH_ACCOUNT), CRED_OAUTH),
+                (_flow(login_flow.SIGN_IN_WITH_API_KEY), CRED_KEY),
+            ],
+            default=CRED_OAUTH,
+        )
+        if method is None:
+            raise typer.Exit(1)
+    return _sign_in(gateway, row) if method == CRED_OAUTH else _connect_with_key(gateway, row)
+
+
+def _ask_method() -> str:
+    """pi's first question: which way in, before which provider."""
+    picked = _choice.row(
+        _flow(login_flow.SELECT_METHOD),
+        [(_flow(label), method) for method, label in login_flow.METHODS],
+        default=CRED_OAUTH,
+    )
+    if picked is None:
+        raise typer.Exit(1)
+    return picked
+
+
+def _row_title(row: dict[str, Any], method: str) -> str:
+    """One provider row: the name, and pi's status marker when it says something.
+
+    The TUI's row carries the id and the marker on every line. Here the config
+    is a clean one, so "• unconfigured" on forty lines says nothing forty
+    times, and the id repeats the name beside it; what is worth a column is a
+    key the environment already supplies, or a credential of the other kind.
+    """
+    marker = login_flow.status_marker(row, method)
+    if marker == login_flow.UNCONFIGURED:
+        return str(row["name"])
+    return f"{row['name']}  ·  {_flow(marker)}"
+
+
+def _select_provider(rows: list[dict[str, Any]], method: str) -> Any:
+    """pi's "Select provider to configure:", filtered to the method chosen.
+
+    The featured few and nothing else, as a grid of dots: a wizard screen is
+    read at a glance, and the forty rows the TUI keeps behind a filter would
+    bury the handful almost everybody picks. The line above says where the
+    rest are. Under the key method the last option is ours, the endpoint the
+    gateway has never heard of. Escape is the TUI's own way back, to the
+    method question. Returns a row, :data:`_DECLARE_ENDPOINT`, or :data:`_BACK`.
+    """
+    featured = login_flow.offered(rows, method)
+    if not featured and method == CRED_OAUTH:
+        chrome.caption(console, _t("No providers available", "没有可用的服务商"))
+        return _BACK
+
+    chrome.hint(
+        console,
+        _t(
+            "Every other provider is a /login away once the setup is done.",
+            "其他服务商在配置完成后，于 TUI 内用 /login 接入。",
+        ),
+    )
+    options: list[tuple[str, Any]] = [(_row_title(row, method), row) for row in featured]
+    if method == CRED_KEY:
+        options.append((_flow(login_flow.ENDPOINT_ROW), _DECLARE_ENDPOINT))
+    picked = _choice.row(_flow(login_flow.SELECT_PROVIDER), options, back=_BACK)
+    if picked is None:
+        raise typer.Exit(1)
+    return picked
+
+
+def _placeholder(text: str) -> Any:
+    """A faint in-field placeholder: gone the moment they type, and gone from
+    the record once the prompt is answered. In the palette's disabled grey."""
+    return [("class:disabled", text)]
+
+
+def _prompt_text(
+    label: str,
+    *,
+    instruction: str,
+    default: str = "",
+    placeholder: str = "",
+    back: bool = False,
+    optional: bool = False,
+) -> Any:
+    """One text field of a form: the label, the hint beside it, the value.
+
+    An empty submit is :data:`_BACK` on the field that offers it -- the first
+    of a form, where the TUI's Esc would leave -- an answer on an optional one,
+    and refused everywhere else.
+    """
+    questionary = _require_questionary()
+    from opendde_harness.cli._styles import OPENDDE_HARNESS_STYLE
+
+    def _validate(value: str) -> Any:
+        if value.strip() or back or optional:
+            return True
+        return _t("Required.", "必填。")
+
+    value = questionary.text(
+        label,
+        default=default,
+        validate=_validate,
+        instruction=instruction,
+        placeholder=_placeholder(placeholder or _t("empty ↵ to go back", "留空回车返回"))
+        if placeholder or back
+        else None,
+        style=OPENDDE_HARNESS_STYLE,
+        qmark=_QMARK,
+    ).ask()
+    if value is None:
+        raise typer.Exit(1)
+    value = value.strip()
+    if back and not value:
+        return _BACK
+    return value
+
+
+def _prompt_secret(label: str, *, instruction: str, back: bool = False) -> Any:
+    """One masked field. Judged as the TUI judges it (``validateSecret``): the
+    value is trimmed, and one with control characters in it is refused -- a
+    key with a line break pasted into it would be sent broken and stored
+    broken. ``back`` gives an empty submit the meaning the TUI's Esc has."""
+    questionary = _require_questionary()
+    from opendde_harness.cli._styles import OPENDDE_HARNESS_STYLE
+
+    def _validate(value: str) -> Any:
+        if any(ord(char) < 0x20 or ord(char) == 0x7F for char in value.strip()):
+            return _flow(login_flow.CONTROL_CHARACTERS)
+        return True
+
+    value = questionary.password(
+        label,
+        validate=_validate,
+        instruction=instruction,
+        placeholder=_placeholder(_t("empty ↵ to go back", "留空回车返回")) if back else None,
+        style=OPENDDE_HARNESS_STYLE,
+        qmark=_QMARK,
+    ).ask()
+    if value is None:
+        raise typer.Exit(1)
+    value = value.strip()
+    if back and not value:
+        return _BACK
+    return value
+
+
+def _pick_option(message: str, options: list[dict[str, Any]]) -> Optional[str]:
+    """pi's own menu inside a sign-in, answered with the option's id, as a row
+    of dots the way the wizard asks every short question. pi's first option is
+    its default."""
+    labels = [(str(option.get("label") or option.get("id")), str(option.get("id"))) for option in options]
+    return _choice.row(message, labels, default=labels[0][1])
+
+
+def _link(url: str, label: Optional[str] = None) -> None:
+    """A link the way the TUI's login view draws one: the address as a
+    hyperlink, and the click hint under it."""
+    console.print(f"{chrome.INDENT}[accent][link={url}]{label or url}[/link][/accent]")
+    chrome.hint(console, _flow(login_flow.CLICK_TO_OPEN))
+
+
+def _show_login_step(step: dict[str, Any]) -> None:
+    """One step that is only there to be read, as the TUI's login view shows it.
+
+    pi's lines, in pi's order, with pi's words: the URL on its own line, the
+    code as "Enter code: <code>" and the wait after it; a sign-in URL with its
+    instructions, and the browser opened for it -- as pi's dialog does, and not
+    for a device code, whose URL is meant for another machine.
+    """
+    kind = step.get("type")
+    if kind == "device_code":
+        _link(str(step.get("verificationUri") or ""))
+        console.print(f"{chrome.INDENT}[warn]{_flow(login_flow.ENTER_CODE, code=step.get('userCode') or '')}[/warn]")
+        chrome.caption(console, _flow(login_flow.WAITING_FOR_AUTHENTICATION))
+        return
+    if kind == "auth_url":
+        from opendde_harness.cli.provider_commands import ConsoleInteraction
+
+        url = str(step.get("url") or "")
+        _link(url)
+        if step.get("instructions"):
+            console.print(f"{chrome.INDENT}[warn]{step['instructions']}[/warn]")
+        ConsoleInteraction().open_url(url)
+        return
+    if kind == "info":
+        console.print(f"{chrome.INDENT}{step.get('message') or ''}")
+        for link in step.get("links") or ():
+            if isinstance(link, dict) and link.get("url"):
+                _link(str(link["url"]), link.get("label"))
+        return
+    chrome.caption(console, str(step.get("message") or ""))
+
+
+def _sign_in(gateway: _Gateway, row: dict[str, Any]) -> Any:
+    """Run pi's own sign-in here and now, showing its steps as they arrive.
+
+    The gateway holds the flow (``model.login``) and pushes every step it
+    reports; the two it stops on are answered from here -- the login-method
+    menu with pi's own labels, and the authorization code a browser login
+    falls back to asking for. The request settles when a credential is stored,
+    which is as long as the person takes. A failure is said the way pi says
+    it, and the list is where it leaves them: entering the provider is what
+    starts a sign-in, so there is nothing to retry from but the list.
+    """
+    from opendde_harness.tui_rpc.methods.model import model_login, model_login_answer, model_login_cancel
+
+    name, slug = row["name"], row["slug"]
+    chrome.heading(console, _flow(login_flow.SIGN_IN_TO, name=name))
+    chrome.caption(console, _flow(login_flow.SIGN_IN_SUBTITLE))
+    chrome.caption(console, _flow(login_flow.STARTING_SIGN_IN))
+    # Chosen here so it is known before the first step arrives, as the TUI
+    # chooses it: a step carrying another id is not this sign-in's to show.
+    login_id = uuid4().hex
+    running = gateway.start(model_login({"provider": slug, "login_id": login_id}, send_frame=gateway.push))
+    try:
+        for frame in gateway.pushed(running):
+            params = frame.get("params") or {}
+            step = params.get("step") or {}
+            if params.get("login_id") != login_id:
+                continue
+            if step.get("type") == "select":
+                answer = _pick_option(str(step.get("message") or ""), list(step.get("options") or ()))
+            elif step.get("type") == "manual_code":
+                answer = _prompt_text(str(step.get("message") or ""), instruction=str(step.get("placeholder") or ""))
+            else:
+                _show_login_step(step)
+                continue
+            if answer is None:
+                gateway.call(model_login_cancel({"login_id": login_id}))
+                raise typer.Exit(1)
+            gateway.call(model_login_answer({"login_id": login_id, "answer": answer}))
+        result = running.result()
+    except Exception as exc:  # noqa: BLE001 - the gateway's own sentence, then the list
+        console.print(f"{chrome.INDENT}[warn]{_flow(login_flow.FAILED_LOGIN, name=name, why=_refusal(exc))}[/warn]")
+        return _BACK
+    chrome.done(console, _flow(login_flow.LOGGED_IN, name=result["provider"]["name"]))
+    return slug, []
+
+
+def _connect_with_key(gateway: _Gateway, row: dict[str, Any]) -> Any:
+    """pi's key form: one masked field, judged by the gateway.
+
+    What the field says beside it is the row's own answer -- a variable that
+    already supplies the key, a key this provider requires, or one it can do
+    without -- and what happens to the value is the gateway's: it stores the
+    key and answers with the row as it now stands, connected or not.
+    """
+    from opendde_harness.tui_rpc.methods.model import model_save_key
+
+    name, slug = row["name"], row["slug"]
+    env = row.get("key_env")
+    required = bool(row.get("needs_api_key")) and not env
+    chrome.heading(console, _flow(login_flow.CONNECT, name=name))
+    chrome.caption(
+        console, _flow(login_flow.KEY_SUBTITLE_REPLACES if row.get("authenticated") else login_flow.KEY_SUBTITLE)
+    )
+    if env:
+        instruction = _flow(login_flow.KEY_HINT_ENV, env=env)
+    elif required:
+        instruction = _flow(login_flow.KEY_HINT_REQUIRED)
+    else:
+        instruction = _flow(login_flow.KEY_HINT_OPTIONAL)
+
+    while True:
+        key = _prompt_secret(_flow(login_flow.API_KEY), instruction=instruction, back=required)
+        if key is _BACK:
+            return _BACK
+        try:
+            with chrome.working(console, _flow(login_flow.WORKING)):
+                connected = gateway.call(model_save_key({"slug": slug, "api_key": key}))["provider"]
+        except Exception as exc:  # noqa: BLE001 - shown on the form, as the TUI shows it
+            console.print(f"{chrome.INDENT}[warn]{_refusal(exc)}[/warn]")
+            continue
+        if connected.get("authenticated"):
+            chrome.done(console, _flow(login_flow.LOGGED_IN, name=connected["name"]))
+            return slug, []
+        console.print(f"{chrome.INDENT}[warn]{connected.get('warning') or _flow(login_flow.KEY_REFUSED)}[/warn]")
+
+
+def _declare_endpoint(gateway: _Gateway) -> Any:
+    """The four fields of the TUI's endpoint form, asked one after another.
+
+    The id, the address, a key only if the server wants one, and the model ids
+    only for an endpoint that publishes none: the gateway asks the endpoint what
+    it serves the moment it is declared, the way pi reads OpenRouter's list. A
+    refusal is the gateway's own sentence, and the form is asked again with
+    what was typed kept.
+    """
+    from opendde_harness.tui_rpc.methods.model import model_declare_provider
+
+    chrome.heading(console, _flow(login_flow.ADD_ENDPOINT))
+    chrome.caption(console, _flow(login_flow.ENDPOINT_SUBTITLE))
+    typed = {"provider": "", "base_url": "", "model": ""}
+    while True:
+        provider = _prompt_text(
+            _flow(login_flow.PROVIDER_ID),
+            instruction=_flow(login_flow.PROVIDER_ID_HINT),
+            default=typed["provider"],
+            placeholder=login_flow.PROVIDER_ID_PLACEHOLDER,
+            back=True,
+        )
+        if provider is _BACK:
+            return _BACK
+        base_url = _prompt_text(
+            _flow(login_flow.BASE_URL),
+            instruction=_flow(login_flow.BASE_URL_HINT),
+            default=typed["base_url"],
+            placeholder=login_flow.BASE_URL_PLACEHOLDER,
+        )
+        api_key = _prompt_secret(_flow(login_flow.API_KEY), instruction=_flow(login_flow.ENDPOINT_KEY_HINT))
+        model = _prompt_text(
+            _flow(login_flow.MODEL_IDS),
+            instruction=_flow(login_flow.MODEL_IDS_HINT),
+            default=typed["model"],
+            placeholder=_flow(login_flow.MODEL_IDS_PLACEHOLDER),
+            optional=True,
+        )
+        typed = {"provider": provider, "base_url": base_url, "model": model}
+        try:
+            with chrome.working(console, _flow(login_flow.WORKING)):
+                declared = gateway.call(
+                    model_declare_provider(
+                        {"provider": provider, "base_url": base_url, "api_key": api_key, "model": model}
+                    )
+                )["provider"]
+        except Exception as exc:  # noqa: BLE001 - shown on the form, as the TUI shows it
+            console.print(f"{chrome.INDENT}[warn]{_refusal(exc)}[/warn]")
+            continue
+        # Bare, as the model step stores them: the row's ids carry the prefix
+        # that routes them, and the step joins it back on when it writes.
+        served = [model_id.bare(model) for model in declared["models"]]
+        count = len(served)
+        chrome.done(
+            console,
+            _flow(
+                login_flow.LOGGED_IN_ENDPOINT,
+                name=declared["name"],
+                count=count,
+                plural="" if count == 1 else "s",
+                url=base_url,
+            ),
+        )
+        return declared["slug"], served
+
+
+def _connect_headless(
+    provider: str, *, api_key: Optional[str], base_url: Optional[str], model: Optional[str]
+) -> tuple[str, list[str]]:
+    """The same two handlers, fed from flags rather than prompts.
+
+    One of pi's own takes a key (or the variable that supplies it) and nothing
+    else; a name pi does not ship is an endpoint declared here, and needs its
+    address. A provider that is only signed in to has no headless way in, and a
+    built-in whose address is the tenant's own -- Azure -- is written with
+    ``ddeharness provider set``, which takes every field the entry has.
+    """
+    from opendde_harness.providers.auth import env_key_name
+    from opendde_harness.tui_rpc.methods.model import model_declare_provider, model_save_key
+
+    provider = _validate_provider_name(provider)
+    with _Gateway() as gateway:
+        try:
+            if pi_ids.is_builtin(provider):
+                if base_url:
+                    raise typer.BadParameter(
+                        f"pi carries {provider}'s address, so --base-url does not apply to it. An address of "
+                        f"your own is written with `ddeharness provider set {provider} --base-url <url> --api "
+                        "<wire> --api-key <key>`."
+                    )
+                if not api_key and not env_key_name(provider) and provider not in pi_ids.AMBIENT:
+                    if provider in pi_ids.OAUTH:
+                        console.print(
+                            "[error]A sign-in requires an interactive browser flow.[/error]\n"
+                            f"Run [accent]ddeharness provider login {provider}[/accent] separately, then re-run onboard."
+                        )
+                        raise typer.Exit(2)
+                    raise typer.BadParameter("--api-key is required in non-interactive mode")
+                gateway.call(model_save_key({"slug": provider, "api_key": api_key or ""}))
+                return provider, []
+            if not base_url:
+                raise typer.BadParameter(f"--base-url is required for {provider} in non-interactive mode")
+            declared = gateway.call(
+                model_declare_provider(
+                    {"provider": provider, "base_url": base_url, "api_key": api_key or "", "model": model or ""}
+                )
+            )["provider"]
+        except Exception as exc:
+            from opendde_harness.tui_rpc.errors import RpcError
+
+            if isinstance(exc, RpcError):
+                raise typer.BadParameter(_refusal(exc)) from exc
+            raise
+    # The ids typed lead: ``--model`` is the catalogue of a declared provider,
+    # and its first entry is the default with nobody at the terminal.
+    return provider, _split_ids(model) if model else [model_id.bare(served) for served in declared["models"]]
+
+
+def _reconnect(provider: str, *, sign_in: bool) -> bool:
+    """Back into the key form or the sign-in for a provider already picked --
+    what a failed check offers. True once it is connected again."""
+    from opendde_harness.tui_rpc.methods.model import model_options
+
+    with _Gateway() as gateway:
+        rows = gateway.call(model_options({"include_catalog": False, "slug": provider}))["providers"]
+        if not rows:
+            return False
+        outcome = _sign_in(gateway, rows[0]) if sign_in else _connect_with_key(gateway, rows[0])
+    return outcome is not _BACK
+
+
+def _memory_step(*, skip: bool, non_interactive: bool, warnings: list[str]) -> object:
+    """The memory plugin's own wizard step. Imported here rather than at the
+    top: the step uses this module's console and prompts, so the two would
+    import each other."""
+    from opendde_harness.plugin.memory.longterm import onboard as memory_onboard
+
+    return memory_onboard.step(skip=skip, non_interactive=non_interactive, warnings=warnings)
+
+
+def _memory_enabled() -> bool:
+    from opendde_harness.plugin.memory.longterm import onboard as memory_onboard
+
+    return memory_onboard.memory_enabled()
 
 
 def _load_current_default_model() -> Optional[str]:
@@ -988,43 +1208,23 @@ def _load_current_default_model() -> Optional[str]:
     return (data or {}).get("agents", {}).get("defaults", {}).get("model") or None
 
 
-def _model_routes_to_provider(model: str, spec: Any) -> bool:
-    """True if ``model`` would auto-route to ``spec`` under ``provider='auto'``.
+def _recommended_model(provider: str) -> str:
+    """The bare model id to preselect for this provider, or "" when we know none.
 
-    Defers to the spec so this guard cannot disagree with the routing it guards.
+    The curated shortlist's first entry, which is the one this project would
+    recommend for daily use. It is the only recommendation left: there is no
+    per-provider spec carrying a default model any more, because a model the
+    vendor has retired is a fact that goes stale in a table and never goes stale
+    in :mod:`providers.common_models`, which the picker reads too.
     """
-    return bool(model and spec and spec.claims(model))
+    from opendde_harness.providers.common_models import common_models_for
 
-
-# How a provider proves who it is. Every decision the wizard makes about a
-# provider -- which field to prompt for, what a failure offers to change, what
-# "remove" clears, whether a rollback applies -- follows from this one question,
-# and it was being answered independently at thirteen sites off two spec flags.
-# Each of the last two review rounds found a site that disagreed with the others:
-# a rollback that wrote credentials to an OAuth provider and killed the wizard, a
-# menu that offered a key prompt to one, a prompt that half-guarded a spec it had
-# already dereferenced. Answer it once.
-
-
-def _format_model_for_provider(provider: str, spec: Any, model_id: str) -> str:
-    """Apply the provider's route prefix to a raw ``/v1/models`` id when needed.
-
-    A vendor OpenDDE Harness carries no spec for still needs the prefix, and needs it most:
-    the id it returns is bare, and a bare id is routed by keyword and fallback
-    rather than to the section the user just configured. Handing one back
-    unprefixed sent the request wherever those rules landed -- configuring
-    Mistral alongside OpenAI produced "mistral-large-latest", which resolves to
-    OpenAI and spends OpenAI's key.
-
-    The rule itself is ``providers.wire.stored_model_id``; deciding it here as
-    well is what made the wizard and the TUI write one model two ways.
-    """
-    return stored_model_id(provider, model_id)
+    shortlist = common_models_for(provider)
+    return model_id.bare(shortlist[0]) if shortlist else ""
 
 
 def _pick_model(
     provider: str,
-    spec: Any,
     *,
     current_model: Optional[str],
     model_ids: Optional[list[str]],
@@ -1032,46 +1232,58 @@ def _pick_model(
     user_provided_model: Optional[str],
     non_interactive: bool,
 ) -> str:
-    """Decide the model string to write into ``agents.defaults.model``."""
-    # Every exit goes through the formatter, which is idempotent. Applying it
-    # only where the candidate list is built covered only the branch that has
-    # candidates -- and a vendor OpenDDE Harness carries no spec for reaches the others:
-    # the probe cannot pre-check it, so there is no list, so the user types the
-    # id. A typed id is bare, and a bare id is routed by keyword and fallback
-    # rather than to the provider just configured, which is how
-    # "mistral-large-latest" came to be served with OpenAI's key.
+    """Decide the model string to write into ``agents.defaults.model``.
+
+    Every exit goes through ``model_id.join``, which is the one rule for what a
+    stored id looks like: "<provider id>/<model id>", the prefix naming the
+    provider because nothing else does any more. The ids reaching here are bare
+    -- the model service is asked for what the endpoint serves -- so qualifying
+    them is not optional: a bare id names no provider and is refused by the
+    schema.
+    """
     if user_provided_model:
-        return _format_model_for_provider(provider, spec, user_provided_model)
+        return model_id.join(provider, user_provided_model)
 
     if non_interactive:
-        default_model = spec.default_model if spec else ""
-        if not default_model:
-            raise typer.BadParameter(f"--model is required for provider '{provider}' (no built-in default model).")
-        return _format_model_for_provider(provider, spec, default_model)
+        recommended = _recommended_model(provider)
+        if not recommended:
+            raise typer.BadParameter(f"--model is required for provider '{provider}' (we have no default for it).")
+        return model_id.join(provider, recommended)
 
-    if current_model and spec and _model_routes_to_provider(current_model, spec):
-        default_value = current_model
+    recommended = _recommended_model(provider)
+    if current_model and model_id.provider_of(current_model) == provider:
+        default_value = model_id.bare(current_model)
     else:
-        default_value = (spec.default_model if spec else "") or ""
+        default_value = recommended
 
-    # A live fetch is the best answer when there is one; when there is not, the
-    # same chain the TUI picker offers beats an empty prompt. Eleven providers
-    # carry no curated shortlist, so before this a failed fetch left the user
-    # typing a model id from memory.
+    # The verification above already asked the model service what this provider
+    # serves, and that answer is `model_ids`. When it has none -- the check was
+    # skipped, or it failed and the user chose to continue -- the same source the
+    # TUI picker reads is asked again here rather than a second list of our own,
+    # so the wizard and the picker cannot offer different models for the same
+    # provider. `models_for_provider` falls back to the curated shortlist when
+    # the service cannot be reached at all; a provider neither answers for is
+    # typed by hand, which is how a self-hosted server was always named.
     if not model_ids:
-        from opendde_harness.providers.common_models import common_models_for, litellm_models_for
+        from opendde_harness.config.loader import load_config
+        from opendde_harness.providers.common_models import models_for_provider
 
-        known = [*common_models_for(provider), *litellm_models_for(provider)]
+        try:
+            config = load_config()
+        except Exception:  # noqa: BLE001 - an unreadable config just has no suggestions
+            config = None
+        known = [str(row.get("id") or "") for row in models_for_provider(config, provider) if row.get("id")]
         if known:
-            # openai / anthropic / deepseek / gemini have no /models endpoint to
-            # pre-check, so there is no list on a perfectly healthy run. Saying
-            # "couldn't reach the provider" there contradicted the line printed
-            # just above it and read as a failure to a user for whom nothing
-            # had failed.
+            # "skipped" is the one status that is nobody's failure: the model
+            # service is not runnable on this machine and the user asked for no
+            # connectivity check, so nothing was asked and nothing refused.
+            # Saying "couldn't reach the provider" there contradicted the line
+            # printed just above it and read as a failure to a user for whom
+            # nothing had failed.
             console.print(
                 _t(
-                    "  [dim]This provider has no model list to fetch - offering the ones we know.[/dim]",
-                    "  [dim]该服务商没有可拉取的模型列表,先列出已知的。[/dim]",
+                    "  [dim]The model service isn't runnable here - offering the models we know.[/dim]",
+                    "  [dim]此机器无法运行模型服务,先列出已知的模型。[/dim]",
                 )
                 if probe_status == "skipped"
                 else _t(
@@ -1081,19 +1293,7 @@ def _pick_model(
             )
             model_ids = known
 
-    if (
-        default_value
-        and spec
-        and default_value == spec.default_model
-        and (
-            not model_ids
-            or any(
-                _format_model_for_provider(provider, spec, mid)
-                == _format_model_for_provider(provider, spec, default_value)
-                for mid in model_ids
-            )
-        )
-    ):
+    if default_value and default_value == recommended and (not model_ids or default_value in model_ids):
         console.print(
             _t(
                 f"  [dim]Default: {default_value} — recommended balance of quality/cost for daily use.[/dim]",
@@ -1102,28 +1302,24 @@ def _pick_model(
         )
 
     if model_ids:
-        choices = [_format_model_for_provider(provider, spec, mid) for mid in model_ids]
-        # Dedupe: the chain above already prefixes its ids, and _format_ leaves a
-        # correctly-prefixed id alone, so two sources can agree on one model.
-        choices = list(dict.fromkeys(choices))
-        default_value = _format_model_for_provider(provider, spec, default_value) if default_value else ""
+        choices = list(dict.fromkeys(model_ids))
         if default_value not in choices:
             default_value = choices[0]
         prompt_label = _t(
             f"Default model ({len(choices)} available):",
             f"默认模型(共 {len(choices)} 个):",
         )
-        # Only the custom provider. Everywhere else the prefix names the vendor
-        # the id belongs to, and a list that hides it stops matching what is
-        # stored; on a user-described endpoint it is the same word on every row,
-        # and that endpoint is also where the fetched list is least likely to
-        # carry the model the user means -- so typing one is the first row there.
-        own_endpoint = credential_kind(provider) == CRED_ENDPOINT
+        # Only a provider this config declares. Everywhere else the list came
+        # from pi's catalogue and holds the models that provider really serves;
+        # on an endpoint the user described, the list is that entry's own
+        # `models` and is the least likely to already carry the model they mean
+        # -- so typing one is the first row there.
+        own_endpoint = _is_declared(provider)
         chosen = _select_model_id(
             choices,
             default_model=default_value,
             label=prompt_label,
-            provider=provider if own_endpoint else None,
+            provider=provider,
             manual_first=own_endpoint,
         )
     else:
@@ -1152,28 +1348,34 @@ def _pick_model(
                     f"  [dim]未输入模型,使用 {default_value}。[/dim]",
                 )
             )
-            return _format_model_for_provider(provider, spec, default_value)
+            return model_id.join(provider, default_value)
         raise typer.Exit(1)
-    return _format_model_for_provider(provider, spec, chosen)
+    return model_id.join(provider, chosen)
 
 
-def _roll_back_provider_fields(provider: str, spec: Any, *, old_key: Optional[str], old_base: Optional[str]) -> None:
+def _roll_back_provider(provider: str, before: Optional[dict[str, Any]]) -> None:
     """Undo what this pass wrote, restoring the state read before it started.
 
-    A named function so the behaviour can be driven by a test: the two shapes
-    this replaced were both wrong in ways only a test that calls it can hold
-    down. Keying off the previous api_key skipped a local deployment entirely,
-    leaving a mistyped address where a working one had been; and asking "was it
-    configured" cleared both fields for a provider that had held only an
-    api_base, erasing an endpoint this pass never touched.
+    Two cases, and the difference is the one the old shape could not express: a
+    provider this pass *created* is put back by removing the entry, because an
+    entry emptied of its fields is not the same thing as never having been
+    configured -- for a declared provider it is not even a valid entry. A
+    provider that already had one is restored to it, rows and all.
 
-    OAuth providers are skipped: their credentials live in a token file, the ops
-    layer refuses to write credential fields for them, and doing it anyway turned
-    a failed verification into a dead wizard.
+    An entry naming a sign-in is left alone. Its credential is a grant in the
+    model service's store, removing the entry would sign the user out of an
+    account they have just signed in to, and the ops layer refuses credential
+    writes for it anyway -- which is how a failed verification once took the
+    whole wizard down with it.
     """
-    if credential_kind(provider) == CRED_OAUTH:
+    if _stored_kind(provider) == CRED_OAUTH:
         return
-    _write_provider_fields(provider, {"api_key": old_key or "", "api_base": old_base})
+    from opendde_harness.config.update_providers import reset_provider
+
+    if before is None:
+        reset_provider(provider)
+        return
+    _write_provider_fields(provider, before)
 
 
 def _write_provider_fields(provider: str, fields: dict[str, Any]) -> None:
@@ -1185,36 +1387,30 @@ def _write_provider_fields(provider: str, fields: dict[str, Any]) -> None:
     try:
         set_provider_fields(provider, fields)
     except KeyError as exc:
-        console.print(f"  [red]✗[/red] {exc}")
+        console.print(f"  [error]✗[/error] {exc}")
         raise typer.Exit(1)
     except RuntimeError as exc:
-        console.print(f"  [red]✗[/red] {exc}")
+        console.print(f"  [error]✗[/error] {exc}")
         raise typer.Exit(1)
     except ValidationError as exc:
-        console.print(_t(f"  [red]✗ Validation failed:[/red]\n{exc}", f"  [red]✗ 校验失败:[/red]\n{exc}"))
+        console.print(_t(f"  [error]✗ Validation failed:[/error]\n{exc}", f"  [error]✗ 校验失败:[/error]\n{exc}"))
         raise typer.Exit(1)
 
 
 def _persist_default_model(model: Optional[str], provider: str) -> None:
-    """Patch ``agents.defaults.model`` and the pin that overrides it.
+    """Write ``agents.defaults.model`` as ``"<provider id>/<model id>"``.
 
-    Both, always. ``agents.defaults.provider`` wins over whatever a model id
-    names, so writing the model alone leaves the wizard's own choice routed to
-    whichever provider was pinned before -- with that provider's key. The rule
-    for what to pin is ``providers.pin``, the same one the picker and
-    ``ddeharness provider use`` ask.
+    One field, because the id's prefix is the only thing that names the provider
+    now. The field that used to pin one beside it is gone, and with it the case
+    it caused: a stale pin outranked what an id said, so the model the wizard
+    had just chosen was answered by whichever provider was pinned before, with
+    that provider's key.
     """
     if not model:
         return
-    from opendde_harness.config.loader import load_config
     from opendde_harness.config.update import set_default_model
-    from opendde_harness.providers import pin
 
-    try:
-        pinned = load_config().agents.defaults.provider or ""
-    except Exception:
-        pinned = ""
-    set_default_model(model, provider=pin.resolve(model, provider=provider, pinned=pinned))
+    set_default_model(model, provider=provider)
 
 
 # ---------------------------------------------------------------------------
@@ -1286,7 +1482,10 @@ def _run_test_probe(
         text, tokens, elapsed = send_probe()
     except Exception as exc:
         console.print(
-            _t(f"  [red]✗ Test failed:[/red] {_probe_failure(exc)}", f"  [red]✗ 测试失败:[/red] {_probe_failure(exc)}")
+            _t(
+                f"  [error]✗ Test failed:[/error] {_probe_failure(exc)}",
+                f"  [error]✗ 测试失败:[/error] {_probe_failure(exc)}",
+            )
         )
         console.print(
             _t(
@@ -1324,7 +1523,7 @@ def _run_test_probe(
     if tokens:
         extras.append(f"{tokens} tokens")
     extras.append(f"{elapsed:.1f}s")
-    console.print(f"  [green]✓ {', '.join(extras)}[/green]")
+    console.print(f"  [ok]✓ {', '.join(extras)}[/ok]")
     return "ok"
 
 
@@ -1333,291 +1532,15 @@ def _run_test_probe(
 # ---------------------------------------------------------------------------
 
 
-def _configure_one_provider(
-    *,
-    provider: Optional[str],
-    api_key: Optional[str],
-    base_url: Optional[str],
-    model: Optional[str],
-    non_interactive: bool,
-    warnings: list[str],
-    skip_test: bool = False,
-    wire: Optional[str] = None,
-) -> Optional[dict[str, Any]]:
-    """Drive one provider through pick → credentials → verify → model → test.
-
-    Returns ``{"provider", "model"}`` on success, or ``None`` if the user
-    chose to go back from the interactive provider picker.
-    """
-    from opendde_harness.providers.registry import find_by_name
-
-    # Loop so "Switch provider" on a connectivity failure rewinds to the
-    # picker instead of tearing the whole wizard down (keeps steps 2/3/4).
-    # A provider passed by flag is used once; switching then requires the
-    # interactive picker (or, in non-interactive mode, is impossible).
-    flag_provider = provider
-
-    def _rewind() -> None:
-        """Discard the flag values before the next pass through the picker.
-
-        All of them, not just the provider: they were typed for the provider
-        that just failed. A stale --api-key was written to the newly picked
-        provider without a prompt, a stale --base-url pointed it at the previous
-        provider's machine, and picking a local deployment -- which rejects
-        --api-key by design -- ended the whole wizard on a usage error, losing
-        the later steps this loop exists to keep.
-        """
-        nonlocal flag_provider, api_key, base_url, model, wire
-        flag_provider = api_key = base_url = model = wire = None
-
-    while True:
-        if flag_provider:
-            provider = _validate_provider_name(flag_provider)
-        else:
-            if non_interactive:
-                raise typer.BadParameter("--provider is required in non-interactive mode")
-            picked = _select_provider()
-            if picked is None:
-                raise typer.Exit(1)
-            if picked is _BACK:
-                return None
-            # Same gate as the flag path: the vendor step lets the user type a
-            # name, and a typo there used to reach the config layer as an
-            # uncaught KeyError that tore down the wizard mid-setup.
-            try:
-                provider = _validate_provider_name(picked)
-            except typer.BadParameter as exc:
-                console.print(f"  [red]x[/red] {exc}")
-                _rewind()
-                continue
-
-        spec = find_by_name(provider)
-        kind = credential_kind(provider)
-        is_oauth = kind == CRED_OAUTH
-        is_custom = kind == CRED_ENDPOINT
-        # The interactive picker already echoes the chosen provider; only print
-        # an explicit confirmation when it came from --provider (no echo then).
-        if flag_provider:
-            console.print(
-                _t(
-                    f"  [dim]Provider:[/dim] [accent]{_provider_label(provider)}[/accent]",
-                    f"  [dim]服务商:[/dim] [accent]{_provider_label(provider)}[/accent]",
-                )
-            )
-
-        # Snapshot the stored key before _collect_credentials overwrites it, so a
-        # failed re-configuration of an existing provider can be rolled back to
-        # its prior working key (rather than left holding the just-typed bad one).
-        # Read through the ops library: it folds in a section still stored under
-        # the provider's pre-rename name, which a raw lookup by the typed name
-        # misses -- and the write below consolidates onto the current name, so a
-        # rollback would otherwise restore nothing over a real key.
-        from opendde_harness.config.update_providers import get_provider_config
-
-        _prev = get_provider_config(provider, redact_secrets=False)
-        old_key = _prev.get("api_key")
-        old_base = _prev.get("api_base")
-
-        custom_model = _collect_credentials(
-            provider,
-            is_oauth=is_oauth,
-            is_custom=is_custom,
-            is_local=kind == CRED_LOCAL,
-            api_key=api_key,
-            base_url=base_url,
-            model=model,
-            non_interactive=non_interactive,
-            wire=wire,
-        )
-        if custom_model is _BACK:
-            # User backed out of the first credential field — rewind to the
-            # provider picker (drop the flags so the picker actually shows).
-            _rewind()
-            continue
-
-        chosen_model = _resolve_model_with_test(
-            provider,
-            spec,
-            is_custom=is_custom,
-            custom_model=custom_model,
-            user_model_flag=model,
-            non_interactive=non_interactive,
-            warnings=warnings,
-            skip_test=skip_test,
-        )
-        if chosen_model is None:
-            # "Switch provider" — re-run the picker (drop the flags so the second
-            # pass prompts rather than reusing the failed values), undoing what
-            # this pass wrote.
-            #
-            # Put back exactly what was there, read before this pass wrote
-            # anything. One branch, because "was it configured" is the wrong
-            # question twice over: a local deployment is configured by address
-            # and has no key, so a rollback keyed off the old key skipped it and
-            # a mistyped address replaced a working one for good; and a provider
-            # that held only an api_base counts as unconfigured, so clearing
-            # both fields for a "new" provider erased an endpoint this pass had
-            # never touched.
-            #
-            # OAuth providers are left alone: their credentials live in a token
-            # file, `set_provider_fields` refuses to write credential fields for
-            # them at all, and doing so turned a failed verification into a
-            # RuntimeError that took the whole wizard down.
-            _roll_back_provider_fields(provider, spec, old_key=old_key, old_base=old_base)
-            _rewind()
-            continue
-        _persist_default_model(chosen_model, provider)
-        return {"provider": provider, "model": chosen_model}
-
-
-def _collect_credentials(
-    provider: str,
-    *,
-    is_oauth: bool,
-    is_custom: bool,
-    is_local: bool = False,
-    api_key: Optional[str],
-    base_url: Optional[str],
-    model: Optional[str],
-    non_interactive: bool,
-    wire: Optional[str] = None,
-) -> Any:
-    """Auth setup: OAuth browser flow or api_key write. Returns the custom
-    model id when the provider is ``custom`` (locked in here), ``None`` for a
-    non-custom provider, or ``_BACK`` if the user backed out of the first
-    interactive credential field, or if the vendor cannot be configured by a
-    bare key at all (caller should rewind to the picker either way)."""
-    from opendde_harness.providers.auth import key_refusal
-
-    refusal = key_refusal(provider)
-    if refusal is not None:
-        console.print(f"  [red]x[/red] {refusal}")
-        if non_interactive:
-            raise typer.Exit(2)
-        return _BACK
-
-    if is_oauth:
-        if non_interactive:
-            console.print(
-                "[red]OAuth providers require an interactive browser flow.[/red]\n"
-                "Run [accent]ddeharness provider login "
-                f"{provider.replace('_', '-')}[/accent] separately, then re-run "
-                "onboard."
-            )
-            raise typer.Exit(2)
-        # Loop so a failed login offers retry / back instead of crashing out.
-        while True:
-            if _run_oauth_login(provider):
-                return None
-            choice = _failure_choice(
-                [
-                    (_t("Retry", "重试"), "retry"),
-                    (_t("Back (pick another provider)", "返回(改选服务商)"), "back"),
-                ],
-                non_interactive=non_interactive,
-            )
-            if choice == "retry":
-                continue
-            return _BACK
-
-    if is_local:
-        # A local deployment authenticates on nothing: it is reached by address.
-        # Routing it through the api_key prompt would stop the user at a
-        # minimum-length check for a credential that does not exist.
-        from opendde_harness.providers.registry import find_by_name
-
-        spec = find_by_name(provider)
-        if api_key:
-            # Said out loud rather than dropped: a local deployment writes no
-            # api_key, so silently ignoring the flag looks like it was accepted.
-            raise typer.BadParameter(
-                f"{provider} is a local deployment and takes no --api-key; pass --base-url instead"
-            )
-        if base_url and not base_url.strip().startswith(("http://", "https://")):
-            # The interactive prompt validates this; the flag path did not, so a
-            # scheme-less address went into the config and failed at first use.
-            raise typer.BadParameter(f"--base-url must start with http:// or https:// (got {base_url!r})")
-        if not base_url:
-            if non_interactive:
-                raise typer.BadParameter(f"--base-url is required for {provider} in non-interactive mode")
-            from opendde_harness.config.update_providers import get_provider_config
-
-            try:
-                stored = get_provider_config(provider, redact_secrets=False).get("api_base") or ""
-            except KeyError:
-                stored = ""
-            base_url = _prompt_local_api_base(spec, current=stored, allow_back=True)
-            if base_url is _BACK:
-                return _BACK
-        _write_provider_fields(provider, {"api_base": base_url})
-        return None
-
-    if not api_key:
-        from opendde_harness.providers.registry import normalize_provider_name
-
-        # GigaChat's key is not a typical API key -- it is base64(client_id:
-        # client_secret) -- and the generic prompt below gives no room to say
-        # so, so the wizard would otherwise send someone looking for a plain
-        # key straight into a 401.
-        if normalize_provider_name(provider) == "gigachat":
-            console.print(
-                "  [dim]GigaChat's key is base64(client_id:client_secret) from the "
-                "GigaChat API console, not a typical API key.[/dim]"
-            )
-
-    # Pure interactive path (no creds came from flags): prompt field-by-field
-    # with empty-submit = back; backing out of the first field rewinds to the
-    # provider picker.
-    pure_interactive = not non_interactive and not api_key and (not is_custom or (not base_url and not model))
-    if pure_interactive:
-        prompts: list[Callable[[], Any]] = [lambda: _prompt_api_key(provider, allow_back=True)]
-        if is_custom:
-            prompts.append(lambda: _prompt_base_url(allow_back=True))
-            prompts.append(lambda: _prompt_wire(allow_back=True))
-        collected = _collect_fields(prompts)
-        if collected is None:
-            return _BACK
-        api_key = collected[0]
-        if is_custom:
-            base_url = collected[1]
-            wire = collected[2]
-    else:
-        if not api_key:
-            if non_interactive:
-                raise typer.BadParameter("--api-key is required in non-interactive mode")
-            api_key = _prompt_api_key(provider)
-        if is_custom:
-            if not base_url:
-                if non_interactive:
-                    raise typer.BadParameter("--base-url is required when --provider=custom in non-interactive mode")
-                base_url = _prompt_base_url()
-            if not wire and not non_interactive:
-                wire = _prompt_wire()
-            if not model and non_interactive:
-                raise typer.BadParameter("--model is required when --provider=custom in non-interactive mode")
-
-    fields: dict[str, Any] = {"api_key": api_key}
-    custom_model: Optional[str] = None
-    if is_custom:
-        fields["api_base"] = base_url
-        # Unset in non-interactive mode leaves the spec's default (chat) in
-        # force rather than writing a value the user never chose.
-        if wire:
-            fields["wire"] = wire
-        custom_model = model
-    elif base_url:
-        fields["api_base"] = base_url
-
-    _write_provider_fields(provider, fields)
-    return custom_model
+# ---------------------------------------------------------------------------
+# Step 1 -- after the provider is connected: the check, the model, the test
+# ---------------------------------------------------------------------------
 
 
 def _resolve_model_with_test(
     provider: str,
-    spec: Any,
     *,
-    is_custom: bool,
-    custom_model: Optional[str],
+    declared_models: Optional[list[str]],
     user_model_flag: Optional[str],
     non_interactive: bool,
     warnings: list[str],
@@ -1626,39 +1549,27 @@ def _resolve_model_with_test(
     """Verify connectivity → pick the default model → send a test probe.
 
     On a verify or test-message failure, offers a recovery submenu (retry /
-    re-pick model / re-enter key / switch / continue). Custom providers use
-    the same model picker after connectivity verification. Only failures stop; success
-    auto-advances. Returns the chosen model, or ``None`` to signal "switch
-    provider" (the caller rewinds to the picker).
+    re-pick model / sign in again or re-enter the key / switch / continue).
+    Only failures stop; success auto-advances. Returns the chosen model, or
+    ``None`` to signal "switch provider" (the caller rewinds to the picker).
     """
     while True:
         ok, status, model_ids = _verify_provider(provider, skip_test=skip_test)
         if not ok:
-            options = (
-                [
+            signs_in = _stored_kind(provider) == CRED_OAUTH
+            if status in {"timeout", "not_served", "no_model"}:
+                # The failures a credential cannot fix: nothing answered in time,
+                # or the entry is not complete enough to be used at all. Offering
+                # the key form for those sends the user to the wrong field.
+                options = [
                     (_t("Retry", "重试"), "retry"),
-                    # A local deployment that cannot be reached is usually a
-                    # wrong address, and this is the branch it lands in -- so
-                    # retry alone left the one thing worth changing unreachable.
-                    *(
-                        [(_t("Re-enter server URL", "重新填服务地址"), "rebase")]
-                        if credential_kind(provider) == CRED_LOCAL
-                        else []
-                    ),
                     (_t("Continue anyway", "仍然继续"), "continue"),
                 ]
-                if status == "network_error"
-                else [
-                    # What to offer depends on what the provider is reached by.
-                    # A local deployment has no key to re-enter, so offering that
-                    # left a mistyped address with no way back to the field.
-                    (
-                        (_t("Sign in again", "重新登录"), "reauth")
-                        if credential_kind(provider) == CRED_OAUTH
-                        else (_t("Re-enter server URL", "重新填服务地址"), "rebase")
-                        if credential_kind(provider) == CRED_LOCAL
-                        else (_t("Re-enter key", "重新填 Key"), "rekey")
-                    ),
+            else:
+                options = [
+                    (_t("Sign in again", "重新登录"), "reauth")
+                    if signs_in
+                    else (_t("Re-enter key", "重新填 Key"), "rekey"),
                     # Also retry, because this branch takes the failures that
                     # cannot be sorted: a credential the account refused and a
                     # refresh that could not reach the network arrive as the same
@@ -1667,25 +1578,13 @@ def _resolve_model_with_test(
                     (_t("Switch provider", "更换服务商"), "switch"),
                     (_t("Continue anyway", "仍然继续"), "continue"),
                 ]
-            )
             choice = _failure_choice(options, non_interactive=non_interactive)
             if choice == "retry":
                 continue
-            if choice == "rekey" and not non_interactive:
-                _write_provider_fields(provider, {"api_key": _prompt_api_key(provider)})
-                continue
-            if choice == "rebase" and not non_interactive:
-                from opendde_harness.config.update_providers import get_provider_config
-
-                try:
-                    stored = get_provider_config(provider, redact_secrets=False).get("api_base") or ""
-                except KeyError:
-                    stored = ""
-                retyped = _prompt_local_api_base(spec, current=stored)
-                _write_provider_fields(provider, {"api_base": retyped})
-                continue
-            if choice == "reauth" and not non_interactive:
-                if _run_oauth_login(provider):
+            if choice in ("rekey", "reauth") and not non_interactive:
+                # The same form or sign-in the provider was connected with:
+                # backing out of it is choosing another provider.
+                if _reconnect(provider, sign_in=choice == "reauth"):
                     continue
                 return None
             if choice == "switch":
@@ -1694,20 +1593,39 @@ def _resolve_model_with_test(
             model_ids = None
         break
 
-    if is_custom:
-        user_model_flag = custom_model or user_model_flag
+    # A declaration named its own catalogue a moment ago, and nothing knows
+    # better than that what the provider serves: those ids were typed for this
+    # endpoint. They are also what the connectivity check could not report when
+    # it could not be run, which is where a self-hosted server that is not up
+    # yet always lands, so they stand in for its answer.
+    #
+    # The flag is overwritten rather than read a second time: for a declared
+    # provider ``--model`` *is* the catalogue, so re-using the raw answer as one
+    # model id wrote "my-vllm/qwen3-32b,qwen3-8b" as the default.
+    if declared_models:
+        if not model_ids:
+            model_ids = list(declared_models)
+        # One id is the default outright, and so is the first of several with
+        # nobody at the terminal to choose. Several and a terminal is a choice.
+        user_model_flag = declared_models[0] if len(declared_models) == 1 or non_interactive else None
 
     current = _load_current_default_model()
     while True:
         chosen = _pick_model(
             provider,
-            spec,
             current_model=current,
             model_ids=model_ids,
             probe_status=status,
             user_provided_model=user_model_flag,
             non_interactive=non_interactive,
         )
+        # A provider this config declares serves what its own list names, so a
+        # model picked or typed here has to join that list or the model service
+        # will not carry it. Idempotent, and the id is stored bare.
+        if _is_declared(provider):
+            from opendde_harness.config.update_providers import add_provider_model
+
+            add_provider_model(provider, chosen)
         _persist_default_model(chosen, provider)
         if skip_test:
             return chosen
@@ -1715,19 +1633,14 @@ def _resolve_model_with_test(
             provider,
             non_interactive=non_interactive,
             warnings=warnings,
-            is_oauth=credential_kind(provider) == CRED_OAUTH,
+            is_oauth=_stored_kind(provider) == CRED_OAUTH,
         )
         if result == "switch":
             return None
-        if result == "rekey":
-            _write_provider_fields(provider, {"api_key": _prompt_api_key(provider)})
-            # Re-test the same model with the new key (picker defaults to it).
-            current = chosen
-            user_model_flag = None
-            continue
-        if result == "reauth":
-            if not _run_oauth_login(provider):
+        if result in ("rekey", "reauth"):
+            if not _reconnect(provider, sign_in=result == "reauth"):
                 return None
+            # Re-test the same model with the new credential (picker defaults to it).
             current = chosen
             user_model_flag = None
             continue
@@ -1736,204 +1649,6 @@ def _resolve_model_with_test(
             user_model_flag = None
             continue
         return chosen  # ok / continue
-
-
-def _configure_existing_provider_model(*, non_interactive: bool) -> bool:
-    """Choose a model for an already-authenticated provider without re-login."""
-    if non_interactive:
-        return False
-    questionary = _require_questionary()
-    from opendde_harness.cli._styles import OPENDDE_HARNESS_STYLE
-    from opendde_harness.providers.registry import find_by_name
-
-    choices = [questionary.Choice(_provider_label(name), value=name) for name in _configured_providers()]
-    if not choices:
-        return False
-    provider = questionary.select(
-        _t("Choose the provider for the default model:", "选择默认模型对应的服务商:"),
-        choices=choices,
-        style=OPENDDE_HARNESS_STYLE,
-        qmark=_QMARK,
-    ).ask()
-    if not provider:
-        raise typer.Exit(1)
-    spec = find_by_name(provider)
-    ok, status, model_ids = _verify_provider(provider)
-    if not ok:
-        return False
-    chosen = _pick_model(
-        provider,
-        spec,
-        current_model=None,
-        model_ids=model_ids,
-        probe_status=status,
-        user_provided_model=None,
-        non_interactive=False,
-    )
-    _persist_default_model(chosen, provider)
-    result = _run_test_probe(
-        provider,
-        non_interactive=False,
-        warnings=[],
-        is_oauth=credential_kind(provider) == CRED_OAUTH,
-    )
-    if result == "reauth":
-        return _run_oauth_login(provider)
-    return result in {"ok", "continue"}
-
-
-# ---------------------------------------------------------------------------
-# Step 1 — multi-provider entry (existing-config branch: done / add / edit)
-# ---------------------------------------------------------------------------
-
-
-def _manage_existing_providers(*, non_interactive: bool) -> None:
-    """Edit/remove submenu for already-configured providers (interactive only)."""
-    questionary = _require_questionary()
-    from opendde_harness.cli._styles import OPENDDE_HARNESS_STYLE
-    from opendde_harness.providers.registry import find_by_name
-
-    while True:
-        configured = _configured_providers()
-        if not configured:
-            return
-        choices = [questionary.Choice(_provider_label(n), value=n) for n in configured]
-        choices.append(questionary.Choice(_t("Back", "返回"), value=_BACK))
-        target = questionary.select(
-            _t("Pick a provider to manage:", "选择要管理的服务商:"),
-            choices=choices,
-            style=OPENDDE_HARNESS_STYLE,
-            qmark=_QMARK,
-        ).ask()
-        if target is None or target is _BACK:
-            return
-
-        action = questionary.select(
-            _t(
-                f"What would you like to do with {_provider_label(target)}?",
-                f"对 {_provider_label(target)} 想做什么?",
-            ),
-            choices=[
-                questionary.Choice(_t("Update API key", "更新 API Key"), value="update"),
-                questionary.Choice(
-                    _t("Remove (clear this provider's key)", "移除(清除该服务商的 Key)"),
-                    value="remove",
-                ),
-                questionary.Choice(_t("Back", "返回"), value=_BACK),
-            ],
-            style=OPENDDE_HARNESS_STYLE,
-            qmark=_QMARK,
-        ).ask()
-        if action is None or action is _BACK:
-            continue
-        if action == "update":
-            target_spec = find_by_name(target)
-            if credential_kind(target) == CRED_OAUTH:
-                # Nothing here to update: the credential is a token file, and the
-                # ops layer refuses credential writes for these -- so offering the
-                # key prompt ended the wizard instead of editing anything.
-                console.print(
-                    _t(
-                        f"  [dim]{_provider_label(target)} signs in through OAuth. "
-                        f"Run: ddeharness provider login {target.replace('_', '-')}[/dim]",
-                        f"  [dim]{_provider_label(target)} 通过 OAuth 登录。"
-                        f"请运行: ddeharness provider login {target.replace('_', '-')}[/dim]",
-                    )
-                )
-                continue
-            if credential_kind(target) == CRED_LOCAL:
-                # A local deployment holds no key; what there is to update is
-                # where it lives. Offering the key prompt wrote a credential into
-                # a provider that never reads one, and left the address alone.
-                from opendde_harness.config.update_providers import get_provider_config
-
-                try:
-                    stored = get_provider_config(target, redact_secrets=False).get("api_base") or ""
-                except KeyError:
-                    stored = ""
-                retyped = _prompt_local_api_base(target_spec, current=stored)
-                _write_provider_fields(target, {"api_base": retyped})
-            elif credential_kind(target) == CRED_ENDPOINT:
-                # A self-hosted endpoint is a key *and* the address it is sent
-                # to. Updating only the key left the one field that moves when
-                # the user redeploys -- the URL -- unreachable from this menu.
-                from opendde_harness.config.update_providers import get_provider_config
-
-                try:
-                    stored = get_provider_config(target, redact_secrets=False).get("api_base") or ""
-                except KeyError:
-                    stored = ""
-                retyped_key = _prompt_api_key(target)
-                retyped_url = _prompt_base_url(stored or "https://")
-                _write_provider_fields(
-                    target, {"api_key": retyped_key, "api_base": retyped_url, "wire": _prompt_wire()}
-                )
-            else:
-                _write_provider_fields(target, {"api_key": _prompt_api_key(target)})
-            console.print(
-                _t(
-                    f"  [green]✓ Updated {_provider_label(target)}.[/green]",
-                    f"  [green]✓ 已更新 {_provider_label(target)}。[/green]",
-                )
-            )
-        elif action == "remove":
-            current = _load_current_default_model()
-            from opendde_harness.providers.registry import find_by_name, normalize_provider_name, split_model_id
-
-            spec = find_by_name(target)
-            if spec is not None:
-                was_default_source = bool(current and _model_routes_to_provider(current, spec))
-            else:
-                # A vendor with no spec of ours is reached by its prefix alone, so
-                # that is the whole test. Treating "no spec" as "not the source"
-                # skipped the guard and left a default model pointing at a
-                # provider whose key had just been removed.
-                prefix, _ = split_model_id(current or "")
-                was_default_source = bool(current and prefix == normalize_provider_name(target))
-            if was_default_source:
-                confirm = questionary.confirm(
-                    _t(
-                        f"The current default model comes from {_provider_label(target)}; "
-                        "removing it means you'll need to pick a new default. Remove anyway?",
-                        f"当前默认模型来自 {_provider_label(target)};移除后需要重新选择默认模型。仍要移除吗?",
-                    ),
-                    default=False,
-                    style=OPENDDE_HARNESS_STYLE,
-                    qmark=_QMARK,
-                ).ask()
-                if not confirm:
-                    continue
-            # Clear both: a local deployment counts as configured by its
-            # api_base, so clearing only the key reported it removed and left it
-            # in the list, still reachable. An OAuth provider has neither field
-            # to clear and refuses the write, so it is told where its credential
-            # actually lives instead of ending the run.
-            target_spec = find_by_name(target)
-            if credential_kind(target) == CRED_OAUTH:
-                console.print(
-                    _t(
-                        f"  [dim]{_provider_label(target)}'s credential is an OAuth token, not a config field, "
-                        "so there is nothing here to remove.[/dim]",
-                        f"  [dim]{_provider_label(target)} 的凭据是 OAuth token,不在配置字段里,"
-                        "这里没有可移除的内容。[/dim]",
-                    )
-                )
-                continue
-            _write_provider_fields(target, {"api_key": "", "api_base": None})
-            if was_default_source:
-                # Clear the now-dangling default so step 1's guard forces a
-                # re-pick instead of leaving a model whose provider has no key.
-                from opendde_harness.config.update import set_default_model
-
-                # The pin goes with it: left behind it would route the next model
-                # the user picks to the provider whose key was just removed.
-                set_default_model("", provider="auto")
-            console.print(
-                _t(
-                    f"  [green]✓ Removed {_provider_label(target)}'s configuration.[/green]",
-                    f"  [green]✓ 已移除 {_provider_label(target)} 的配置。[/green]",
-                )
-            )
 
 
 def _step1_provider(
@@ -1945,93 +1660,53 @@ def _step1_provider(
     non_interactive: bool,
     warnings: list[str],
     skip_test: bool = False,
-    wire: Optional[str] = None,
-) -> object:
-    """Step 1 screen. Returns ``_BACK`` only when the user backs out of the
-    first-run picker on the welcome screen (handled by the runner)."""
-    _step_header(1, _t("Choose your LLM provider", "选择 LLM 服务商"))
-    console.print(
+) -> None:
+    """Step 1: connect a provider the way ``/login`` does, then settle the model.
+
+    The flags connect without prompts when they carry a credential or an
+    address; ``--provider`` alone goes straight to that provider the way
+    ``/login <provider>`` does. "Switch provider" from a failed check undoes
+    what that pass wrote and comes back to the flow; the flags are used once.
+    """
+    _step_header(1, _t("LLM provider", "LLM 服务商"))
+    chrome.caption(
+        console,
         _t(
-            "  [dim]OpenDDE Harness's chat and reasoning are all driven by it.[/dim]",
-            "  [dim]OpenDDE Harness 的对话与思考都由它驱动。[/dim]",
-        )
+            "OpenDDE Harness's chat and reasoning are all driven by it.",
+            "OpenDDE Harness 的对话与思考都由它驱动。",
+        ),
     )
 
-    configured = _configured_providers()
-    if non_interactive or not configured:
-        result = _configure_one_provider(
-            provider=provider,
-            api_key=api_key,
-            base_url=base_url,
-            model=model,
+    while True:
+        # Read before anything is written, so a failed pass can be undone: the
+        # entry as it stood, or ``None`` when this provider had none at all.
+        stored = _load_raw_config().get("providers") or {}
+        before = {name: _stored_entry(name) for name in stored if isinstance(stored, dict)}
+
+        if non_interactive or (provider and (api_key or base_url)):
+            if not provider:
+                raise typer.BadParameter("--provider is required in non-interactive mode")
+            connected, declared_models = _connect_headless(provider, api_key=api_key, base_url=base_url, model=model)
+        else:
+            connected, declared_models = _connect_interactive(provider)
+
+        chosen_model = _resolve_model_with_test(
+            connected,
+            declared_models=declared_models,
+            user_model_flag=model,
             non_interactive=non_interactive,
             warnings=warnings,
             skip_test=skip_test,
-            wire=wire,
         )
-        if result is None:
-            return _BACK
-        return None
-
-    questionary = _require_questionary()
-    from opendde_harness.cli._styles import OPENDDE_HARNESS_STYLE
-
-    while True:
-        names = ", ".join(_provider_label(n).split(" (")[0] for n in _configured_providers())
-        action = questionary.select(
-            _t(
-                f"LLM provider already configured: {names}. What would you like to do?",
-                f"LLM 服务商已配置:{names}。想做什么?",
-            ),
-            choices=[
-                questionary.Choice(_t("Done, continue", "完成,继续"), value="done"),
-                questionary.Choice(_t("Choose default model", "选择默认模型"), value="model"),
-                questionary.Choice(_t("Add another provider", "新增一个服务商"), value="add"),
-                questionary.Choice(_t("Edit / remove a provider", "编辑 / 移除服务商"), value="edit"),
-            ],
-            style=OPENDDE_HARNESS_STYLE,
-            qmark=_QMARK,
-        ).ask()
-        if action is None:
-            raise typer.Exit(1)  # Ctrl+C exits; never treat it as "done"
-        if action == "done":
-            # Step 1 is required: never advance without at least one provider AND
-            # a default model, so deleting every provider can't slip through.
-            if not (_configured_providers() and _load_current_default_model()):
-                console.print(
-                    _t(
-                        "  [yellow]At least one provider with a default model is required — add or re-pick one.[/yellow]",
-                        "  [yellow]至少需要一个带默认模型的服务商 — 请新增或重新选择一个。[/yellow]",
-                    )
-                )
-                continue
-            return None
-        if action == "model":
-            if _configure_existing_provider_model(non_interactive=False):
-                continue
-            console.print(
-                _t(
-                    "  [yellow]Could not configure a default model. Choose a provider and try again.[/yellow]",
-                    "  [yellow]无法配置默认模型,请重新选择服务商。[/yellow]",
-                )
-            )
-        if action == "add":
-            _configure_one_provider(
-                provider=None,
-                api_key=None,
-                base_url=None,
-                model=None,
-                non_interactive=False,
-                warnings=warnings,
-                skip_test=skip_test,
-            )
-        elif action == "edit":
-            _manage_existing_providers(non_interactive=non_interactive)
-
-
-# ---------------------------------------------------------------------------
-# Final summary
-# ---------------------------------------------------------------------------
+        if chosen_model is None:
+            # "Switch provider" -- back to the flow, undoing what this pass
+            # wrote and dropping the flags: they were typed for the provider
+            # that just failed.
+            _roll_back_provider(connected, before.get(connected))
+            provider = api_key = base_url = model = None
+            continue
+        _persist_default_model(chosen_model, connected)
+        return
 
 
 def _protein_design_recap() -> str:
@@ -2045,7 +1720,7 @@ def _protein_design_recap() -> str:
 
     config = load_protein_design_config()
     if not config:
-        return _t("[yellow]not configured[/yellow]", "[yellow]未配置[/yellow]")
+        return _t("[warn]not configured[/warn]", "[warn]未配置[/warn]")
     report = inspect_compute(config)
     placement = {
         "local_docker": _t("local Docker", "本地 Docker"),
@@ -2053,73 +1728,50 @@ def _protein_design_recap() -> str:
         "worker_pool": _t("worker pool", "计算节点池"),
     }.get(str(report.get("placement")), str(report.get("placement") or "—"))
     readiness = (
-        _t("[green]ready[/green]", "[green]就绪[/green]")
+        _t("[ok]ready[/ok]", "[ok]就绪[/ok]")
         if report.get("ready")
-        else _t("[yellow]unreachable[/yellow]", "[yellow]未就绪[/yellow]")
+        else _t("[warn]unreachable[/warn]", "[warn]未就绪[/warn]")
     )
     return f"{placement}, {readiness}"
 
 
 def _print_next_steps(*, warnings: list[str], show_next_steps: bool = True) -> None:
-    from rich.table import Table
-
     console.print()
     if warnings:
-        console.print(
-            Panel(
-                _t(
-                    "[bold yellow]⚠ Setup finished with warnings[/bold yellow]",
-                    "[bold yellow]⚠ 配置完成,但有警告[/bold yellow]",
-                )
-                + "\n\n"
-                + _t(
-                    "[dim]These items didn't pass a connectivity test:[/dim] ",
-                    "[dim]以下项目未通过连通测试:[/dim] ",
-                )
-                + f"{', '.join(warnings)}\n"
-                + _t(
-                    "[dim]Fix them before relying on the related features "
-                    "(re-run [/dim][accent]ddeharness onboard[/accent][dim] to reconfigure).[/dim]",
-                    "[dim]在依赖相关功能前请先修复(重新运行 [/dim][accent]ddeharness onboard[/accent][dim] 重新配置)。[/dim]",
-                ),
-                border_style="yellow",
-                padding=(1, 2),
-            )
+        console.print(f"  [warn][bold]![/bold] {_t('Setup finished with warnings', '配置完成,但有警告')}[/warn]")
+        console.print()
+        chrome.caption(
+            console,
+            _t("These items didn't pass a connectivity test: ", "以下项目未通过连通测试: ") + ", ".join(warnings),
+        )
+        chrome.hint(
+            console,
+            _t(
+                "Fix them before relying on the related features — ddeharness onboard reconfigures.",
+                "在依赖相关功能前请先修复 — 重新运行 ddeharness onboard 可重新配置。",
+            ),
         )
     else:
-        console.print(
-            Panel(
-                _t(
-                    "[bold green]🎉 Setup complete![/bold green]",
-                    "[bold green]🎉 配置完成![/bold green]",
-                ),
-                border_style="green",
-                padding=(0, 2),
-            )
-        )
+        console.print(f"  [ok][bold]✓[/bold] {_t('Setup complete', '配置完成')}[/ok]")
 
     # Recap what was configured (read from disk) so the user has closure.
-    provs = ", ".join(_provider_label(n).split(" (")[0] for n in _configured_providers()) or "—"
-    mem = (
-        _t("Persistent Memory", "长期记忆已启用")
-        if onboard_memory._memory_enabled()
-        else _t("[yellow]off[/yellow]", "[yellow]未启用[/yellow]")
-    )
-    recap = Table(show_header=False, box=None, padding=(0, 2, 0, 0))
-    recap.add_column(style="dim", no_wrap=True)
-    recap.add_column()
-    recap.add_row(_t("Provider", "服务商"), provs)
-    recap.add_row(_t("Default model", "默认模型"), _load_current_default_model() or "—")
-    recap.add_row(_t("Memory", "长期记忆"), mem)
-    recap.add_row(_t("Protein Design", "蛋白设计"), _protein_design_recap())
-    console.print(
-        Panel(
-            recap,
-            title=f"[bold]{_t('Your setup', '你的配置')}[/bold]",
-            title_align="left",
-            border_style="#8a6d00",
-            padding=(1, 2),
-        )
+    provs = ", ".join(_provider_label(n) for n in _configured_providers()) or "—"
+    mem = _t("on", "已启用") if _memory_enabled() else _t("[warn]off[/warn]", "[warn]未启用[/warn]")
+    chrome.heading(console, _t("Your setup", "你的配置"))
+    chrome.fields(
+        console,
+        [
+            (_t("Provider", "服务商"), provs),
+            (_t("Default model", "默认模型"), _load_current_default_model() or "—"),
+            (_t("Memory", "长期记忆"), mem),
+            (_t("Protein design", "蛋白设计"), _protein_design_recap()),
+            (
+                _t("Web search", "网页搜索"),
+                _t("Brave Search API", "Brave Search API")
+                if _web_search_configured()
+                else _t("DuckDuckGo (no key)", "DuckDuckGo（无 key）"),
+            ),
+        ],
     )
 
     if not show_next_steps:
@@ -2133,21 +1785,17 @@ def _print_next_steps(*, warnings: list[str], show_next_steps: bool = True) -> N
         )
         return
 
-    table = Table(show_header=False, box=None, padding=(0, 3, 0, 0))
-    table.add_column(style="accent", no_wrap=True)
-    table.add_column(style="dim")
-    table.add_row("ddeharness", _t("start the antibody design TUI", "启动抗体设计 TUI"))
-    table.add_row("ddeharness doctor", _t("check configuration and compute readiness", "检查配置与计算就绪状态"))
-    table.add_row("ddeharness tracing", _t("open the results dashboard", "打开结果面板"))
-    console.print(
-        Panel(
-            table,
-            title=f"[bold]{_t('Get started', '开始使用')}[/bold]",
-            title_align="left",
-            border_style="border",
-            padding=(1, 2),
-        )
+    chrome.heading(console, _t("Get started", "开始使用"))
+    chrome.fields(
+        console,
+        [
+            ("ddeharness", _t("start the antibody design TUI", "启动抗体设计 TUI")),
+            ("ddeharness doctor", _t("check configuration and compute readiness", "检查配置与计算就绪状态")),
+            ("ddeharness tracing", _t("open the results dashboard", "打开结果面板")),
+        ],
+        key_style="accent",
     )
+    console.print()
 
 
 # ---------------------------------------------------------------------------
@@ -2161,14 +1809,14 @@ def run_wizard(
     api_key: Optional[str] = None,
     base_url: Optional[str] = None,
     model: Optional[str] = None,
-    wire: Optional[str] = None,
     skip_memory: bool = False,
     skip_protein_design: bool = False,
+    brave_api_key: Optional[str] = None,
     non_interactive: bool = False,
     yes: bool = False,
-    reset: bool = False,
     skip_test: bool = False,
     show_next_steps: bool = True,
+    fresh: bool = False,
 ) -> None:
     """Run the three-step onboarding wizard end-to-end.
 
@@ -2189,14 +1837,14 @@ def run_wizard(
             api_key=api_key,
             base_url=base_url,
             model=model,
-            wire=wire,
             skip_memory=skip_memory,
             skip_protein_design=skip_protein_design,
+            brave_api_key=brave_api_key,
             non_interactive=non_interactive,
             yes=yes,
-            reset=reset,
             skip_test=skip_test,
             show_next_steps=show_next_steps,
+            fresh=fresh,
         )
     finally:
         _logger.enable("opendde_harness")
@@ -2213,27 +1861,143 @@ def _step3_protein_design(*, skip: bool, non_interactive: bool, warnings: list[s
     return None
 
 
+def _web_search_configured() -> bool:
+    """Is a Brave key in effect -- configured under either spelling, or in the environment?"""
+    from opendde_harness.agent.tools.web import brave_key
+
+    web = _load_raw_config().get("tools", {}).get("web", {})
+    return bool(brave_key(web.get("braveApiKey") or web.get("brave_api_key")))
+
+
+def _step4_web_search(
+    *, brave_api_key: Optional[str], non_interactive: bool, warnings: list[str], skip_test: bool
+) -> object:
+    """Step 4 -- Web search (optional).
+
+    Without a key ``web_search`` queries DuckDuckGo, which needs none, and a
+    provider with a hosted search (the Codex login, OpenAI, Anthropic) uses
+    that regardless. A Brave Search API key (free tier: 2,000 queries a
+    month) makes the keyless path a documented API instead of a scraped page.
+    The key comes from the flag when given, else from a prompt when there
+    is a terminal; then one path verifies (unless ``skip_test``) and saves.
+    """
+    from opendde_harness.agent.tools.web import header_safe
+    from opendde_harness.config.update import set_web_search_key
+
+    _step_header(4, _t("Web search", "网页搜索"))
+    console.print(
+        _t(
+            "  [dim]Without a key, web_search uses DuckDuckGo (no key needed); a provider with its own "
+            "hosted search (Codex login, OpenAI, Anthropic) uses that either way.[/dim]\n"
+            "  [dim]A Brave Search API key makes the keyless path a proper API: free tier 2,000 queries/month at "
+            "[/dim][accent]https://api-dashboard.search.brave.com/app/keys[/accent]",
+            "  [dim]不配置 key 时，web_search 走 DuckDuckGo（无需 key）；自带托管搜索的服务商（Codex 登录、OpenAI、"
+            "Anthropic）始终用自己的搜索。[/dim]\n"
+            "  [dim]配置 Brave Search API key 后，无托管搜索的模型改走正式 API：免费档每月 2,000 次，申请地址 "
+            "[/dim][accent]https://api-dashboard.search.brave.com/app/keys[/accent]",
+        )
+    )
+    key = brave_api_key
+    if key is None and not non_interactive:
+        questionary = _require_questionary()
+        from opendde_harness.cli._styles import OPENDDE_HARNESS_STYLE
+
+        key = questionary.password(
+            _t("Brave Search API key (Enter to skip):", "Brave Search API key（直接回车跳过）:"),
+            placeholder=_t("skip: DuckDuckGo, no key", "跳过：使用 DuckDuckGo，无需 key"),
+            style=OPENDDE_HARNESS_STYLE,
+            qmark=_QMARK,
+        ).ask()
+        if key is None:
+            raise typer.Exit(1)
+    key = (key or "").strip()
+    if not key:
+        if not non_interactive:
+            console.print(
+                _t(
+                    "  [dim]Skipped: web_search keeps its Brave key.[/dim]"
+                    if _web_search_configured()
+                    else "  [dim]Skipped: web_search uses DuckDuckGo. Run `ddeharness onboard` again to add a key.[/dim]",
+                    "  [dim]已跳过：web_search 沿用已配置的 Brave key。[/dim]"
+                    if _web_search_configured()
+                    else "  [dim]已跳过：web_search 使用 DuckDuckGo。随时重新运行 ddeharness onboard 添加 key。[/dim]",
+                )
+            )
+        return None
+    if not header_safe(key):
+        # Refused before it is saved or sent: the HTTP stack's own rejection
+        # would quote the whole key.
+        console.print(
+            _t(
+                "  [warn]⚠ The key holds characters a header cannot carry (a line break?); not saved.[/warn]",
+                "  [warn]⚠ key 中含有 HTTP 头无法携带的字符（换行？），未保存。[/warn]",
+            )
+        )
+        warnings.append(_t("Web search (Brave)", "网页搜索（Brave）"))
+        return None
+    if not skip_test:
+        ok, reason = _verify_brave_key(key)
+        if not ok:
+            console.print(
+                _t(
+                    f"  [warn]⚠ Brave did not accept the key: {reason}[/warn]",
+                    f"  [warn]⚠ Brave 未接受该 key：{reason}[/warn]",
+                )
+            )
+            warnings.append(_t("Web search (Brave)", "网页搜索（Brave）"))
+    set_web_search_key(key)
+    console.print(_t("  [ok]✓ Brave Search configured.[/ok]", "  [ok]✓ Brave Search 已配置。[/ok]"))
+    return None
+
+
+def _verify_brave_key(key: str) -> tuple[bool, str]:
+    """One query against Brave's API; the reason on failure.
+
+    ``_brief`` renders the failure: the reason is printed, and the raw text of
+    a header the HTTP stack refused locally quotes the key itself.
+    """
+    import asyncio
+
+    from opendde_harness.agent.tools.web import WebSearchTool, _brief
+
+    try:
+        hits = asyncio.run(WebSearchTool(api_key=key)._brave("OpenDDE", 1))
+    except Exception as exc:
+        return False, _brief(exc)
+    return (True, "") if hits else (False, "no results")
+
+
 def _run_wizard_body(
     *,
     provider: Optional[str] = None,
     api_key: Optional[str] = None,
     base_url: Optional[str] = None,
     model: Optional[str] = None,
-    wire: Optional[str] = None,
     skip_memory: bool = False,
     skip_protein_design: bool = False,
+    brave_api_key: Optional[str] = None,
     non_interactive: bool = False,
     yes: bool = False,
-    reset: bool = False,
     skip_test: bool = False,
     show_next_steps: bool = True,
+    fresh: bool = False,
 ) -> None:
     global _LANG
     _check_tty_or_die(non_interactive)
     _LANG = _config_language()  # start from the saved language (default "en")
     if not non_interactive:
         _pick_language()  # may change _LANG (persisted after bootstrap below)
-    _handle_existing_config(reset=reset, yes=yes, non_interactive=non_interactive)
+    if fresh or not _reusable_config():
+        _retire_existing_setup()
+    else:
+        console.print()
+        chrome.caption(
+            console,
+            _t(
+                "Keeping your configuration; every step starts from what is already there.",
+                "保留现有配置；每一步都以已有的值作为起点。",
+            ),
+        )
     _bootstrap_empty_config()
     if not non_interactive:
         from opendde_harness.config.update import set_language
@@ -2241,30 +2005,30 @@ def _run_wizard_body(
         set_language(_LANG)  # persist now that config.json exists
 
     console.print()
-    console.print(
-        Panel(
-            _t(
-                "[bold][accent]✨ Welcome to the OpenDDE Harness setup wizard[/accent][/bold]\n\n"
-                "[dim]We'll configure, in order:[/dim]\n"
-                "  [accent]①[/accent] LLM      [accent]②[/accent] Persistent Memory      "
-                "[accent]③[/accent] Protein Design\n\n"
-                "[dim]↑↓ select · Enter confirm · Ctrl+C quit anytime — anything already written is kept.[/dim]",
-                "[bold][accent]✨ 欢迎使用 OpenDDE Harness 配置向导[/accent][/bold]\n\n"
-                "[dim]我们将依次配置:[/dim]\n"
-                "  [accent]①[/accent] LLM      [accent]②[/accent] Persistent Memory      "
-                "[accent]③[/accent] 蛋白设计\n\n"
-                "[dim]↑↓ 选择 · Enter 确认 · 随时 Ctrl+C 退出 — 已写入的配置会保留。[/dim]",
-            ),
-            border_style="border",
-            padding=(1, 2),
-        )
+    chrome.caption(console, _t("We'll configure, in order:", "我们将依次配置:"))
+    chrome.steps(
+        console,
+        [
+            _t("LLM provider", "LLM 服务商"),
+            _t("Long-term memory", "长期记忆"),
+            _t("Protein design", "蛋白设计"),
+            _t("Web search", "网页搜索"),
+        ],
+    )
+    console.print()
+    chrome.hint(
+        console,
+        _t(
+            "Ctrl+C quits at any point — the previous config is backed up and this run starts clean.",
+            "随时 Ctrl+C 退出 — 原有配置已备份，本次从空白开始。",
+        ),
     )
 
     warnings: list[str] = []
 
     # Screen state machine. Each screen returns ``_BACK`` to rewind or anything
-    # else to advance. Step 1 is required; backing out of it from the first
-    # screen is a no-op (there's no earlier screen).
+    # else to advance. Step 1 is required and never rewinds: the language
+    # screen before it is answered again by running the wizard again.
     screens: list[Callable[[], object]] = [
         lambda: _step1_provider(
             provider=provider,
@@ -2274,42 +2038,25 @@ def _run_wizard_body(
             non_interactive=non_interactive,
             warnings=warnings,
             skip_test=skip_test,
-            wire=wire,
         ),
-        lambda: onboard_memory._step4_memory(
-            skip=skip_memory,
-            non_interactive=non_interactive,
-            main_model=_load_current_default_model(),
-            warnings=warnings,
-            skip_test=skip_test,
-        ),
+        lambda: _memory_step(skip=skip_memory, non_interactive=non_interactive, warnings=warnings),
         lambda: _step3_protein_design(
             skip=skip_protein_design,
             non_interactive=non_interactive,
             warnings=warnings,
+        ),
+        lambda: _step4_web_search(
+            brave_api_key=brave_api_key,
+            non_interactive=non_interactive,
+            warnings=warnings,
+            skip_test=skip_test,
         ),
     ]
 
     index = 0
     while index < len(screens):
         result = screens[index]()
-        if result is _BACK:
-            if index == 0:
-                # The language picker ran before the state machine, so Step 1
-                # is the first *numbered* screen but not the first screen the
-                # user saw. Backing out of it returns to the language picker:
-                # re-pick (persisting the choice) and then re-display Step 1 in
-                # the chosen language. Step 1 stays required -- we never skip
-                # past it, which would leave provider/model unwritten and
-                # re-trip the startup gate into an infinite loop.
-                _pick_language()
-                from opendde_harness.config.update import set_language
-
-                set_language(_LANG)
-            else:
-                index -= 1
-        else:
-            index += 1
+        index += -1 if result is _BACK and index else 1
 
     _print_next_steps(warnings=warnings, show_next_steps=show_next_steps)
 
@@ -2339,8 +2086,8 @@ def ensure_ready_to_start(*, interactive: bool) -> bool:
         # we have not established sends the user to fix the wrong thing.
         console.print(
             _t(
-                f"  [yellow]No usable provider resolves the default model ({model}).[/yellow]",
-                f"  [yellow]默认模型({model})解析不到可用的服务商。[/yellow]",
+                f"  [warn]No usable provider resolves the default model ({model}).[/warn]",
+                f"  [warn]默认模型({model})解析不到可用的服务商。[/warn]",
             )
         )
         console.print(
@@ -2372,22 +2119,33 @@ def register(app: typer.Typer) -> None:
 
     @app.command()
     def onboard(
-        provider: Optional[str] = typer.Option(None, "--provider", help="LLM provider name (skips Step 1's prompt)"),
+        provider: Optional[str] = typer.Option(
+            None,
+            "--provider",
+            help="A pi provider id (e.g. 'openai-codex', 'anthropic'), or a name of your own for an "
+            "OpenAI-compatible endpoint this config declares. Alone it goes straight to that provider, "
+            "as /login <provider> does; with --api-key or --base-url it connects without prompts",
+        ),
         api_key: Optional[str] = typer.Option(None, "--api-key", help="API key for the chosen provider"),
         base_url: Optional[str] = typer.Option(
             None,
             "--base-url",
-            help="Server URL: required for a local deployment (ollama_chat / hosted_vllm), or a custom OpenAI-compatible endpoint",
+            help="Address of an OpenAI-compatible endpoint this config declares (a relay, a self-hosted "
+            "server); pi carries the address of every provider it ships",
         ),
-        model: Optional[str] = typer.Option(None, "--model", help="Default model id (e.g. 'openai/gpt-4o-mini')"),
-        wire: Optional[str] = typer.Option(
+        model: Optional[str] = typer.Option(
             None,
-            "--wire",
-            help="Wire a custom endpoint serves: 'chat' (/v1/chat/completions, the default) or 'responses' (/v1/responses)",
+            "--model",
+            help="Default model id (e.g. 'openai/gpt-4o-mini'); for a declared provider, the id(s) it serves",
         ),
         skip_memory: bool = typer.Option(False, "--skip-memory", help="Skip Step 2 (Persistent Memory)"),
         skip_protein_design: bool = typer.Option(
             False, "--skip-protein-design", help="Skip Step 3 (Protein Design compute settings)"
+        ),
+        brave_api_key: Optional[str] = typer.Option(
+            None,
+            "--brave-api-key",
+            help="Step 4: Brave Search API key for web_search (without one, DuckDuckGo is used)",
         ),
         non_interactive: bool = typer.Option(
             False,
@@ -2395,32 +2153,31 @@ def register(app: typer.Typer) -> None:
             help="Run without prompts (requires flags for any missing field)",
         ),
         yes: bool = typer.Option(False, "--yes", "-y", help="Skip all confirm prompts"),
-        reset: bool = typer.Option(
-            False,
-            "--reset",
-            help="Re-run the wizard over an existing config (does not erase it; each step keeps current values as defaults)",
-        ),
         skip_test: bool = typer.Option(
             False,
             "--skip-test",
             help="Skip the one-shot test message (avoids a billed call; connectivity is still checked)",
         ),
+        fresh: bool = typer.Option(
+            False,
+            "--fresh",
+            help="Move the existing configuration aside and start from nothing, even when this build "
+            "understands its shape",
+        ),
     ) -> None:
-        """Configure LLM, memory and Protein Design compute."""
-        if wire is not None and wire not in ("chat", "responses"):
-            raise typer.BadParameter(f"--wire must be 'chat' or 'responses' (got {wire!r})")
+        """Configure LLM, memory, Protein Design compute and web search."""
         run_wizard(
             provider=provider,
             api_key=api_key,
             base_url=base_url,
             model=model,
-            wire=wire,
             skip_memory=skip_memory,
             skip_protein_design=skip_protein_design,
+            brave_api_key=brave_api_key,
             non_interactive=non_interactive,
             yes=yes,
-            reset=reset,
             skip_test=skip_test,
+            fresh=fresh,
         )
 
 

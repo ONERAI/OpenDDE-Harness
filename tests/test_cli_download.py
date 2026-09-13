@@ -43,7 +43,9 @@ def test_download_resumes_a_partial_file_with_a_range_request(tmp_path, monkeypa
             download_file(["https://example.invalid/f"], target, sha256=SHA, size=len(DATA), console=console) == target
         )
     assert target.read_bytes() == DATA and seen == ["bytes=4000-"]
-    assert capsys.readouterr().out.strip() == "Source: https://example.invalid/f"
+    # A transfer that works says nothing: the progress display is what shows it,
+    # and a line per source scrolled the rest of the screen away.
+    assert capsys.readouterr().out.strip() == ""
     assert (tmp_path / "log").read_text() == ""
 
 
@@ -98,3 +100,33 @@ def test_download_reports_http_errors_and_size_limits(tmp_path, monkeypatch, cap
     _serve(monkeypatch, lambda request: httpx.Response(200, content=DATA))
     with pytest.raises(DownloadError, match="size or time limit"):
         download_file(["https://example.invalid/big"], tmp_path / "b.part", max_bytes=100)
+
+
+def test_a_caller_already_drawing_hands_its_display_in(tmp_path, monkeypatch):
+    """Every transfer of a preparation shares one progress display: a row while
+    a file moves and none once it has. Each opening its own is what a pool of
+    downloads used to do, and two live displays fight over the terminal."""
+    import io
+
+    _serve(monkeypatch, lambda request: httpx.Response(200, content=DATA))
+    console = Console(file=io.StringIO(), force_terminal=False)
+    shared = _download.progress(console)
+    rows = []
+    add_task = shared.add_task
+    monkeypatch.setattr(shared, "add_task", lambda name, **kwargs: rows.append(name) or add_task(name, **kwargs))
+
+    with shared:
+        for index in (1, 2):
+            download_file(
+                ["https://example.invalid/f"],
+                tmp_path / f"f{index}",
+                sha256=SHA,
+                size=len(DATA),
+                description=f"file-{index}",
+                bar=shared,
+            )
+
+    assert rows == ["file-1", "file-2"]
+    # Each row is taken back when its transfer ends, so the display stays the
+    # height of what is moving.
+    assert shared.tasks == []

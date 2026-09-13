@@ -12,14 +12,15 @@ import json
 from pathlib import Path
 from typing import Any
 
+from opendde_harness.providers import messages as msg
 from opendde_harness.session.manager import Session
 from opendde_harness.utils.helpers import ensure_dir, safe_filename
 
 _ROLE_HEADINGS = {
-    "user": "## 🧑 User",
-    "assistant": "## 🤖 Assistant",
-    "system": "## ⚙️ System",
-    "tool": "## 🛠 Tool result",
+    msg.USER: "## 🧑 User",
+    msg.ASSISTANT: "## 🤖 Assistant",
+    msg.SYSTEM: "## ⚙️ System",
+    msg.TOOL_RESULT: "## 🛠 Tool result",
 }
 
 
@@ -32,8 +33,8 @@ def render_transcript(session: Session) -> str:
     blocks. Pure — performs no I/O.
     """
     parts: list[str] = [_render_header(session)]
-    for msg in session.messages:
-        parts.append(_render_message(msg))
+    for message in session.messages:
+        parts.append(_render_message(message))
     return "\n\n".join(p for p in parts if p) + "\n"
 
 
@@ -74,68 +75,48 @@ def _render_header(session: Session) -> str:
     return "\n".join(lines)
 
 
-def _render_message(msg: dict[str, Any]) -> str:
-    role = msg.get("role", "")
+def _render_message(message: dict[str, Any]) -> str:
+    role = message.get("role", "")
     heading = _ROLE_HEADINGS.get(role, f"## {role or 'message'}")
-    if role == "tool":
-        name = msg.get("name") or msg.get("tool_call_id") or ""
+    if msg.is_tool_result(message):
+        name = message.get("toolName") or message.get("toolCallId") or ""
         suffix = f": `{name}`" if name else ""
-        return f"{heading}{suffix}\n\n{_fenced(_as_text(msg.get('content')))}"
+        return f"{heading}{suffix}\n\n{_fenced(_content_text(message))}"
 
-    blocks: list[str] = [heading]
-    reasoning = _reasoning_text(msg)
-    if reasoning:
+    parts: list[str] = [heading]
+    reasoning = msg.thinking_of(message)
+    if reasoning.strip():
         quoted = "\n".join(f"> {line}" for line in reasoning.splitlines() or [""])
-        blocks.append(f"> 💭 _thinking_\n{quoted}")
-    content = _as_text(msg.get("content"))
+        parts.append(f"> 💭 _thinking_\n{quoted}")
+    content = _content_text(message)
     if content:
-        blocks.append(content)
-    for call in msg.get("tool_calls") or []:
-        blocks.append(_render_tool_call(call))
-    return "\n\n".join(blocks)
+        parts.append(content)
+    for call in msg.tool_calls_of(message):
+        parts.append(_render_tool_call(call))
+    return "\n\n".join(parts)
 
 
 def _render_tool_call(call: dict[str, Any]) -> str:
-    fn = call.get("function") or {}
-    name = fn.get("name") or call.get("name") or "tool"
-    args = fn.get("arguments")
-    if args is None:
-        args = call.get("arguments")
-    return f"⏺ **{name}**\n\n{_fenced(_as_text(args))}"
+    name = call.get("name") or "tool"
+    return f"⏺ **{name}**\n\n{_fenced(json.dumps(call.get('arguments') or {}, ensure_ascii=False, indent=2))}"
 
 
-def _reasoning_text(msg: dict[str, Any]) -> str:
-    rc = msg.get("reasoning_content")
-    if isinstance(rc, str) and rc.strip():
-        return rc
-    blocks = msg.get("thinking_blocks")
-    if isinstance(blocks, list):
-        texts = [b.get("thinking", "") for b in blocks if isinstance(b, dict) and b.get("thinking")]
-        if texts:
-            return "\n".join(texts)
-    return ""
+def _content_text(message: dict[str, Any]) -> str:
+    """A message's content as a transcript reads it: text, and a note per picture.
 
-
-def _as_text(content: Any) -> str:
-    """Flatten a message content value (str, multimodal list, or dict) to text."""
-    if content is None:
-        return ""
+    ``thinking`` and ``toolCall`` blocks are rendered by the caller, each in its
+    own place, so they are not repeated here.
+    """
+    content = message.get("content")
     if isinstance(content, str):
         return content
-    if isinstance(content, list):
-        out: list[str] = []
-        for part in content:
-            if isinstance(part, dict):
-                if part.get("type") == "text" and isinstance(part.get("text"), str):
-                    out.append(part["text"])
-                elif part.get("type") == "image_url":
-                    out.append("[image]")
-                else:
-                    out.append(json.dumps(part, ensure_ascii=False))
-            else:
-                out.append(str(part))
-        return "\n".join(out)
-    return json.dumps(content, ensure_ascii=False)
+    out: list[str] = []
+    for block in msg.blocks_of(message):
+        if msg.is_text(block):
+            out.append(str(block.get("text") or ""))
+        elif msg.is_image(block):
+            out.append("[image]")
+    return "\n".join(out)
 
 
 def _fenced(text: str) -> str:

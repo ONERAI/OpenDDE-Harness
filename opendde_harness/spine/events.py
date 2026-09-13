@@ -22,7 +22,12 @@ class NoticeKind(StrEnum):
     PROGRESS = "progress"
     TOOL_HINT = "tool_hint"
     INJECTED = "injected"
+    #: Something the turn produced did not reach where it was going: an outlet
+    #: that refused it, or the memory service refusing a completed turn the
+    #: extraction outbox has now abandoned. The detail says which.
     DELIVERY_FAILED = "delivery_failed"
+    #: The turn is not running on the model the session asked for.
+    MODEL_FALLBACK = "model_fallback"
 
 
 class ToolPhase(StrEnum):

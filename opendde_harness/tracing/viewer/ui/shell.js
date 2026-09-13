@@ -106,4 +106,4 @@ module.exports = String.raw`<!doctype html>
     <script src="/app.js"></script>
   </body>
   </html>
-`;
+`

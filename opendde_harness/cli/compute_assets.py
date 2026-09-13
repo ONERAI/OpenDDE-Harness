@@ -5,11 +5,11 @@ from __future__ import annotations
 import functools
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
 import subprocess
-import sys
 import tempfile
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -17,6 +17,9 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from rich.console import Console
+
+from opendde_harness.cli import _download
 from opendde_harness.cli._download import HF_ORIGIN, download_file, with_mirrors
 from opendde_harness.cli.compute_environment import SUBPROCESS_TIMEOUT, load_environment
 from opendde_harness.plugin.protein_design.core.asset_paths import (
@@ -54,6 +57,12 @@ def source_revisions(path: Path | None = None) -> dict[str, str]:
     if not {"OPENDDE_REV", "LIGANDMPNN_REV", "PLIP_REV", "ESM_REV"} <= revisions.keys():
         raise ValueError(f"Missing required source revisions in {path}")
     return revisions
+
+
+#: Stdlib logging, not loguru: the compute container runs this module from
+#: ``/workspace`` against its own runtime, which ships rich and httpx but no
+#: loguru -- a top-level import of it stopped the container's API at startup.
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -173,7 +182,7 @@ def model_environment(weights_dir: str = "/weights", opendde_dir: str | None = N
     }
 
 
-def _prepare_shared_models(root: Path) -> dict[str, str]:
+def _prepare_shared_models(root: Path, *, bar=None) -> dict[str, str]:
     revision = source_revisions()["ESM_REV"]
     reference = root / "huggingface/models--facebook--esm2_t33_650M_UR50D/refs/main"
     if reference.is_symlink() or (reference.exists() and reference.read_text().strip() != revision):
@@ -188,7 +197,7 @@ def _prepare_shared_models(root: Path) -> dict[str, str]:
             previous.append(path.resolve())
     for asset in shared_asset_plan():
         reuse_asset(root / asset.relative_path, asset, [path / asset.relative_path for path in previous])
-        download_asset(root, asset)
+        download_asset(root, asset, bar=bar)
     if not reference.exists():
         reference.parent.mkdir(parents=True, exist_ok=True)
         reference.write_text(revision)
@@ -281,11 +290,18 @@ def weights_layout(
     return "\n".join(lines)
 
 
-def download_asset(root: Path, asset: Asset) -> Path:
+def download_asset(root: Path, asset: Asset, *, bar=None) -> Path:
+    """Fetch one asset into ``root``, unless a verified copy is already there.
+
+    ``bar`` is the progress display the whole preparation shares: a row per
+    transfer that goes when the transfer does, so the screen holds the few
+    files moving now rather than a line for every file ever considered. What
+    each file did is in the log.
+    """
     destination = root / asset.relative_path
     if destination.exists() or destination.is_symlink():
         if valid_asset(destination, asset):
-            print(f"Verified existing asset: {destination}", flush=True)
+            logger.debug("asset already verified: %s", destination)
             return destination
         raise ValueError(
             f"Existing asset has a different identity: {destination}. It was not overwritten; use another asset directory or move it aside yourself."
@@ -294,9 +310,14 @@ def download_asset(root: Path, asset: Asset) -> Path:
     partial = destination.with_name(f".{destination.name}.{asset.sha256[:12]}.part")
     if partial.is_symlink():
         raise ValueError(f"Refusing a symlinked partial download: {partial}")
-    print(f"Downloading {asset.relative_path} (partial transfers resume on rerun)", flush=True)
+    logger.debug("downloading %s (a partial transfer resumes on a rerun)", asset.relative_path)
     download_file(
-        with_mirrors(asset.sources), partial, sha256=asset.sha256, size=asset.size, description=asset.relative_path
+        with_mirrors(asset.sources),
+        partial,
+        sha256=asset.sha256,
+        size=asset.size,
+        description=asset.relative_path,
+        bar=bar,
     )
     partial.chmod(0o644)
     partial.replace(destination)
@@ -324,7 +345,7 @@ def clone_repository(url: str, revision: str, destination: Path) -> None:
             )
         if git("rev-parse", "HEAD") != revision or git("status", "--porcelain", "--untracked-files=no"):
             raise ValueError(f"Source revision differs or has local edits: {destination}. It was left unchanged.")
-        print(f"Reusing pinned source: {destination} ({revision[:12]})", flush=True)
+        _download.report(f"Reusing pinned source: {destination} ({revision[:12]})")
         return
     destination.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".clone-", dir=destination.parent) as temporary:
@@ -370,7 +391,7 @@ def prepare_sources(root: Path) -> None:
         ("foldmason", "steineggerlab/foldmason", environment["foldmason_revision"]),
     ):
         clone_repository(f"https://github.com/{repository}.git", revision, root / "external" / name)
-    print(f"Mounted codebase ready: {root}", flush=True)
+    _download.report(f"Mounted codebase ready: {root}")
 
 
 def reuse_asset(destination: Path, asset: Asset, candidates: list[Path]) -> None:
@@ -392,7 +413,7 @@ def reuse_asset(destination: Path, asset: Asset, candidates: list[Path]) -> None
             temporary.replace(destination)
         finally:
             temporary.unlink(missing_ok=True)
-        print(f"Reused verified asset: {candidate} -> {destination}", flush=True)
+        logger.debug("reused a verified asset: %s -> %s", candidate, destination)
         return
 
 
@@ -409,7 +430,7 @@ def write_json(path: Path, value: dict) -> None:
             temporary.unlink(missing_ok=True)
 
 
-def _prepare_downloads(root: Path, checkpoint: str, workers: int, paths: dict[str, str]) -> None:
+def _prepare_downloads(root: Path, checkpoint: str, workers: int, paths: dict[str, str], *, bar=None) -> None:
     plan = asset_plan(checkpoint)
     archived = root / ".legacy"
     previous_roots = sorted(archived.glob("opendde-*"), reverse=True)[:20] if archived.is_dir() else []
@@ -426,8 +447,8 @@ def _prepare_downloads(root: Path, checkpoint: str, workers: int, paths: dict[st
                 raise ValueError(
                     f"Explicit custom checkpoint is missing or unreadable: {destination}; no download source was assumed."
                 )
-            print(
-                f"Using explicit custom checkpoint: {destination}; released-model checksum is not asserted.", flush=True
+            _download.report(
+                f"Using explicit custom checkpoint: {destination}; released-model checksum is not asserted."
             )
             return
         candidates = [
@@ -435,11 +456,15 @@ def _prepare_downloads(root: Path, checkpoint: str, workers: int, paths: dict[st
             for previous in previous_roots
         ]
         reuse_asset(destination, asset, candidates)
-        download_asset(destination.parent, Asset(destination.name, asset.url, asset.sha256, asset.size, asset.mirrors))
+        download_asset(
+            destination.parent,
+            Asset(destination.name, asset.url, asset.sha256, asset.size, asset.mirrors),
+            bar=bar,
+        )
 
-    print("Preparing OpenDDE checkpoint first (exclusive download stage).", flush=True)
+    logger.debug("preparing the OpenDDE checkpoint first, on its own")
     download(plan.pop(0))
-    print(f"Preparing remaining assets with up to {workers} concurrent downloads.", flush=True)
+    logger.debug("preparing the remaining assets, up to %s at a time", workers)
     failures = []
     with ThreadPoolExecutor(max_workers=workers) as pool:
         jobs = {pool.submit(download, asset): asset.relative_path for asset in plan}
@@ -447,10 +472,10 @@ def _prepare_downloads(root: Path, checkpoint: str, workers: int, paths: dict[st
             name = jobs[future]
             try:
                 future.result()
-                print(f"Asset ready: {name}", flush=True)
+                logger.debug("asset ready: %s", name)
             except Exception as exc:
                 failures.append(f"{name}: {exc}")
-                print(f"Asset failed: {name}: {exc}", file=sys.stderr, flush=True)
+                _download.report(f"Asset failed: {name}: {exc}")
     if failures:
         raise ValueError(
             "Some compute assets failed; verified files and partial downloads were retained:\n"
@@ -478,11 +503,12 @@ def prepare(
         if directory == Path(directory.anchor) or directory == Path.home().resolve():
             raise ValueError("Choose dedicated asset directories, not a filesystem or home root.")
     root.mkdir(parents=True, exist_ok=True)
-    with portalocker.Lock(str(root / ".prepare.lock"), timeout=1):
-        print(
-            weights_layout(root, data, with_opendde=with_opendde, checkpoint=checkpoint)
-            + "\nPreparing inference assets only; large local search databases are excluded.",
-            flush=True,
+    # One progress display for every transfer this makes: a row while a file is
+    # moving and nothing once it has, so the screen keeps to the few in flight.
+    with portalocker.Lock(str(root / ".prepare.lock"), timeout=1), _download.progress(Console()) as display:
+        logger.debug(
+            "preparing inference assets only; the large local search databases are excluded\n%s",
+            weights_layout(root, data, with_opendde=with_opendde, checkpoint=checkpoint),
         )
         manifests: dict[Path, list[Asset]] = {root: shared_asset_plan()}
         if with_opendde:
@@ -493,11 +519,11 @@ def prepare(
                 **{key: value for key, value in (paths or {}).items() if key.startswith("opendde_")},
             }
             data.mkdir(parents=True, exist_ok=True)
-            _prepare_downloads(data, checkpoint, download_workers, paths)
+            _prepare_downloads(data, checkpoint, download_workers, paths, bar=display)
             manifests.setdefault(data, []).extend(asset_plan(checkpoint))
         else:
             paths = {}
-        paths.update(_prepare_shared_models(root))
+        paths.update(_prepare_shared_models(root, bar=display))
         # Every listed file was verified against its published digest above, so
         # the manifests can be rebuilt from the plan without rereading gigabytes.
         for base, plan in manifests.items():
@@ -519,8 +545,7 @@ def prepare(
             "esm_revision": source_revisions()["ESM_REV"],
         }
         write_json(state_file, state)
-        print(
-            "Compute assets are ready. Docker, a compatible compute image, and GPU drivers are still required for local GPU execution.",
-            flush=True,
+        _download.report(
+            "Compute assets are ready. Docker, a compatible compute image, and GPU drivers are still required for local GPU execution."
         )
         return state

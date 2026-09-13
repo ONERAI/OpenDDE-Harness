@@ -11,9 +11,7 @@ Registered via a closure that pre-binds the broker (mirrors
 ``register_confirm_methods``). Gated on a non-None broker by the umbrella, so
 paths that build no broker do not register it.
 
-This method is intentionally NOT in ``METHOD_MODELS`` / ``openrpc.json`` — like
-the confirm pair, the question round-trip lives outside the cross-language
-schema-parity contract.
+The method and its notification payload are declared in ``openrpc.json``.
 """
 
 from __future__ import annotations

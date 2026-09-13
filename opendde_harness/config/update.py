@@ -79,6 +79,25 @@ def set_language(
     return prev
 
 
+def set_web_search_key(key: str, *, config_path: Path | None = None) -> str | None:
+    """Patch ``tools.web.braveApiKey`` on the on-disk config. Returns the previous value.
+
+    Set by the onboarding wizard's web-search screen; an empty key removes
+    it, and ``web_search`` then queries DuckDuckGo without one.
+    """
+    path = config_path or get_config_path()
+    data = read_raw_or_raise(path)
+    web = data.setdefault("tools", {}).setdefault("web", {})
+    # The schema reads either spelling; one field is written, both are cleared.
+    previous = [web.pop(name) for name in ("braveApiKey", "brave_api_key") if name in web]
+    prev = previous[0] if previous else None
+    if key:
+        web["braveApiKey"] = key
+    write_json_atomic(path, data)
+    logger.info("config/update: web search key {}", "set" if key else "cleared")
+    return prev
+
+
 def set_default_model(
     model: str,
     *,
@@ -89,24 +108,25 @@ def set_default_model(
 
     Used by the onboarding wizard after the user picks a provider: the wizard
     needs to swap the default model to one that matches the chosen provider
-    (otherwise the TUI would still route to whatever the freshly
-    created ``Config()`` baked in, which is typically a different vendor).
+    (otherwise the TUI would still route to whatever the freshly created
+    ``Config()`` baked in, which is typically a different vendor).
 
-    ``provider`` writes ``agents.defaults.provider`` in the same patch. That field
-    overrides what a model id says, so leaving it behind lets a stale pin route
-    the new model to the old vendor -- with the old vendor's key -- while the
-    write that was just reported as successful changes nothing. Callers that do
-    not know which provider serves the model pass None and leave it alone.
+    ``provider`` qualifies a bare model id, and is how a caller that knows the
+    provider hands it over. The id is what carries it: the field that used to
+    name the provider separately is gone, because it overrode what an id said
+    and a stale one routed the new model to the old vendor's key.
     """
+    from opendde_harness.providers import model_id
+
     path = config_path or get_config_path()
     data = read_raw_or_raise(path)
     defaults = data.setdefault("agents", {}).setdefault("defaults", {})
     prev = defaults.get("model")
-    defaults["model"] = model
-    if provider is not None:
-        defaults["provider"] = provider
+    qualified = model_id.join(provider, model) if provider else model
+    defaults["model"] = qualified
+    defaults.pop("provider", None)
     write_json_atomic(path, data)
-    logger.info("config/update: default model set to {} (was {}), provider={}", model, prev, provider)
+    logger.info("config/update: default model set to {} (was {})", qualified, prev)
     return prev
 
 
@@ -126,19 +146,11 @@ def init_extension_block_defaults(*, config_path: Path | None = None) -> None:
 
     Defaults are pulled from the Pydantic models so this seed can't drift from
     the schema, with two deliberate onboard-time overrides:
-      - ``skillForge.memory.enabled`` is seeded ``True`` (per-turn extraction on
-        for a fresh install) even though the schema default is conservative-off;
       - ``plugins.config["long-term-memory"]`` is seeded with only ``base_url`` so
         the block is never empty and the user can see/edit it. Identity
         (``user_id`` / ``agent_id``) is deliberately NOT duplicated here — it
         comes from ``memory.userId`` / ``memory.agentId`` via the host's
         ``ServiceLocator`` at plugin activation time.
-
-    The optional service fields on ``SkillForgeConfig`` (``embedding_url`` /
-    ``embedding_api_key`` / ``reranker_url`` / ``reranker_api_key``) are
-    deliberately NOT written. They stay at public
-    schema defaults and deployments that need hosted services add explicit
-    values by hand.
 
     Key casing follows each block's convention: ``memory`` / ``skillForge`` use
     camelCase (the file-level alias); ``plugins.config`` is a verbatim
@@ -169,9 +181,6 @@ def init_extension_block_defaults(*, config_path: Path | None = None) -> None:
     router_defaults = SkillForgeRouterConfig()
     skill_forge = data.setdefault("skillForge", {})
     skill_forge.setdefault("enabled", True)
-    # Onboard turns per-turn extraction ON (schema default is off for
-    # non-onboard programmatic use).
-    skill_forge.setdefault("memory", {}).setdefault("enabled", True)
     router = skill_forge.setdefault("router", {})
     router.setdefault("enabled", router_defaults.enabled)
     router.setdefault("weights", dict(router_defaults.weights))
@@ -184,34 +193,24 @@ def set_plugin_config_fields(
     plugin_id: str,
     fields: dict[str, Any],
     *,
-    remove: tuple[str, ...] | None = None,
     config_path: Path | None = None,
 ) -> None:
     """Merge ``fields`` into ``plugins.config[plugin_id]`` on the on-disk config.
 
     A merge rather than a replace: the slice holds several independent decisions
-    (which memory root, whether opendde owns it, its cached address) written at
+    (a memory service's address and the port it is meant to listen on) written at
     different moments, and a replacing write would drop whichever the caller did
     not happen to be carrying.
-
-    ``remove`` names keys that no longer apply, for the case a merge cannot
-    express. Switching to a memory service the user runs has to retract the
-    recorded root, not merely stop updating it: left behind, it is still
-    exported to the library and still points opendde at a directory it has just
-    promised to leave alone.
     """
     path = config_path or get_config_path()
     data = read_raw_or_raise(path)
     slice_ = data.setdefault("plugins", {}).setdefault("config", {}).setdefault(plugin_id, {})
     slice_.update(fields)
-    for key in remove or ():
-        slice_.pop(key, None)
     write_json_atomic(path, data)
     logger.info(
-        "config/update: plugins.config.{} updated ({}{})",
+        "config/update: plugins.config.{} updated ({})",
         plugin_id,
         ", ".join(fields),
-        f"; removed {', '.join(remove)}" if remove else "",
     )
 
 
@@ -238,9 +237,23 @@ def set_memory_backend(
     return prev
 
 
+def set_scoped_models(models: list[str] | None, *, config_path: Path | None = None) -> None:
+    """Write ``agents.scopedModels``: pi's saved model scope, or ``None`` for all."""
+    path = config_path or get_config_path()
+    data = read_raw_or_raise(path)
+    section = data.setdefault("agents", {})
+    if models is None:
+        section.pop("scopedModels", None)
+    else:
+        section["scopedModels"] = list(models)
+    write_json_atomic(path, data)
+    logger.info("config/update: agents.scopedModels set to {}", "all" if models is None else len(models))
+
+
 __all__ = [
     "set_default_model",
     "set_memory_backend",
+    "set_scoped_models",
     "set_skill_blocked",
     "init_extension_block_defaults",
 ]

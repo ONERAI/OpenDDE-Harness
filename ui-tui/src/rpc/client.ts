@@ -8,7 +8,9 @@
 // (pass_fds=(3,4)) was rejected — Node can't reliably wrap inherited pipe FDs.
 //
 // Framing: newline-delimited UTF-8 JSON (specs §2.5). Each frame is
-// `JSON.stringify(obj) + '\n'`. Single frame limit: 1 MiB.
+// `JSON.stringify(obj) + '\n'`. Single frame limit: 1 MiB of UTF-8 bytes,
+// newline included — the same thing `tui_rpc/server.py` measures on the frames
+// it reads, and not the same as a JavaScript string's `.length`.
 //
 // Writes are serialized through a `writeQueue` (single-writer model) so
 // concurrent `rpc()` / `subscribe()` calls never interleave bytes.
@@ -27,8 +29,13 @@ import { isJsonRpcError } from './generated.js'
 import { SubscriptionRegistry } from './subscriptions.js'
 
 const MAX_FRAME_BYTES = 1024 * 1024 // 1 MiB (specs §2.5)
+const NEWLINE = 0x0a
 
 type Pending = {
+  /** Runs while the response frame is being processed, before the awaiting
+   *  caller is resumed. `subscribe` uses it to install its handler in time for
+   *  an event that shares the response's chunk. */
+  onResult?: (result: unknown) => void
   resolve: (value: unknown) => void
   reject: (err: Error) => void
 }
@@ -46,6 +53,12 @@ export interface RpcClientOptions {
    * are logged as unknown and dropped.
    */
   onNotification?: (method: string, params: unknown) => void
+  /**
+   * Called once when the socket is gone — peer close, transport error, or
+   * `close()` from this side. The UI uses it to drop broker prompts and
+   * pickers that can no longer be answered.
+   */
+  onClose?: (err: Error) => void
 }
 
 export class RpcClient {
@@ -54,9 +67,10 @@ export class RpcClient {
   private readonly pending = new Map<number, Pending>()
   private readonly warn: (msg: string) => void
   private readonly onNotification?: (method: string, params: unknown) => void
+  private readonly onClose?: (err: Error) => void
 
   private nextId = 1
-  private readBuffer = ''
+  private readBuffer: Buffer = Buffer.alloc(0)
   private writeQueue: Promise<void> = Promise.resolve()
   private closed = false
   private connected = false
@@ -71,6 +85,7 @@ export class RpcClient {
     }
     this.warn = opts.warn ?? (m => process.stderr.write(`[rpc-client] ${m}\n`))
     this.onNotification = opts.onNotification
+    this.onClose = opts.onClose
 
     // Cross-platform transport: the parent exports either a TCP-loopback
     // "host:port" (current Python parent; works on Windows too) or, for legacy
@@ -81,8 +96,6 @@ export class RpcClient {
     } else {
       this.socket = createConnection(target)
     }
-    this.socket.setEncoding('utf-8')
-
     // Shared secret the parent validates as the first line before any frame
     // (the loopback port is reachable by any local process, so this gates it).
     const authToken = process.env.OPENDDE_HARNESS_RPC_TOKEN
@@ -105,9 +118,11 @@ export class RpcClient {
       this.socket.once('error', onError)
     })
 
+    // Bytes, not decoded text: the frame limit is a byte limit, and a
+    // multibyte character must not be split across the newline scan.
     this.socket.on('data', (chunk: string | Buffer) => {
-      const text = typeof chunk === 'string' ? chunk : chunk.toString('utf-8')
-      this.readBuffer += text
+      const bytes = typeof chunk === 'string' ? Buffer.from(chunk, 'utf-8') : chunk
+      this.readBuffer = this.readBuffer.length === 0 ? bytes : Buffer.concat([this.readBuffer, bytes])
       if (this.readBuffer.length > MAX_FRAME_BYTES * 2) {
         // Defensive: if peer is flooding without newlines, abort rather than OOM.
         this.warn(
@@ -129,20 +144,26 @@ export class RpcClient {
   }
 
   private drainBuffer(): void {
-    let nl = this.readBuffer.indexOf('\n')
+    let nl = this.readBuffer.indexOf(NEWLINE)
     while (nl !== -1) {
-      const line = this.readBuffer.slice(0, nl).trim()
-      this.readBuffer = this.readBuffer.slice(nl + 1)
+      const line = this.readBuffer.subarray(0, nl)
+      this.readBuffer = this.readBuffer.subarray(nl + 1)
       if (line.length > 0) {
         this.handleFrame(line)
       }
-      nl = this.readBuffer.indexOf('\n')
+      nl = this.readBuffer.indexOf(NEWLINE)
     }
   }
 
-  private handleFrame(line: string): void {
-    if (line.length > MAX_FRAME_BYTES) {
-      this.warn(`oversized frame (${line.length} bytes) dropped`)
+  /** `raw` is one frame's bytes without its terminating newline. */
+  private handleFrame(raw: Buffer): void {
+    // The newline counts towards the limit, as it does on the Python side.
+    if (raw.length + 1 > MAX_FRAME_BYTES) {
+      this.warn(`oversized frame (${raw.length + 1} bytes) dropped`)
+      return
+    }
+    const line = raw.toString('utf-8').trim()
+    if (line.length === 0) {
       return
     }
     let frame: unknown
@@ -194,6 +215,9 @@ export class RpcClient {
     if (isJsonRpcError(resp)) {
       pending.reject(rpcErrorFromFrame((resp as JsonRpcErrorResponse).error))
     } else {
+      // Before resolving: the rest of this chunk is dispatched synchronously,
+      // so anything the result has to be registered for must happen now.
+      pending.onResult?.(resp.result)
       pending.resolve(resp.result)
     }
   }
@@ -208,11 +232,13 @@ export class RpcClient {
     }
     this.pending.clear()
     this.registry.clear()
+    this.onClose?.(err)
   }
 
   private async writeFrame(frame: string): Promise<void> {
-    if (frame.length > MAX_FRAME_BYTES) {
-      throw new Error(`rpc-client: outgoing frame ${frame.length} bytes exceeds ${MAX_FRAME_BYTES} limit`)
+    const size = Buffer.byteLength(frame, 'utf-8')
+    if (size > MAX_FRAME_BYTES) {
+      throw new Error(`rpc-client: outgoing frame ${size} bytes exceeds ${MAX_FRAME_BYTES} limit`)
     }
     // Serialize all writes — even when the socket itself is happy with
     // concurrent writes, we don't want two frames interleaved on the wire.
@@ -230,7 +256,12 @@ export class RpcClient {
   }
 
   /** Invoke a JSON-RPC method and await the typed result. */
-  async rpc<R = unknown, P = unknown>(method: string, params: P): Promise<R> {
+  rpc<R = unknown, P = unknown>(method: string, params: P): Promise<R> {
+    return this.request<R, P>(method, params)
+  }
+
+  /** `onResult` runs synchronously while the response frame is handled. */
+  private async request<R, P>(method: string, params: P, onResult?: (result: R) => void): Promise<R> {
     if (this.closed) {
       throw new Error('rpc-client: closed')
     }
@@ -239,6 +270,7 @@ export class RpcClient {
     const frame = JSON.stringify(req) + '\n'
     const result = new Promise<R>((resolve, reject) => {
       this.pending.set(id, {
+        onResult: onResult && (value => onResult(value as R)),
         resolve: v => resolve(v as R),
         reject
       })
@@ -259,6 +291,11 @@ export class RpcClient {
    * the handler against that id and returns an `unsubscribe()` thunk that
    * both calls the paired server method (if `unsubscribeMethod` is given)
    * and detaches the handler locally.
+   *
+   * Registration happens while the response frame is processed, not after the
+   * await resumes: the server may put the stream's first event in the same TCP
+   * chunk as the response, and `drainBuffer` dispatches that chunk's lines
+   * synchronously — a handler installed a microtask later would miss it.
    */
   async subscribe<E = unknown, P = unknown, R extends { subscription_id: string } = { subscription_id: string }>(
     method: string,
@@ -266,9 +303,10 @@ export class RpcClient {
     handler: (event: E) => void,
     opts: { unsubscribeMethod?: string } = {}
   ): Promise<{ subscription_id: string; unsubscribe: () => Promise<void> }> {
-    const result = await this.rpc<R, P>(method, params)
+    const result = await this.request<R, P>(method, params, ({ subscription_id }) =>
+      this.registry.register<E>(subscription_id, handler)
+    )
     const subscriptionId = result.subscription_id
-    this.registry.register<E>(subscriptionId, handler)
     const unsubscribeMethod = opts.unsubscribeMethod
     const unsubscribe = async (): Promise<void> => {
       this.registry.unregister(subscriptionId)

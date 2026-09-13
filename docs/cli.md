@@ -18,14 +18,16 @@ Prefix each command below with `ddeharness`.
 | `upgrade` | Legacy GitHub Release updater (`--check` only reports); use the installation guide for package updates |
 | `compare` | Compare two candidate populations |
 | `compute` | `prepare`, `serve`, `stop` |
-| `provider` | `login`, `list`, `get`, `set`, `test`, `use`, `reset`, `show`, `endpoint` |
+| `provider` | `login`, `list`, `get`, `set`, `test`, `use`, `reset`, `show`, `model set` |
 | `protein-design` | `context`, `validate`, `start` |
 | `skill` | `list`, `get`, `block`, `unblock` |
 | `tui` | Launch the native TUI (bare `ddeharness` does the same) |
 | `sessions` | `create`, `list`, `resume`, `delete`, `fork`, `export` |
 
-Every command accepts `--help`. `provider endpoint` has `add`, `remove`, and
-`list` subcommands. The current `upgrade` implementation still queries
+Every command accepts `--help`. `provider model set <provider> <model>` writes
+what only you know about one model -- its window, its output ceiling, its
+sampling temperature, which catalogue model a deployment serves. The current
+`upgrade` implementation still queries
 `OpenDDE-Harness-beta`; update a PyPI installation with
 `uv tool upgrade opendde-harness`, or follow the
 [source update instructions](installation.md#install-from-source).

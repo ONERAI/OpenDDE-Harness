@@ -11,7 +11,6 @@ from opendde_harness.config.features import (
     ContextConfig,
     LocalDirConfig,
     MemoryConfig,
-    MemoryExtractionConfig,
     PluginsConfig,
     RuntimeConfig,
     SkillForgeConfig,
@@ -24,7 +23,6 @@ from opendde_harness.config.schema import Config as OpenDDEHarnessConfig
 __all__ = [
     "CheckpointConfig",
     "ContextConfig",
-    "MemoryExtractionConfig",
     "LocalDirConfig",
     "MemoryConfig",
     "OpenDDEHarnessConfig",

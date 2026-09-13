@@ -1,4 +1,4 @@
-'use strict';
+'use strict'
 
 // Reads the long-term memory deposits (episode / atomic_fact / foresight / agent_case /
 // agent_skill) and indexes it so a `memory.store` span can be joined to the family
@@ -10,9 +10,9 @@
 // turn share one parent_id, so we group by parent_id and match the group whose
 // timestamp is nearest the store time within a tolerance. See STORE_DEPOSIT_DESIGN.md.
 
-const fs = require('fs');
-const os = require('os');
-const path = require('path');
+const fs = require('fs')
+const os = require('os')
+const path = require('path')
 
 // dir basename -> derived memory type
 const DIR_TYPE = {
@@ -21,70 +21,70 @@ const DIR_TYPE = {
   '.foresights': 'foresight',
   '.agent_cases': 'agent_case',
   '.agent_skills': 'agent_skill'
-};
+}
 
 // The memory root: an explicit override, else the root recorded in the harness
 // config by `ddeharness onboard`, else the default location under the harness
 // data dir.
 function resolveMemoryRoot() {
-  if (process.env.OPENDDE_HARNESS_MEMORY_ROOT) return process.env.OPENDDE_HARNESS_MEMORY_ROOT;
-  const dataDir = path.join(os.homedir(), '.opendde_harness');
+  if (process.env.OPENDDE_HARNESS_MEMORY_ROOT) return process.env.OPENDDE_HARNESS_MEMORY_ROOT
+  const dataDir = path.join(os.homedir(), '.opendde_harness')
   try {
-    const config = JSON.parse(fs.readFileSync(path.join(dataDir, 'config.json'), 'utf8'));
-    const recorded = config && config.plugins && config.plugins.config && config.plugins.config['long-term-memory'];
-    if (recorded && typeof recorded.root === 'string' && recorded.root) return recorded.root;
+    const config = JSON.parse(fs.readFileSync(path.join(dataDir, 'config.json'), 'utf8'))
+    const recorded = config && config.plugins && config.plugins.config && config.plugins.config['long-term-memory']
+    if (recorded && typeof recorded.root === 'string' && recorded.root) return recorded.root
   } catch {
     // No config, or one the viewer cannot read: fall through to the default.
   }
-  return path.join(dataDir, 'memory');
+  return path.join(dataDir, 'memory')
 }
 
 function walkFiles(root, out = []) {
-  let entries;
+  let entries
   try {
-    entries = fs.readdirSync(root, { withFileTypes: true });
+    entries = fs.readdirSync(root, { withFileTypes: true })
   } catch {
-    return out;
+    return out
   }
   for (const ent of entries) {
-    const full = path.join(root, ent.name);
+    const full = path.join(root, ent.name)
     if (ent.isDirectory()) {
-      if (ent.name === '.index' || ent.name === '.tmp') continue;
-      walkFiles(full, out);
+      if (ent.name === '.index' || ent.name === '.tmp') continue
+      walkFiles(full, out)
     } else if (ent.isFile() && ent.name.endsWith('.md')) {
-      out.push(full);
+      out.push(full)
     }
   }
-  return out;
+  return out
 }
 
 function fileType(filePath) {
-  const dir = path.basename(path.dirname(filePath));
-  if (DIR_TYPE[dir]) return DIR_TYPE[dir];
-  const base = path.basename(filePath);
+  const dir = path.basename(path.dirname(filePath))
+  if (DIR_TYPE[dir]) return DIR_TYPE[dir]
+  const base = path.basename(filePath)
   for (const [d, t] of Object.entries(DIR_TYPE)) {
-    if (base.startsWith(t)) return t;
+    if (base.startsWith(t)) return t
   }
-  return null;
+  return null
 }
 
 // Parse `<!-- entry:ID -->...<!-- /entry:ID -->` blocks into structured entries.
 function parseEntries(text, type) {
-  const entries = [];
-  const re = /<!--\s*entry:([^\s]+)\s*-->([\s\S]*?)<!--\s*\/entry:\1\s*-->/g;
-  let m;
+  const entries = []
+  const re = /<!--\s*entry:([^\s]+)\s*-->([\s\S]*?)<!--\s*\/entry:\1\s*-->/g
+  let m
   while ((m = re.exec(text)) !== null) {
-    const id = m[1];
-    const body = m[2];
-    const header = {};
-    const hre = /^\*\*([^*]+)\*\*:\s*(.+)$/gm;
-    let h;
-    while ((h = hre.exec(body)) !== null) header[h[1].trim()] = h[2].trim();
-    const sections = {};
-    const sre = /^###\s+(.+?)\s*\n([\s\S]*?)(?=\n###\s|\n<!--|\s*$)/gm;
-    let s;
-    while ((s = sre.exec(body)) !== null) sections[s[1].trim()] = s[2].trim();
-    const ts = header.timestamp ? Date.parse(header.timestamp) : NaN;
+    const id = m[1]
+    const body = m[2]
+    const header = {}
+    const hre = /^\*\*([^*]+)\*\*:\s*(.+)$/gm
+    let h
+    while ((h = hre.exec(body)) !== null) header[h[1].trim()] = h[2].trim()
+    const sections = {}
+    const sre = /^###\s+(.+?)\s*\n([\s\S]*?)(?=\n###\s|\n<!--|\s*$)/gm
+    let s
+    while ((s = sre.exec(body)) !== null) sections[s[1].trim()] = s[2].trim()
+    const ts = header.timestamp ? Date.parse(header.timestamp) : NaN
     entries.push({
       id,
       type,
@@ -93,91 +93,91 @@ function parseEntries(text, type) {
       timestampMs: Number.isNaN(ts) ? null : ts,
       timestamp: header.timestamp || null,
       subject: sections.Subject || null,
-      text:
-        sections.Summary ||
-        sections.Fact ||
-        sections.Foresight ||
-        sections.Content ||
-        sections.Subject ||
-        null,
+      text: sections.Summary || sections.Fact || sections.Foresight || sections.Content || sections.Subject || null,
       startTime: header.start_time || null,
       endTime: header.end_time || null
-    });
+    })
   }
-  return entries;
+  return entries
 }
 
 // Build: Map<sessionId, Array<familyGroup>> where a familyGroup is all entries
 // sharing one parent_id (one turn's memcell) grouped by type.
 function buildDepositIndex(memoryRoot) {
-  const files = walkFiles(memoryRoot);
-  const byParent = new Map();
+  const files = walkFiles(memoryRoot)
+  const byParent = new Map()
   for (const file of files) {
-    const type = fileType(file);
-    if (!type) continue;
-    let text;
+    const type = fileType(file)
+    if (!type) continue
+    let text
     try {
-      text = fs.readFileSync(file, 'utf8');
+      text = fs.readFileSync(file, 'utf8')
     } catch {
-      continue;
+      continue
     }
     for (const entry of parseEntries(text, type)) {
-      if (!entry.parentId) continue;
+      if (!entry.parentId) continue
       if (!byParent.has(entry.parentId)) {
         byParent.set(entry.parentId, {
           parentId: entry.parentId,
           sessionId: entry.sessionId,
           timestampMs: entry.timestampMs,
           types: {}
-        });
+        })
       }
-      const group = byParent.get(entry.parentId);
-      if (group.timestampMs == null && entry.timestampMs != null) group.timestampMs = entry.timestampMs;
-      if (!group.sessionId && entry.sessionId) group.sessionId = entry.sessionId;
-      if (!group.types[type]) group.types[type] = [];
-      group.types[type].push(entry);
+      const group = byParent.get(entry.parentId)
+      if (group.timestampMs == null && entry.timestampMs != null) group.timestampMs = entry.timestampMs
+      if (!group.sessionId && entry.sessionId) group.sessionId = entry.sessionId
+      if (!group.types[type]) group.types[type] = []
+      group.types[type].push(entry)
     }
   }
-  const bySession = new Map();
+  const bySession = new Map()
   for (const group of byParent.values()) {
-    const sid = group.sessionId || '__unknown__';
-    if (!bySession.has(sid)) bySession.set(sid, []);
-    bySession.get(sid).push(group);
+    const sid = group.sessionId || '__unknown__'
+    if (!bySession.has(sid)) bySession.set(sid, [])
+    bySession.get(sid).push(group)
   }
-  return bySession;
+  return bySession
 }
 
 // Resolve the deposit family for one store span.
 // Returns { parentId, timestamp, counts, types } or null (not yet distilled).
 function resolveDeposit(index, sessionId, storeTimeMs, toleranceMs = 20000) {
-  if (!sessionId || storeTimeMs == null) return null;
-  const groups = index.get(sessionId);
-  if (!groups || !groups.length) return null;
-  let best = null;
-  let bestDelta = Infinity;
+  if (!sessionId || storeTimeMs == null) return null
+  const groups = index.get(sessionId)
+  if (!groups || !groups.length) return null
+  let best = null
+  let bestDelta = Infinity
   for (const g of groups) {
-    if (g.timestampMs == null) continue;
-    const delta = Math.abs(g.timestampMs - storeTimeMs);
+    if (g.timestampMs == null) continue
+    const delta = Math.abs(g.timestampMs - storeTimeMs)
     if (delta < bestDelta) {
-      bestDelta = delta;
-      best = g;
+      bestDelta = delta
+      best = g
     }
   }
-  if (!best || bestDelta > toleranceMs) return null;
-  const counts = {};
-  for (const [t, arr] of Object.entries(best.types)) counts[t] = arr.length;
-  return { parentId: best.parentId, timestamp: best.timestampMs, deltaMs: bestDelta, counts, types: best.types };
+  if (!best || bestDelta > toleranceMs) return null
+  const counts = {}
+  for (const [t, arr] of Object.entries(best.types)) counts[t] = arr.length
+  return { parentId: best.parentId, timestamp: best.timestampMs, deltaMs: bestDelta, counts, types: best.types }
 }
 
 function summarize(deposit) {
-  if (!deposit) return null;
-  const label = { episode: 'episode', atomic_fact: 'fact', foresight: 'foresight', agent_case: 'case', agent_skill: 'skill' };
-  const parts = [];
-  for (const [t, n] of Object.entries(deposit.counts)) {
-    const name = label[t] || t;
-    parts.push(`${n} ${name}${n === 1 ? '' : 's'}`);
+  if (!deposit) return null
+  const label = {
+    episode: 'episode',
+    atomic_fact: 'fact',
+    foresight: 'foresight',
+    agent_case: 'case',
+    agent_skill: 'skill'
   }
-  return parts.join(' · ');
+  const parts = []
+  for (const [t, n] of Object.entries(deposit.counts)) {
+    const name = label[t] || t
+    parts.push(`${n} ${name}${n === 1 ? '' : 's'}`)
+  }
+  return parts.join(' · ')
 }
 
-module.exports = { resolveMemoryRoot, buildDepositIndex, resolveDeposit, summarize, parseEntries };
+module.exports = { resolveMemoryRoot, buildDepositIndex, resolveDeposit, summarize, parseEntries }

@@ -45,8 +45,7 @@ class AgentProfile(Generic[T]):
     default_skills: tuple[str, ...]
     allowed_tools: tuple[str, ...]
     max_tool_turns: int
-    max_tokens: int = 8192
-    temperature: float = 0.2
+    max_tokens: int = 16384
     tool_errors_are_fatal: bool = True
     tool_call_limits: tuple[tuple[str, int], ...] = ()
 

@@ -283,7 +283,9 @@ def test_stale_snapshots_are_pruned_keeping_referenced_and_newest(tmp_path, monk
         "1.0.0-f",
         "sources",
     ]
-    assert capsys.readouterr().out == f"Removed stale runtime code: {snapshots['c']}\n"
+    # Pruning a snapshot is bookkeeping: it goes to the log, not onto a screen
+    # the user is being asked a question on.
+    assert capsys.readouterr().out == ""
     monkeypatch.setattr(compute_code.shutil, "which", lambda _name: None)
     assert compute_code.prune_runtime_code(cache, snapshots["f"]) == []
     assert (cache / "1.0.0-a").is_dir() and (cache / "1.0.0-d").is_dir()
@@ -301,7 +303,9 @@ def test_prepared_code_prunes_stale_snapshots(tmp_path, installed_code, monkeypa
     monkeypatch.setattr(compute_code, "_referenced_snapshots", lambda: set())
     root = compute_code.prepare_runtime_code(cache)
     assert sorted(path.name for path in cache.iterdir()) == ["0.9.0-1", "0.9.0-2", root.name]
-    assert f"Removed stale runtime code: {stale[0]}\n" in capsys.readouterr().out
+    # What was pruned is in the log; what the screen gets is the one line that
+    # says the code is ready.
+    assert capsys.readouterr().out.startswith("Runtime code ready: ")
     assert compute_code.prepare_runtime_code(cache) == root
     assert (cache / "0.9.0-1").is_dir()
 

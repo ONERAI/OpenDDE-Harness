@@ -1,6 +1,7 @@
 #!/usr/bin/env node
-// Bundles src/entry.tsx into a single self-contained dist/entry.js.
-// No runtime node_modules needed.
+// Bundles src/entry.ts into a single self-contained dist/entry.js.
+// No runtime node_modules needed — the Python launcher runs it as
+// `node dist/entry.js` from an installed wheel.
 import { build } from 'esbuild'
 import { readFileSync, writeFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
@@ -8,57 +9,48 @@ import { dirname, resolve } from 'node:path'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const root = resolve(here, '..')
-const out = resolve(root, 'dist/entry.js')
+// Two self-contained bundles: the TUI, and the pi-ai model service the Python
+// side spawns (src/model-service/main.ts) — same build, same launch rule.
+const entries = [
+  ['src/entry.ts', 'dist/entry.js'],
+  ['src/model-service/main.ts', 'dist/model-service.js']
+]
 
-// `react-devtools-core` is only imported when DEV=true at runtime (Ink dev
-// mode). Stub it out so the bundle doesn't carry the dep.
-const stubDevtools = {
-  name: 'stub-react-devtools-core',
-  setup(b) {
-    b.onResolve({ filter: /^react-devtools-core$/ }, args => ({
-      path: args.path,
-      namespace: 'stub-devtools'
-    }))
-    b.onLoad({ filter: /.*/, namespace: 'stub-devtools' }, () => ({
-      contents: 'export default { initialize() {}, connectToDevTools() {} }',
-      loader: 'js'
-    }))
+// The compaction extension (`pi-codex-compact`) statically imports the pi
+// coding agent for its local text-summary fallback, the one part of it we do
+// not use. Left alone, that single import would pull the whole agent into the
+// bundle, so it resolves to a stub that throws if anything ever calls it.
+const alias = {
+  '@earendil-works/pi-coding-agent': resolve(root, 'src/model-service/pi-coding-agent-stub.ts')
+}
+
+for (const [source, target] of entries) {
+  const out = resolve(root, target)
+
+  await build({
+    entryPoints: [resolve(root, source)],
+    alias,
+    bundle: true,
+    platform: 'node',
+    format: 'esm',
+    target: 'node22',
+    outfile: out,
+    // Some transitive deps use CommonJS `require(...)` at runtime (pi-tui probes
+    // for optional native modifier helpers this way). ESM bundles don't get a
+    // `require` binding automatically, so inject one.
+    banner: {
+      js: "import { createRequire as __cr } from 'node:module'; const require = __cr(import.meta.url);"
+    },
+    logLevel: 'info'
+  })
+
+  // Nix's patchShebangs phase mangles `/usr/bin/env -S node --foo`; the launcher
+  // always invokes this file as `node dist/entry.js`, so a shebang is only a
+  // liability. Strip whatever esbuild carried over.
+  const body = readFileSync(out, 'utf8')
+  if (body.startsWith('#!')) {
+    writeFileSync(out, body.slice(body.indexOf('\n') + 1))
   }
+
+  console.log(`built ${out}`)
 }
-
-await build({
-  entryPoints: [resolve(root, 'src/entry.tsx')],
-  bundle: true,
-  platform: 'node',
-  format: 'esm',
-  target: 'node20',
-  outfile: out,
-  jsx: 'automatic',
-  jsxImportSource: 'react',
-  // React and the reconciler pick their dev/prod builds by this at runtime;
-  // without it the shipped TUI runs React's development build (2-3x slower frames).
-  define: { 'process.env.NODE_ENV': '"production"' },
-  // Skip the prebuilt @hermes/ink bundle — esbuild's __esm helper doesn't
-  // await nested async init, which breaks lazy-initialized exports like
-  // `render`. Bundling from source sidesteps that.
-  alias: { '@hermes/ink': resolve(root, 'packages/hermes-ink/src/entry-exports.ts') },
-  plugins: [stubDevtools],
-  // Some transitive deps use CommonJS `require(...)` at runtime. ESM bundles
-  // don't get a `require` binding automatically, so we inject one.
-  banner: {
-    js: "import { createRequire as __cr } from 'node:module'; const require = __cr(import.meta.url);"
-  },
-  logLevel: 'info'
-})
-
-// esbuild preserves the shebang from src/entry.tsx into the bundle, but Nix's
-// patchShebangs phase mangles `/usr/bin/env -S node --foo --bar` (it strips
-// the `node` token, leaving a broken interpreter). The hermes_cli launcher
-// always invokes this file as `node dist/entry.js` anyway, so the shebang is
-// redundant — strip it.
-const body = readFileSync(out, 'utf8')
-if (body.startsWith('#!')) {
-  writeFileSync(out, body.slice(body.indexOf('\n') + 1))
-}
-
-console.log(`built ${out}`)

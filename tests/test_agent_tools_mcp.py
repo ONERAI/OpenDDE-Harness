@@ -61,10 +61,13 @@ async def test_a_failing_transport_is_this_servers_error_and_the_next_still_conn
 
     registry = ToolRegistry()
     async with AsyncExitStack() as stack:
-        await mcp_tools.connect_mcp_servers(
+        registered = await mcp_tools.connect_mcp_servers(
             {"bad": _config("https://bad.example/mcp"), "good": _config("https://good.example/mcp")}, registry, stack
         )
 
+    # What the welcome panel reads: the server that connected and how many tools
+    # it offered. The one that failed is absent, not present with zero.
+    assert registered == {"good": 1}
     assert attempted == ["https://bad.example/mcp", "https://good.example/mcp"]
     assert any(d["function"]["name"].endswith("ping") for d in registry.get_definitions())
     assert asyncio.current_task().cancelling() == 0
@@ -81,11 +84,12 @@ async def test_an_unknown_transport_is_skipped_before_any_connection(monkeypatch
 
     monkeypatch.setattr(mcp_tools, "_mcp_server_connection", fake_connection)
 
-    await mcp_tools.connect_mcp_servers(
+    registered = await mcp_tools.connect_mcp_servers(
         {"svc": _config("https://x", transport="carrier-pigeon")}, ToolRegistry(), AsyncExitStack()
     )
 
     assert attempted is False
+    assert registered == {}
 
 
 async def test_a_transport_failing_after_the_handshake_never_cancels_the_agent_task(monkeypatch):
@@ -172,3 +176,78 @@ async def test_a_cancellation_during_close_is_honoured_after_the_reap(monkeypatc
 
     assert after_close == []
     assert not [t for t in asyncio.all_tasks() if t.get_name() == "mcp:slow"]
+
+
+async def test_the_tool_count_is_what_survives_the_disabled_tools_blacklist(monkeypatch):
+    """A server offering two tools with one blacklisted contributes one."""
+
+    @asynccontextmanager
+    async def fake_connection(name, cfg, transport_type, executor):
+        yield (
+            None,
+            SimpleNamespace(
+                tools=[
+                    SimpleNamespace(name=tool, description="", inputSchema={"type": "object", "properties": {}})
+                    for tool in ("a", "b")
+                ]
+            ),
+        )
+
+    monkeypatch.setattr(mcp_tools, "_mcp_server_connection", fake_connection)
+
+    registry = ToolRegistry()
+    offered = await mcp_tools.connect_mcp_servers({"svc": _config("https://x")}, registry, AsyncExitStack())
+
+    # What the server offered, which is what the connector can know.
+    assert offered == {"svc": 2}
+    assert mcp_tools.registered_tool_counts(registry, offered) == {"svc": 2}
+
+    # The agent applies its blacklist after connecting; the count follows.
+    registry.unregister("mcp_svc_b")
+    assert mcp_tools.registered_tool_counts(registry, offered) == {"svc": 1}
+
+    # A server whose every tool is disabled still connected, and says zero
+    # rather than disappearing into "never connected".
+    registry.unregister("mcp_svc_a")
+    assert mcp_tools.registered_tool_counts(registry, offered) == {"svc": 0}
+
+    # One server's count never counts another's tools, however similar the name.
+    assert mcp_tools.registered_tool_counts(registry, ["svc_extra", "other"]) == {"svc_extra": 0, "other": 0}
+
+
+async def test_overlapping_server_names_do_not_borrow_each_others_tools(monkeypatch):
+    """`a` and `a_b` both prefix-match `mcp_a_b_ping`, and underscores in tool
+    names make the ambiguity worse. Ownership is recorded on the wrapper, so
+    neither server can claim the other's tool."""
+    offered_tools = {"a": ["ping"], "a_b": ["ping", "deep_health_check"]}
+
+    @asynccontextmanager
+    async def fake_connection(name, cfg, transport_type, executor):
+        yield (
+            None,
+            SimpleNamespace(
+                tools=[
+                    SimpleNamespace(name=tool, description="", inputSchema={"type": "object", "properties": {}})
+                    for tool in offered_tools[name]
+                ]
+            ),
+        )
+
+    monkeypatch.setattr(mcp_tools, "_mcp_server_connection", fake_connection)
+
+    registry = ToolRegistry()
+    servers = {name: _config("https://x") for name in offered_tools}
+    offered = await mcp_tools.connect_mcp_servers(servers, registry, AsyncExitStack())
+
+    assert offered == {"a": 1, "a_b": 2}
+    # The registered names alone cannot tell these apart: `mcp_a_b_ping` starts
+    # with `mcp_a_`, and `mcp_a_b_deep_health_check` starts with `mcp_a_b_`.
+    assert set(registry.tool_names) == {"mcp_a_ping", "mcp_a_b_ping", "mcp_a_b_deep_health_check"}
+    assert mcp_tools.registered_tool_counts(registry, offered) == {"a": 1, "a_b": 2}
+
+    # The blacklist still applies to the server that actually owns the tool.
+    registry.unregister("mcp_a_b_deep_health_check")
+    assert mcp_tools.registered_tool_counts(registry, offered) == {"a": 1, "a_b": 1}
+
+    registry.unregister("mcp_a_ping")
+    assert mcp_tools.registered_tool_counts(registry, offered) == {"a": 0, "a_b": 1}

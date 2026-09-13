@@ -30,47 +30,36 @@ class _Base(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Feature 1 — Context Management (Curator)
+# Feature 1 — Context Management
 # ---------------------------------------------------------------------------
 
 
 class ContextConfig(_Base):
-    """Context engine selection and tuning."""
+    """Context engine tuning.
 
-    engine: str = "unified"
-    """Deprecated — there is now a single :class:`ContextAssembler`.
-
-    The historical ``"legacy"`` / ``"curator"`` / ``"default"`` split was
-    collapsed: every turn runs the Curator history lane + the long-term
-    memory recall / SkillForgeRouter lanes in one engine. The field is retained (as a
-    free string) so existing YAML setting ``engine: legacy`` etc. still
-    loads — the value is ignored by ``build_context_engine``.
+    Two settings: when a backend that compacts server-side should do so, and
+    how much of the head of a conversation is never dropped. History selection
+    itself is deterministic and has no knobs -- the policy is in
+    :mod:`opendde_harness.context_engine.history_trimmer`.
     """
 
-    # Curator history-lane knobs.
-    fast_path_threshold: float = 0.60
-    """Curator Fast Path cutoff. Below this % of budget → zero-LLM pass-through."""
+    server_compact_ratio: float = Field(default=0.8, ge=0.0, le=1.0, allow_inf_nan=False)
+    """On a provider that compacts server-side (the Codex login), compact the
+    session once a call's prompt reaches this share of the model's window; the
+    backend's own opaque summary then replaces the earlier history on that
+    model. 0 disables it.
 
-    curator_model: str = ""
-    """Model for the Curator agent loop (Slow Path). Empty follows the agent's
-    own model, which every configured provider can serve; a pin names one
-    the provider must be able to route to."""
-
-    curator_timeout_seconds: float = 60.0
-    """Max wall time for one Curator slow-path invocation before the
-    deterministic fallback takes over."""
-
-    relevance_decay: float = 0.95
-    """Per-turn decay factor for non-recent message relevance."""
-
-    relevance_reference_boost: float = 0.15
-    """Boost applied when assistant response references older message content."""
+    A share, so it is bounded at load: a negative one or a NaN compares false
+    against every prompt size and asked the backend to compact on every single
+    turn, and one above 1 (or an infinity) quietly made the trigger
+    unreachable. Both read as a working setting.
+    """
 
     protect_first_n: int = 3
-    """Number of head exchanges always preserved in context."""
+    """How many of the conversation's first user messages are never dropped.
 
-    archive_dir: str = "memory/.curator/archive"
-    """Relative path under workspace for lossless message archives."""
+    The user's own framing of the task, which every later turn is judged
+    against -- not the first few tool-heavy turns."""
 
 
 # ---------------------------------------------------------------------------
@@ -85,41 +74,6 @@ class ContextConfig(_Base):
 # scaffold dataclasses inside ``skill_forge/`` and stay at their
 # defaults for now. Owners will promote individual fields here when
 # they need user-facing knobs.
-
-
-class MemoryExtractionConfig(_Base):
-    """Long-term memory extraction pipeline configuration (``skillForge.memory``).
-
-    When enabled, every completed user→agent turn is funneled into the
-    memory service's pipeline that distills an AgentCase + zero-or-more
-    SkillOps from it.
-    """
-
-    enabled: bool = False
-    # Note: the per-turn tool-call gate (formerly min_tool_calls / min_messages
-    # here) is now sourced from skill_forge.detect_min_tool_calls so the same
-    # threshold drives any future auto-detect surface in addition to this
-    # pipeline.
-    # Number of similar existing skills shown to the skill_extractor
-    # LLM as candidates for ``update``. 5 is enough — overlap between
-    # turn-derived candidates above this rank is rare, and the prompt
-    # budget for supporting_cases scales with this number.
-    max_skills_top_k: int = 5
-    # Confidence floor: skills falling below this after a downward
-    # adjustment are soft-deleted on the spot.
-    retire_confidence: float = 0.1
-    # Skip the skill_extractor LLM call when ``case.quality_score`` is
-    # below this floor. Low-quality distillations tend to produce noisy
-    # / contradictory skills more often than reusable ones; the case is
-    # still persisted (useful for retrieval / audit).
-    min_quality_for_skill_extract: float = 0.2
-    # 3-tier value gate placed before case extraction (in _flush_segment).
-    # Only segments that pass at least one tier are extracted:
-    #   Tier 1 (fast-pass): has_user_feedback AND >=2 user messages in segment
-    #   Tier 2 (fast-pass): total tool_calls > complex_task_tool_call_threshold
-    #   Tier 3 (cheap LLM): detect_llm asked whether trajectory is worth
-    #                        learning from; false → skip, true → extract
-    complex_task_tool_call_threshold: int = 20
 
 
 class LocalDirConfig(_Base):
@@ -142,11 +96,10 @@ class LocalDirConfig(_Base):
 class SkillForgeConfig(_Base):
     """SkillForge configuration.
 
-    ``enabled=True`` (default, R8) activates the SkillForge retrieval/
-    injection pipeline. Set ``enabled=False`` to fall back to the
-    pre-refactor behavior of handing the full skill directory to the LLM
-    (component stubs that return empty lists also cause ``ContextBuilder``
-    to fall back to the full directory automatically).
+    Which skills the agent is told about, and where they are read from.
+    The choice itself takes no model call: a small catalogue is
+    advertised whole, a large one is narrowed by BM25 over the user's
+    message, and the agent loads a body with ``use_skill``.
 
     Evolution is handled by the long-term memory
     extraction pipeline, configured via
@@ -161,8 +114,9 @@ class SkillForgeConfig(_Base):
 
     # --- Master switch + location ---
     enabled: bool = True
-    """Master switch (R8: default True). Activates the SkillForge
-    retrieval/injection pipeline."""
+    """Master switch. ``False`` drops the ``# Skills`` block entirely: no
+    router is built, nothing is advertised, and configured ``local_dirs``
+    are not mounted. ``skillForge.router.enabled=False`` does the same."""
 
     blocklist: list[str] = Field(default_factory=list)
     """Skill names refused everywhere (config key ``skillForge.blocklist``):
@@ -189,47 +143,6 @@ class SkillForgeConfig(_Base):
     Paths deeper than this below a layer root are silently skipped.
     Prevents unbounded filesystem walks on huge mirrors."""
 
-    # --- Retrieval / reranker knobs ---
-    embedding_model: str = "default"
-    """Dense embedding model identifier used by the configured embedding
-    service. Configure it to match the model used by the active retrieval
-    source."""
-
-    embedding_url: str = "http://localhost:1357"
-    """Remote embedding service base URL.
-
-    Retrieval calls ``POST <embedding_url>/embed``. Override this with
-    ``REMOTE_EMBEDDING_URL`` or user config when using a hosted embedding
-    service."""
-
-    reranker_enabled: bool = True
-    """Run a reranker pass after dense retrieval. On by default — adds
-    200-500ms per query (cross-encoder GPU inference) but lifts mass-pool
-    precision noticeably. Disable when latency matters more than ranking."""
-
-    reranker_model: str = "default"
-    """Reranker model label used for configuration and observability."""
-
-    reranker_url: str = "http://localhost:1357"
-    """Remote reranker service base URL.
-
-    Reranking calls ``POST <reranker_url>/score`` with
-    ``{"prompts": [...]}`` and reads ``{"scores": [...]}``. Override this
-    with ``REMOTE_RERANKER_URL`` or user config when using a hosted reranker
-    service."""
-
-    embedding_api_key: str | None = None
-    """Optional bearer token for the configured embedding service."""
-
-    reranker_api_key: str | None = None
-    """Optional bearer token for the configured reranker service."""
-
-    embedding_dimensions: int | None = None
-    """Request specific embedding dimensions (for models that support it)."""
-
-    top_k: int = 5
-    """Number of skills returned by ``select()``."""
-
     # --- Dual-pool fusion weights (R6) ---
     local_pool_top_k: int = 10
     """Candidate count from the local BM25 pool per query."""
@@ -245,69 +158,14 @@ class SkillForgeConfig(_Base):
     """When reranker is enabled, mass pool fetches this many candidates
     for rescoring, then truncates to ``mass_pool_top_k`` before RRF."""
 
-    # --- Query rewrite knobs ---
-    rewrite_enabled: bool = True
-    """Enable a second retrieval path with LLM-rewritten queries."""
-
-    rewrite_max_tokens: int = 8192
-    """Output token budget for the rewriter LLM call. Defaults to 8192 to
-    leave headroom for Qwen3-style reasoning traces (~3-4k tokens) on top
-    of the actual rewrite output. The previous 1024 budget caused frequent
-    finish_reason=length truncations with empty visible content, which
-    surfaced as 'Failed to parse rewrite response as JSON' fallbacks."""
-
-    # --- Deprecated presentation knobs ---------------------------------
-    injection_mode: str = "catalog"
-    """Deprecated compatibility field; selected skills are always rendered
-    as a metadata-only catalog and loaded through ``use_skill``. Historical
-    ``full_body`` / ``summary`` values are accepted when reading older user
-    configs but no longer alter runtime behavior."""
-
-    inject_max: int = 2
-    """Deprecated compatibility field. ``llm_gate_max_select`` controls the
-    catalog size; no skill body is inlined."""
-
     disable_always: bool = False
-    """When True, ``get_always_skills()`` returns [] and select() filters
-    out always:true skills. R8 default: False (always skills inject)."""
+    """When True, ``get_always_skills()`` returns [] and the ``# Active
+    Skills`` block is empty. Default False (always-skills are listed)."""
 
     always_max: int = 5
     """Max always skills injected per turn (R3). Exceeding this truncates
     by local_dirs list order + alphabetical, with a WARN listing dropped
     skill names."""
-
-    # --- LLM gate selector (default-on, mirrors openspace select_skills_with_llm) ---
-    llm_gate_enabled: bool = True
-    """When ``True`` (default), ``select()`` resolves a pool of
-    ``llm_gate_pool_size`` candidates after RRF merge, then asks an LLM to
-    plan + filter down to ``llm_gate_max_select`` skills. Empty result is
-    valid ("inject nothing"). Costs one LLM call per ``select()`` invocation
-    but eliminates the ~30% noise-injection rate of pure-RRF top-K (Round D
-    obs.: irrelevant skills polluting the prompt). Disable to skip the
-    extra LLM call (rare; useful when LLM provider is unavailable)."""
-
-    llm_gate_max_select: int = 2
-    """Upper bound on skills advertised in the per-turn catalog."""
-
-    llm_gate_pool_size: int = 10
-    """Candidate pool size handed to the gate (after RRF). Aligned
-    with RRF output size (local_pool_top_k + mass_pool_top_k dedupe)."""
-
-    llm_gate_model: str | None = None
-    """Optional model override for gate calls. ``None`` → use the
-    provider's default chat model (typically the agent's main model)."""
-
-    llm_gate_temperature: float = 0.0
-    """Sampling temperature for gate calls. 0.0 for deterministic
-    filtering. Reasoning models may need 0.6 to engage <think>."""
-
-    llm_gate_max_tokens: int = 8192
-    """Output token budget for the gate LLM call. Defaults to 8192 to
-    leave headroom for Qwen3-style reasoning traces (~3-4k tokens) on top
-    of the gate's JSON answer. The previous 4096 budget caused empty
-    content (finish_reason=length) on the 27B model in ~50% of calls,
-    forcing a legacy top-N fallback that returned 5 skills instead of
-    the configured llm_gate_max_select."""
 
     # --- Evolver model ---
     evolve_model: str | None = None
@@ -353,13 +211,6 @@ class SkillForgeConfig(_Base):
     retirement_idle_days: int = 90
     """Active skill unused for this long → deprecated."""
 
-    # --- Long-term memory extraction pipeline ---
-    memory: MemoryExtractionConfig = Field(default_factory=MemoryExtractionConfig)
-    """Long-term memory extraction pipeline. Distinct from the
-    SkillForge master switch above: the retrieval/injection path can be
-    enabled (``skill_forge.enabled=True``) without extraction, and vice
-    versa."""
-
     # --- Validators ---
 
     @model_validator(mode="before")
@@ -402,9 +253,13 @@ class PluginsConfig(_Base):
 class MemoryConfig(_Base):
     """Which memory backend is active + per-track identity wiring.
 
-    ``backend`` is the name of an activated ``memory_backend``
-    contribution (set ``None`` to disable backend-driven memory and
-    operate purely on opendde-core's MemoryStore + MemoryConsolidator).
+    ``backend`` names the activated ``memory_backend`` contribution that owns
+    automatic durable extraction. Unset -- the default -- the owner is the host's
+    own markdown writer, which needs no service installed: it annotates each
+    completed turn into ``episodes.md`` and rewrites the ``user.md`` section
+    behind a tag that has heated up. Naming a backend here replaces that writer
+    rather than joining it; two writers on one profile is the state this setting
+    exists to prevent.
 
     The two id fields are bare, backend-native strings. The host passes
     ``user_id`` for the user-track recall and ``agent_id`` for the
@@ -418,10 +273,31 @@ class MemoryConfig(_Base):
     after which every stored memory is unrecallable with no warning.
     """
 
-    backend: str | None = "longterm"
-    """Activated backend contribution name. ``None`` disables the
-    plugin-driven memory path; AgentLoop continues with opendde-core's
-    MemoryStore alone."""
+    backend: str | None = None
+    """Who owns automatic durable extraction. Three kinds of value:
+
+    - unset (``None``), the default: the host's own writer
+      (``HostMarkdownBackend``). The turns a session completes are annotated into
+      ``episodes.md`` and the profile sections behind a hot tag are rewritten in
+      ``user.md``. Nothing to install.
+    - ``"off"``: no owner at all. Nothing is extracted, no model call is made for
+      memory, and neither file is written; ``user.md`` is still read into the
+      prompt exactly as whoever maintains it by hand left it.
+    - any other value: the name of an activated ``memory_backend`` contribution,
+      which replaces the host writer rather than joining it.
+
+    ``"off"`` is a written word and not the absence of one on purpose. A config
+    that says nothing about memory is a config whose author never chose, and that
+    one gets the default owner."""
+
+    foresight: bool = False
+    """Ask the annotator for predictions as well as episodes, and keep them in
+    ``user.md``'s ``## Foresight`` section.
+
+    Off by default, and deliberately: with it off the annotation tool has one
+    slot and the model is not asked to guess at all, which is both cheaper and
+    the only version of this whose output is checkable against what was said.
+    Only the host writer reads it; a plugin backend has its own policy."""
 
     user_id: str = "default"
     """Bare user identity passed as ``backend.recall(user_id=...)`` for
@@ -446,7 +322,9 @@ class SkillForgeRouterConfig(_Base):
 
     enabled: bool = True
     """Master switch. ``False`` makes the host bypass SkillForgeRouter
-    entirely (used by tests / restricted deployments)."""
+    entirely, which leaves the ``# Skills`` block out of the prompt (used
+    by tests / restricted deployments). Same effect as
+    ``skillForge.enabled=False``."""
 
     weights: dict[str, float] = Field(
         default_factory=lambda: {
@@ -470,17 +348,14 @@ class SkillForgeRouterConfig(_Base):
     identity dominate."""
 
     over_fetch_factor: int = 2
-    """Each source is asked for ``top_k * factor`` hits before fusion
-    narrows back to ``top_k``. Larger factors give better cross-source
-    coverage at the cost of per-source query work."""
+    """Each source is asked for ``k * factor`` hits before fusion narrows back
+    to ``k`` (the segment's own constant). Larger factors give better
+    cross-source coverage at the cost of per-source query work."""
 
     dedup_by: Literal["name", "qualified_id"] = "name"
     """Cross-source dedup key for the RRF fusion. ``"name"`` collapses
     a same-named skill across sources into one slot; ``"qualified_id"``
     keeps them as separate entries (useful for telemetry experiments)."""
-
-    top_k: int = 5
-    """Final top-K returned from ``SkillForgeRouter.select``."""
 
 
 # Resolve the forward-ref ``SkillForgeConfig.router: "SkillForgeRouterConfig"``

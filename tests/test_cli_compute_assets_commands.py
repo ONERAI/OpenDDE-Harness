@@ -105,7 +105,7 @@ def test_local_preparation_uses_both_roots(tmp_path, monkeypatch):
     weights, data = tmp_path / "harness", tmp_path / "opendde"
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path / "home"))
 
-    def download(destination_root, asset):
+    def download(destination_root, asset, *, bar=None):
         path = destination_root / asset.relative_path
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"fixture")
@@ -145,7 +145,7 @@ def test_shared_models_are_copied_from_the_opendde_data_root(tmp_path, monkeypat
     previous.parent.mkdir(parents=True)
     previous.write_bytes(data)
 
-    def download(destination_root, asset):
+    def download(destination_root, asset, *, bar=None):
         path = destination_root / asset.relative_path
         assert path.is_file(), "the existing copy must be reused before any download"
         return path
@@ -386,7 +386,7 @@ def test_shared_only_preparation_uses_requested_root(tmp_path, monkeypatch):
     unrelated = tmp_path / "other-cache"
     monkeypatch.setenv("OPENDDE_ROOT_DIR", str(unrelated))
 
-    def download(destination_root, asset):
+    def download(destination_root, asset, *, bar=None):
         path = destination_root / asset.relative_path
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"verified model fixture")
@@ -442,3 +442,41 @@ def test_the_default_checkpoint_is_the_antibody_one():
     assert DEFAULT_CHECKPOINT == "opendde_abag.pt"
     assert set(compute_assets.CHECKPOINTS) == {"opendde.pt", "opendde_abag.pt"}
     assert compute_assets.asset_plan(DEFAULT_CHECKPOINT)[0].relative_path == "checkpoint/opendde_abag.pt"
+
+
+def test_the_assets_module_loads_under_the_container_runtime():
+    """The compute container runs this module from /workspace against its own
+    runtime, which ships rich and httpx but neither loguru nor portalocker; its
+    API imports ``model_environment`` from here at startup. A top-level import
+    of something that runtime lacks stops the container as it starts -- and the
+    container removes itself, so all that reaches the user is a refused
+    connection.
+
+    Checked in a subprocess: hiding a module from this one would leave the
+    import machinery holding a second copy of everything under test.
+    """
+    import subprocess
+    import sys
+
+    script = """
+import sys
+
+class Absent:
+    def find_spec(self, name, path=None, target=None):
+        if name.split(".")[0] in {"loguru", "portalocker"}:
+            raise ModuleNotFoundError(f"No module named {name!r}")
+        return None
+
+sys.meta_path.insert(0, Absent())
+from opendde_harness.cli.compute_assets import model_environment
+print(callable(model_environment))
+"""
+    finished = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        cwd=str(Path(__file__).resolve().parents[1]),
+    )
+
+    assert finished.returncode == 0, finished.stderr
+    assert finished.stdout.strip() == "True"

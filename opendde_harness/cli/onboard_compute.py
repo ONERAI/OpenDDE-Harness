@@ -600,7 +600,7 @@ def create_arguments(
     args = [
         "run",
         "--detach",
-        "--rm",
+        *removal_flags(),
         "--pull=never",
         "--name",
         name,
@@ -738,6 +738,22 @@ def _reclaim_name(container: dict[str, Any], token: str) -> int | None:
     return int(port)
 
 
+#: Set it to anything non-blank and a started container stays after it exits,
+#: so ``docker logs`` can still answer why.
+KEEP_ENV = "OPENDDE_HARNESS_COMPUTE_KEEP"
+
+
+def removal_flags() -> list[str]:
+    """``--rm``, unless the environment asks for the container to be kept.
+
+    The container is ephemeral and removes itself, which also removes its logs
+    -- and a container that exits as it starts then leaves nothing to read.
+    :data:`KEEP_ENV` holds it, which is the first thing to reach for when the
+    readiness check cannot connect.
+    """
+    return [] if os.environ.get(KEEP_ENV, "").strip() else ["--rm"]
+
+
 def start_service(
     settings: DockerSettings, token: str, api_url: str = "", *, code_id: str | None = None, quiet: bool = False
 ) -> dict[str, Any]:
@@ -769,8 +785,28 @@ def start_service(
         docker(*args, env=env)
     state = local_service.new_state(container=name, image=settings.image, code_id=code_id, port=port)
     local_service.write_state(state)
-    wait_for_service(state["url"], token, settings.mode, api_url)
+    try:
+        wait_for_service(state["url"], token, settings.mode, api_url)
+    except ComputeSetupError as exc:
+        raise _readiness_failure(exc, name) from exc
     return state
+
+
+def _readiness_failure(exc: "ComputeSetupError", name: str) -> "ComputeSetupError":
+    """The readiness error, told in terms of what became of the container.
+
+    A container that exits on startup takes its logs with it (it removes
+    itself), and the bare "connection refused" that is left says nothing about
+    why. Whether the container is still there is the one fact that separates
+    "it never came up" from "it is up and not answering yet", so it is the fact
+    the message carries -- with the way to keep the next one for its logs.
+    """
+    if inspect_container(name) is not None:
+        return exc
+    return ComputeSetupError(
+        f"{exc} The container exited as it started and removed itself, so it left no logs. "
+        f"Set {KEEP_ENV}=1 and start it again to keep it, then read `docker logs {name}`."
+    )
 
 
 OPTIONAL_EXTERNAL_SERVICES = {

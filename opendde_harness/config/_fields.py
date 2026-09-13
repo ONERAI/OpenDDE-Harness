@@ -56,26 +56,16 @@ def annotation_str(ann: Any) -> str:
 _SECRET_EXACT = {"token", "secret", "password", "api_key"}
 _SECRET_SUFFIXES = ("_token", "_secret", "_key", "_password")
 
-# Names that should be redacted but neither match _SECRET_EXACT nor end in a
-# secret suffix. Today this only covers Gemini's ``api_key_list`` (suffix is
-# ``_list``, not ``_key``). Delete entries here as schema.py grows the
-# ``json_schema_extra={"secret": True}`` marker on the underlying fields.
-_KNOWN_SECRET_FIELDS: set[str] = {"api_key_list"}
-
 
 def is_secret_field(field_name: str, field_info: Any) -> bool:
     """Detect secret fields, in priority order:
 
     1. Explicit: ``field_info.json_schema_extra.get('secret') is True``
-    2. Patch set: ``_KNOWN_SECRET_FIELDS`` (workaround for fields the
-       suffix heuristic misses, e.g. Gemini's ``api_key_list``).
-    3. Exact match (``token`` / ``secret`` / ``password`` / ``api_key``).
-    4. Suffix match (``_token`` / ``_secret`` / ``_key`` / ``_password``).
+    2. Exact match (``token`` / ``secret`` / ``password`` / ``api_key``).
+    3. Suffix match (``_token`` / ``_secret`` / ``_key`` / ``_password``).
     """
     extra = getattr(field_info, "json_schema_extra", None)
     if isinstance(extra, dict) and extra.get("secret") is True:
-        return True
-    if field_name in _KNOWN_SECRET_FIELDS:
         return True
     if field_name in _SECRET_EXACT:
         return True

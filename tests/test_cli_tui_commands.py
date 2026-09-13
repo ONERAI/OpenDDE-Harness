@@ -3,13 +3,15 @@ import json
 import pytest
 from typer.testing import CliRunner
 
+from opendde_harness import node_runtime as node_paths
 from opendde_harness.cli import onboard_commands, tui_commands
+from tests._config import config_dict, keyed
 
 NOT_CONFIGURED = "OpenDDE Harness is not configured. Run `ddeharness onboard`."
-MINIMAL_CONFIG = {
-    "agents": {"defaults": {"model": "openai/gpt-4o-mini"}},
-    "providers": {"openai": {"apiKey": "sk-test"}},
-}
+#: The least a config can hold and still launch: one provider with a key, and a
+#: default model whose prefix names that provider. Built by the one helper that
+#: knows the shape, so a change to it reaches this suite without an edit here.
+MINIMAL_CONFIG = config_dict(keyed("openai", key="sk-test"), model="openai/gpt-4o-mini")
 
 
 @pytest.fixture
@@ -28,8 +30,8 @@ def write_config(home, payload):
 @pytest.fixture
 def launch(monkeypatch):
     calls = []
-    monkeypatch.setattr(tui_commands, "find_node", lambda: ("node", (22, 0, 0)))
-    monkeypatch.setattr(tui_commands, "resolve_dist_entry", lambda: tui_commands._PACKAGED_DIST_ENTRY)
+    monkeypatch.setattr(tui_commands, "find_node", lambda: ("node", (22, 19, 0)))
+    monkeypatch.setattr(tui_commands, "resolve_dist", lambda name: node_paths.packaged_dist_dir() / name)
     monkeypatch.setattr(tui_commands, "run_subprocess_with_rpc", lambda *args, **kwargs: calls.append(args) or 0)
     monkeypatch.setattr("opendde_harness.cli.update_notice.maybe_refresh_async", lambda: None)
     return calls
@@ -84,13 +86,9 @@ def test_configured_install_skips_the_wizard(home, launch, monkeypatch):
 
 
 def test_unusable_default_model_hints_and_launches(home, launch, monkeypatch, capsys):
-    write_config(
-        home,
-        {
-            "agents": {"defaults": {"model": "anthropic/claude-sonnet-5"}},
-            "providers": {"openai": {"apiKey": "sk-test"}},
-        },
-    )
+    # A key for one provider and a default model another one serves: the id's
+    # prefix is what routes it, and nothing configured answers to that prefix.
+    write_config(home, config_dict(keyed("openai", key="sk-test"), model="anthropic/claude-sonnet-5"))
     monkeypatch.setattr(tui_commands, "_stdout_isatty", lambda: True)
     monkeypatch.setattr(onboard_commands, "run_wizard", lambda **kwargs: pytest.fail("wizard must not run"))
     result = CliRunner().invoke(tui_commands.tui_app, [])
@@ -101,8 +99,8 @@ def test_unusable_default_model_hints_and_launches(home, launch, monkeypatch, ca
 
 def test_check_smoke_path_needs_no_config(home, monkeypatch):
     calls = []
-    monkeypatch.setattr(tui_commands, "find_node", lambda: ("node", (22, 0, 0)))
-    monkeypatch.setattr(tui_commands, "resolve_dist_entry", lambda: tui_commands._PACKAGED_DIST_ENTRY)
+    monkeypatch.setattr(tui_commands, "find_node", lambda: ("node", (22, 19, 0)))
+    monkeypatch.setattr(tui_commands, "resolve_dist", lambda name: node_paths.packaged_dist_dir() / name)
     monkeypatch.setattr(tui_commands, "run_subprocess", lambda *args, **kwargs: calls.append(args) or 0)
     monkeypatch.setattr("opendde_harness.cli.update_notice.maybe_refresh_async", lambda: None)
     monkeypatch.setattr(onboard_commands, "run_wizard", lambda **kwargs: pytest.fail("wizard must not run"))

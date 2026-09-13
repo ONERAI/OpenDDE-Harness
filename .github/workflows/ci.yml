@@ -15,8 +15,12 @@ permissions:
 
 jobs:
   pre-commit:
-    name: pre-commit diff
-    runs-on: ubuntu-latest
+    name: pre-commit diff (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
@@ -60,8 +64,12 @@ jobs:
           fi
 
   lint-python:
-    name: python lint
-    runs-on: ubuntu-latest
+    name: python lint (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
@@ -86,8 +94,12 @@ jobs:
         run: make lint-python
 
   pytest:
-    name: python tests
-    runs-on: ubuntu-latest
+    name: python tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
@@ -112,8 +124,12 @@ jobs:
         run: uv run pytest -q
 
   client-smoke:
-    name: client startup
-    runs-on: ubuntu-latest
+    name: client startup (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
@@ -132,8 +148,12 @@ jobs:
           uv run ddeharness compute prepare --help
 
   tui:
-    name: TUI checks
-    runs-on: ubuntu-latest
+    name: TUI checks (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7

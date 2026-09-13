@@ -47,5 +47,5 @@ ci: lint test build
 
 clean:
 	rm -rf .pytest_cache .ruff_cache .uv-cache .mypy_cache htmlcov dist build
-	rm -rf ui-tui/dist ui-tui/coverage ui-tui/.vitest-cache ui-tui/packages/hermes-ink/dist
+	rm -rf ui-tui/dist ui-tui/coverage ui-tui/.vitest-cache
 	find . -type d -name __pycache__ -prune -exec rm -rf {} +

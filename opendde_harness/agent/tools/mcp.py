@@ -1,6 +1,7 @@
 """MCP client: connects to MCP servers and wraps their tools as native OpenDDE Harness tools."""
 
 import asyncio
+from collections.abc import Iterable
 from contextlib import AsyncExitStack, asynccontextmanager
 from typing import TYPE_CHECKING, Any
 
@@ -127,9 +128,16 @@ async def _mcp_transport(name: str, cfg, transport_type: str, executor: "Sandbox
 class MCPToolWrapper(Tool):
     """Wraps a single MCP server tool as an OpenDDE Harness Tool."""
 
+    # An MCP server declares a name and a schema, not whether calling it changes
+    # anything. Treated as if it does: the cost of journaling a read is one
+    # line, and the cost of not journaling a write is a job nobody can account
+    # for. A wrapper that learns the answer can override this.
+    external_effects = True
+
     def __init__(self, session, server_name: str, tool_def, tool_timeout: int = 30):
         self._session = session
         self._original_name = tool_def.name
+        self._server_name = server_name
         self._name = f"mcp_{server_name}_{tool_def.name}"
         self._description = tool_def.description or tool_def.name
         self._parameters = tool_def.inputSchema or {"type": "object", "properties": {}}
@@ -138,6 +146,18 @@ class MCPToolWrapper(Tool):
     @property
     def name(self) -> str:
         return self._name
+
+    @property
+    def server_name(self) -> str:
+        """Which configured MCP server this tool came from.
+
+        Recorded, not inferred. The registered name is
+        ``mcp_<server>_<tool>``, and reading ownership back out of that string
+        is ambiguous the moment one server's name is another's plus an
+        underscore: servers ``a`` and ``a_b`` both prefix-match
+        ``mcp_a_b_ping``.
+        """
+        return self._server_name
 
     @property
     def description(self) -> str:
@@ -183,13 +203,42 @@ class MCPToolWrapper(Tool):
         return text or "(no output)"
 
 
+def registered_tool_counts(registry: ToolRegistry, servers: Iterable[str]) -> dict[str, int]:
+    """How many tools each named server actually contributes to the registry.
+
+    Counted from the registry rather than from what the server offered, because
+    the configured ``disabled_tools`` blacklist runs after the connection and
+    unregisters whatever it names. A server whose every tool is disabled stays
+    in the mapping with zero: it connected, and that is a different fact from
+    never having connected.
+    """
+    counts = {server: 0 for server in servers}
+
+    for name in registry.tool_names:
+        tool = registry.get(name)
+
+        if isinstance(tool, MCPToolWrapper) and tool.server_name in counts:
+            counts[tool.server_name] += 1
+
+    return counts
+
+
 async def connect_mcp_servers(
     mcp_servers: dict,
     registry: ToolRegistry,
     stack: AsyncExitStack,
     executor: "SandboxExecutor | None" = None,
-) -> None:
-    """Connect to configured MCP servers and register their tools."""
+) -> dict[str, int]:
+    """Connect to configured MCP servers and register their tools.
+
+    Returns the servers that connected, mapped to how many tools each one
+    offered. A server that was skipped or failed to connect is absent from the
+    mapping rather than present with zero: those are different facts, and the
+    welcome panel reports them differently. The counts are what was offered;
+    :func:`registered_tool_counts` is what survived the blacklist, and the
+    caller re-counts with it once the blacklist has run.
+    """
+    registered: dict[str, int] = {}
     for name, cfg in mcp_servers.items():
         # Resolve transport type BEFORE the try/except so the sandbox guard below
         # can raise without being swallowed by the per-server error handler.
@@ -234,8 +283,11 @@ async def connect_mcp_servers(
                 registry.register(wrapper)
                 logger.debug("MCP: registered tool '{}' from server '{}'", wrapper.name, name)
 
+            registered[name] = len(tools.tools)
             logger.info("MCP server '{}': connected, {} tools registered", name, len(tools.tools))
         except (Exception, BaseExceptionGroup) as e:
             # BaseExceptionGroup is raised by anyio task groups (e.g. streamableHttp cancel
             # scope failures) and is not a subclass of Exception in Python 3.11+.
             logger.error("MCP server '{}': failed to connect: {}", name, e)
+
+    return registered

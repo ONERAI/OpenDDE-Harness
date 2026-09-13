@@ -1,0 +1,10 @@
+{"_type": "metadata", "key": "cli:legacy", "created_at": "2026-09-01T10:00:00", "updated_at": "2026-09-01T10:04:00", "metadata": {"title": "a session from before the switch"}, "last_consolidated": 0, "generation": 0}
+{"role": "system", "content": "You are terse.", "timestamp": "2026-09-01T10:00:00", "id": "r0"}
+{"role": "user", "content": "read a.txt", "timestamp": "2026-09-01T10:00:01", "id": "r1", "turn_id": "t1"}
+{"role": "assistant", "content": "reading", "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "read", "arguments": "{\"path\": \"a.txt\"}"}}], "reasoning_content": "the file first", "timestamp": "2026-09-01T10:00:02", "id": "r2", "turn_id": "t1"}
+{"_type": "lifecycle", "kind": "tool.started", "id": "l1", "timestamp": "2026-09-01T10:00:02", "turn_id": "t1", "call_id": "call_1", "name": "read"}
+{"role": "tool", "tool_call_id": "call_1", "content": "the file body", "timestamp": "2026-09-01T10:00:03", "id": "r3", "turn_id": "t1"}
+{"role": "assistant", "content": "it says hello", "pi": {"role": "assistant", "content": [{"type": "thinking", "thinking": "signed", "thinkingSignature": "sig-1"}, {"type": "text", "text": "it says hello"}], "api": "openai-responses", "provider": "openai", "model": "gpt-5", "responseId": "resp_1", "stopReason": "stop", "timestamp": 1757000000000}, "timestamp": "2026-09-01T10:00:04", "id": "r4", "turn_id": "t1"}
+{"role": "user", "content": [{"type": "text", "text": "and this picture?"}, {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=="}}], "timestamp": "2026-09-01T10:01:00", "id": "r5", "turn_id": "t2"}
+{"role": "assistant", "content": "[Earlier conversation compacted by the model's own backend; replayed on this model.]", "compaction": {"provider": "openai-codex", "model": "openai-codex/gpt-5", "items": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "the user's own recent words"}]}]}, "timestamp": "2026-09-01T10:02:00", "id": "r6"}
+{"_type": "lifecycle", "kind": "turn.completed", "id": "l2", "timestamp": "2026-09-01T10:04:00", "turn_id": "t1", "generation": 0, "status": "completed"}

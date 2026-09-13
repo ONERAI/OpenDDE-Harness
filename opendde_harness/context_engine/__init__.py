@@ -2,30 +2,36 @@
 
 One engine — :class:`ContextAssembler` — assembled by
 :func:`build_context_engine` from a flat list of :class:`SegmentBuilder`
-(seg1–5 + the Curator). The historical ``legacy`` / ``curator`` /
-``default`` split has been collapsed.
+plus one deterministic history selector (:class:`HistoryTrimmer`).
 """
 
 from opendde_harness.context_engine.assembler import ContextAssembler
 from opendde_harness.context_engine.base import (
     AssembledPrefix,
     AssemblyContext,
-    ContextEngine,
     Segment,
     SegmentBuilder,
+    TurnContext,
 )
-from opendde_harness.context_engine.curator import TurnContext
 from opendde_harness.context_engine.factory import build_context_engine
-from opendde_harness.context_engine.history_trimmer import HistoryTrimmer
+from opendde_harness.context_engine.history_trimmer import (
+    ContextBudgetError,
+    HistoryTrimmer,
+    SelectionOutcome,
+)
+from opendde_harness.context_engine.types import AssembledContext, TokenBudget
 
 __all__ = [
+    "AssembledContext",
     "AssembledPrefix",
     "AssemblyContext",
     "ContextAssembler",
-    "ContextEngine",
+    "ContextBudgetError",
     "HistoryTrimmer",
     "Segment",
     "SegmentBuilder",
+    "SelectionOutcome",
+    "TokenBudget",
     "TurnContext",
     "build_context_engine",
 ]

@@ -1,4 +1,9 @@
-import { pick } from '../lib/text.js'
+// What the editor shows before anything is typed: the questions this product
+// is for, so an empty prompt still says what it is good at. One is drawn per
+// session rather than per keystroke — a placeholder that changes while you look
+// at it is noise, not flavour.
+
+import { pick } from './pick.js'
 
 export const PLACEHOLDERS = [
   'Design a VHH against human CRLF2 and keep the framework fixed',
@@ -33,4 +38,7 @@ export const PLACEHOLDERS = [
   'Show me the tools and skills available here'
 ]
 
-export const PLACEHOLDER = pick(PLACEHOLDERS)
+/** One placeholder, drawn when a session opens. */
+export function pickPlaceholder(random?: () => number): string {
+  return pick(PLACEHOLDERS, random)
+}

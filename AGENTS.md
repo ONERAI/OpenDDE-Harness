@@ -17,7 +17,7 @@ This file applies to the whole repository unless a deeper `AGENTS.md` overrides 
 - `opendde_harness/plugin/protein_design/`: antibody design workflows and compute backends.
 - `opendde_harness/providers/`, `session/`, `sandbox/`, `security/`: model providers, sessions, and execution boundaries.
 - `opendde_harness/tui_rpc/`, `tracing/`: TUI communication and tracing dashboard.
-- `ui-tui/`: TypeScript/React terminal UI.
+- `ui-tui/`: TypeScript terminal UI, built on pi-tui.
 - `tests/`: Python tests; `tests/integration/` requires real resources.
 - `docs/`, `docker/`: user guides, design examples, and compute image definitions.
 

@@ -40,7 +40,7 @@ class UnderstandMediaTool(Tool):
             "(docx/xlsx/pptx), and http(s) URLs (fetched and parsed by "
             "content type). Pass the file path(s) shown in the "
             "'[Attachment: ...]' or '[Image: ...]' notes of the user message, "
-            "and/or http(s) URLs. For an image prefer read_file, which hands you the picture "
+            "and/or http(s) URLs. For an image prefer the read tool, which hands you the picture "
             "itself; reach for this tool on an image only when you cannot see "
             "images or when a scan needs OCR — it returns another model's "
             "transcription, not the original. Video is not supported."
@@ -109,37 +109,31 @@ def _multimodal_available() -> bool:
 def make_understand_media_tool(ctx: Any) -> Tool | None:
     """Plugin tool-factory entry point (manifest ``contributes.tools``).
 
-    Stateless — the tool reads its config (model/endpoint) from the memory
-    library's own multimodal settings at call time, so ``ctx`` is accepted
-    for signature symmetry but not used.
+    Stateless -- the parser resolves its model at call time (the conversation's
+    default, through the model service), so ``ctx`` is accepted for signature
+    symmetry but not used.
 
     Returns ``None`` when the optional multimodal parser extra isn't
     installed, so the host declines to register a tool that could never
     succeed. The LLM then never sees ``understand_media`` in environments
     without the extra, rather than discovering it's unavailable only after
-    spending a tool call on it. Runtime LLM config (the library's multimodal
-    settings) is intentionally *not* gated here — that's a deploy-time
-    setting handled by the tool's call-time graceful failure; only the
-    static "is the parser installed" fact decides registration.
+    spending a tool call on it. Whether the conversation model can read the
+    attachment is a call-time answer, reported by the tool.
     """
     del ctx
-    # Point the library at opendde's memory home before any library import
-    # resolves settings (the multimodal parser/LLM read them at call time).
-    from opendde_harness.config.update_memory import (
-        configure_memory_env,
-        ensure_memory_home,
-        memory_owned,
-        memory_root,
-    )
+    # Point the library at the memory home before any library import resolves
+    # settings (the parser reads them at call time), and at this plugin's own
+    # model client: the parser runs in this process, and the model it parses
+    # with is the conversation's, through the model service -- the same client
+    # the memory server is started with.
+    from opendde_harness.plugin.memory.longterm._library import patch_llm_client
+    from opendde_harness.plugin.memory.longterm._service_llm import ModelServiceLLMClient
+    from opendde_harness.plugin.memory.longterm.settings import configure_memory_env, ensure_memory_home, memory_root
 
     root = memory_root()
     configure_memory_env(root)
-    # Templates only into a root opendde owns. Multimodal parsing reads the same
-    # memory config the memory does -- one machine, one user, one set of keys --
-    # but reusing a root the user manages must not write to it, and "the files
-    # are usually already there" is not a basis for that promise.
-    if memory_owned():
-        ensure_memory_home(root)
+    ensure_memory_home(root)
+    patch_llm_client(ModelServiceLLMClient)
     if not _multimodal_available():
         return None
     return UnderstandMediaTool()

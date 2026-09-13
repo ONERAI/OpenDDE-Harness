@@ -12,11 +12,11 @@ goes through :func:`make_backend` -> ``LongTermMemoryBackend(ctx)`` ->
 Three architectural invariants worth re-stating:
 
 1. **No compaction.** ``backend.store`` writes to the memory server's index and
-   returns. opendde core's ``MemoryConsolidator.maybe_consolidate`` is
-   a separate post-turn step the host owns.
-2. **No ``long_term`` property.** opendde core's :class:`MemoryStore`
-   stays where it is; Sentinel / Personalizer / ContextBuilder import
-   it directly. The backend is unaware of MEMORY.md.
+   returns. Fitting a session to the model's window is the context engine's
+   job, and a separate one.
+2. **No ``long_term`` property.** opendde core's :class:`MemoryStore` stays
+   where it is: the hand-maintained ``user.md`` the prompt reads. The backend
+   is unaware of it.
 3. **recall names the track explicitly.** The server takes
    ``owner_type: Literal["user", "agent"]`` explicitly; the host passes
    ``user_id`` XOR ``agent_id`` and the backend forwards the set field
@@ -30,6 +30,7 @@ import asyncio
 import logging
 import re
 import time
+from datetime import datetime
 from enum import Enum
 from types import SimpleNamespace
 from typing import Any, Literal, Protocol
@@ -40,6 +41,7 @@ from opendde_harness.memory_engine import Memory
 from opendde_harness.plugin import PluginContext
 from opendde_harness.plugin.memory.longterm._library import EXECUTABLE
 from opendde_harness.plugin.memory.longterm._server import DEFAULT_MEMORY_BASE_URL
+from opendde_harness.providers import messages as msg
 
 logger = logging.getLogger("opendde_harness.plugin.memory.longterm")
 
@@ -154,7 +156,6 @@ class ServiceState(Enum):
     UNRESPONSIVE = "unresponsive"
     UNCONFIGURED = "unconfigured"
     NO_BINARY = "no_binary"
-    FOREIGN = "foreign"
 
 
 # Probing cannot change these: they are facts about the install, not the
@@ -164,7 +165,7 @@ _TERMINAL_STATES = frozenset({ServiceState.UNCONFIGURED, ServiceState.NO_BINARY}
 
 # Only the opening state may spawn. Every other non-ready state has already
 # either spawned once (STARTING / FAILED), found the data occupied
-# (UNRESPONSIVE), been told not to (FOREIGN), or knows a spawn cannot succeed.
+# (UNRESPONSIVE), or knows a spawn cannot succeed.
 _SPAWNABLE_STATES = frozenset({ServiceState.UNKNOWN})
 
 # Minimum gap between out-of-band probes. Coarse on purpose: this exists to
@@ -211,7 +212,6 @@ class _HttpMemoryAdapter:
         self._client = client or httpx.AsyncClient(
             timeout=httpx.Timeout(timeout_s),
         )
-        self._caps: dict[str, bool] | None = None
 
     async def aclose(self) -> None:
         """Close the underlying client if we own it. Idempotent."""
@@ -223,64 +223,16 @@ class _HttpMemoryAdapter:
             return {"Authorization": f"Bearer {self._api_key}"}
         return {}
 
-    async def _capabilities(self) -> dict[str, bool]:
-        """What the server built, from ``/health``, cached for this adapter.
+    @staticmethod
+    def _search_tuning() -> dict[str, Any]:
+        """Search parameters for a server with no embedding.
 
-        The server reports ``capabilities`` as of 1.2.1. An empty mapping means the
-        question could not be answered -- the server is unreachable, or predates
-        the field -- and every caller must then leave the request alone: a
-        ``SearchRequest`` forbids extra keys, so guessing turns a working request
-        into a validation error.
-
-        Cached because the library documents a tier change as requiring a server
-        restart, and the adapter does not outlive one.
+        This plugin configures no embedding or rerank role, so the server's
+        default HYBRID would be refused (its ``needs_embedding`` covers vector,
+        hybrid and agentic) and recall would return nothing. KEYWORD searches
+        the same rows lexically, on both tracks, and needs neither.
         """
-        if self._caps is None:
-            self._caps = await self._probe_capabilities()
-        return self._caps
-
-    async def _probe_capabilities(self) -> dict[str, bool]:
-        from opendde_harness.plugin.memory.longterm._health import HEALTH_TIMEOUT_S, parse_capabilities
-
-        try:
-            # Same headers as every other call on this client: the server ships no
-            # auth today, but a deployment behind a proxy that adds it would read
-            # an unauthenticated probe as a server with no capabilities.
-            r = await self._client.get(
-                f"{self._base_url}/health",
-                headers=self._headers(),
-                timeout=HEALTH_TIMEOUT_S,
-            )
-            r.raise_for_status()
-            payload = r.json()
-        except Exception as exc:
-            logger.warning("memory health probe failed (%s); leaving search parameters untouched", exc)
-            return {}
-        return parse_capabilities(payload)
-
-    async def _search_tuning(self, *, agent_id: str | None) -> dict[str, Any]:
-        """Search parameters this server's capabilities call for.
-
-        Two degradations, and the first rules out the second:
-
-        - **No embedding.** The default HYBRID is refused outright (the server's
-          ``needs_embedding`` covers vector, hybrid and agentic), so recall would
-          return nothing at all. KEYWORD needs neither embedding nor rerank and
-          still searches the same rows, just lexically -- worse recall, but
-          recall. This is what makes the embedding role genuinely optional.
-        - **No rerank, agent track, HYBRID.** Agent-track HYBRID requires either
-          a cross-encoder or an LLM rerank.  The LLM lane is too slow for the
-          synchronous design loop (and previously exceeded its recall budget on
-          every cycle), so use direct VECTOR recall instead.  This preserves
-          semantic matching while avoiding an extra LLM request.  Moot under
-          KEYWORD, whose agent path does not go through rerank at all.
-        """
-        caps = await self._capabilities()
-        if caps.get("embed") is False:
-            return {"method": "keyword"}
-        if agent_id is not None and caps.get("rerank") is False:
-            return {"method": "vector"}
-        return {}
+        return {"method": "keyword"}
 
     async def search(
         self,
@@ -309,7 +261,7 @@ class _HttpMemoryAdapter:
             body["app_id"] = app_id
         if project_id is not None:
             body["project_id"] = project_id
-        body.update(await self._search_tuning(agent_id=agent_id))
+        body.update(self._search_tuning())
         url = f"{self._base_url}/api/v2/memory/search"
         r = await self._client.post(url, json=body, headers=self._headers())
         r.raise_for_status()
@@ -358,6 +310,45 @@ class _HttpMemoryAdapter:
 # ---------------------------------------------------------------------------
 # LongTermMemoryBackend — host's MemoryBackend implementation
 # ---------------------------------------------------------------------------
+
+
+#: pi's roles as the service spells them. The prefix the assembler builds has no
+#: owner and no place in a memory store, so it is dropped.
+_SERVICE_ROLES = {msg.USER: "user", msg.ASSISTANT: "assistant", msg.TOOL_RESULT: "tool"}
+
+
+def _service_role(role: Any) -> str | None:
+    return _SERVICE_ROLES.get(role) if isinstance(role, str) else None
+
+
+def _text_of(message: dict[str, Any]) -> str:
+    """One message's words for the store: its text, whitespace collapsed.
+
+    A picture and the model's reasoning are left out. The store indexes what was
+    said, and neither is that.
+    """
+    content = message.get("content")
+    if isinstance(content, str):
+        return content.strip()
+    blocks = (str(block.get("text") or "").strip() for block in msg.blocks_of(message) if msg.is_text(block))
+    return " ".join(block for block in blocks if block).strip()
+
+
+def _timestamp_ms(value: Any, fallback: int) -> int:
+    """A recorded timestamp as the milliseconds the service requires.
+
+    pi's messages carry milliseconds. A session written before they did carries
+    an ISO string, which is parsed rather than passed through: the service reads
+    the field as a number, and a string put the whole batch at the epoch.
+    """
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return int(value)
+    if isinstance(value, str) and value:
+        try:
+            return int(datetime.fromisoformat(value).timestamp() * 1000)
+        except ValueError:
+            return fallback
+    return fallback
 
 
 class LongTermMemoryBackend:
@@ -592,7 +583,6 @@ class LongTermMemoryBackend:
 
             from rich.console import Console
 
-            from opendde_harness.config.update_memory import memory_owned
             from opendde_harness.plugin.memory.longterm._server import (
                 MemoryBinaryMissingError,
                 MemoryNotConfiguredError,
@@ -601,30 +591,6 @@ class LongTermMemoryBackend:
 
             stderr = Console(stderr=True)
             base_url = self._config.get("base_url") or DEFAULT_MEMORY_BASE_URL
-
-            if not memory_owned():
-                # A root the user manages: connect if a server is up, never start
-                # one. Starting it would take the OME jobstore lock exclusively,
-                # which is theirs to grant, not opendde's to assume.
-                from opendde_harness.plugin.memory.longterm._server import ProbeResult, probe_health
-
-                if await asyncio.to_thread(probe_health, base_url) is ProbeResult.OK:
-                    self._state = ServiceState.READY
-                    # Say what it can actually do, exactly as the owned path
-                    # does. The argument for the warning is stronger here, not
-                    # weaker: opendde cannot repair someone else's embedding
-                    # config, so telling them is the only move it has.
-                    await asyncio.to_thread(self._warn_if_recall_cannot_work, base_url)
-                    return
-                # FOREIGN, not NoOp: opendde still must not start this server, but
-                # the user may start it themselves mid-session, and the probe
-                # that notices needs an adapter left to use.
-                self._state = ServiceState.FOREIGN
-                stderr.print(
-                    f"[yellow]Long-term memory is off: the memory service you manage is not running at {base_url}.[/yellow]\n"
-                    "[dim]Start it yourself and OpenDDE Harness will use it; OpenDDE Harness does not start or stop it.[/dim]"
-                )
-                return
 
             try:
                 # Narrate only a real wait. ``on_wait`` does not fire when a
@@ -678,70 +644,6 @@ class LongTermMemoryBackend:
                     "[dim]This session starts without long-term memory; OpenDDE Harness retries in the background.[/dim]"
                 )
                 return
-            # Off-thread: the probe and the config read below are both blocking
-            # IO, and start() runs on the loop every session begins on.
-            await asyncio.to_thread(self._warn_if_recall_cannot_work, base_url)
-
-    @staticmethod
-    def _warn_unowned_recall(base_url: str, report: Any) -> None:
-        """Say what a server the user runs cannot do, on its own authority.
-
-        No log path in the message: the log opendde knows about is the one it
-        writes for servers it starts, and this is not one of those. Silence
-        from a server too old to report capabilities stays silence rather than
-        becoming a verdict.
-        """
-        if not report.reports_capabilities or report.available("embedding") is not False:
-            return
-        from rich.console import Console
-
-        Console(stderr=True).print(
-            "[yellow]The memory service you run is up but embedding is unavailable: recall falls back "
-            "to keyword matching.[/yellow]\n"
-            "[dim]Memories are still stored. Fix the embedding provider in that server's own\n"
-            "config and restart it -- OpenDDE Harness follows along.[/dim]"
-        )
-
-    @staticmethod
-    def _warn_if_recall_cannot_work(base_url: str) -> None:
-        """Say out loud when the server is up but recall is not what it should be.
-
-        A running server no longer implies a fully working one: library 1.2.1 boots
-        with ``[llm]`` alone. What is left is real but weaker, and the log saying
-        so is file-only at runtime, so the difference looks like an agent that is
-        merely vague rather than one running on a lesser search -- the hardest
-        kind of fault to attribute. ``ddeharness doctor`` can find it, but only if the
-        user thinks to ask; this is on the path every session already takes.
-
-        Only what was configured and could not be built is worth saying: a role
-        the user never configured is a choice they already know about, and
-        repeating it every start would be noise.
-        """
-        from opendde_harness.config.update_memory import memory_owned
-        from opendde_harness.plugin.memory.longterm._health import probe_capabilities
-
-        report = probe_capabilities(base_url)
-        if not memory_owned():
-            # Their server, so the local toml is not evidence about it: no root
-            # is recorded, and memory_role_configured would read the fallback
-            # one -- the fabricated root doctor was fixed to stop trusting. It
-            # usually does not exist, so the gate read False and this warning,
-            # the only move opendde has left on this path, never fired at all.
-            LongTermMemoryBackend._warn_unowned_recall(base_url, report)
-            return
-        from opendde_harness.config.update_memory import memory_role_configured
-
-        if not (memory_role_configured("embedding") and report.available("embedding") is False):
-            return
-        from rich.console import Console
-
-        from opendde_harness.plugin.memory.longterm._server import server_log_path
-
-        Console(stderr=True).print(
-            "[yellow]The memory service is running but embedding is unavailable: recall falls back to "
-            "keyword matching.[/yellow]\n"
-            f"[dim]Memories are still stored. Check {server_log_path()} and fix the provider.[/dim]"
-        )
 
     async def stop(self) -> None:
         self._logger.info("LongTermMemoryBackend.stop")
@@ -1065,9 +967,9 @@ class LongTermMemoryBackend:
     ) -> list[dict[str, Any]]:
         """Adapt opendde AgentLoop messages into the service's MessageItemDTO shape.
 
-        AgentLoop: ``{"role", "content", ...}`` with role ∈ {"system",
-        "user", "assistant", "tool"} and ``content`` either ``str`` or
-        a list of multimodal parts.
+        AgentLoop: pi's ``Message`` (``opendde_harness.providers.messages``) --
+        roles ``user`` / ``assistant`` / ``toolResult``, content either a string
+        or a list of blocks, plus the ``system`` prefix the assembler builds.
 
         Service: ``{"sender_id" (required), "role", "timestamp" (ms
         epoch, required), "content"}`` with role ∈ {"user",
@@ -1081,41 +983,33 @@ class LongTermMemoryBackend:
           ``recall(user_id=<X>)`` must use that same ``<X>``.
 
         Other conversions: drop ``system``; missing ``sender_id`` on a
-        user message → ``user_id``; missing ``timestamp`` → now (ms);
-        multimodal ``content`` → space-joined text; empty text → drop.
+        user message → ``user_id``; missing timestamp → now (ms); block content
+        → space-joined text, pictures and reasoning left out; empty text → drop.
         """
         now_ms = int(time.time() * 1000)
         out: list[dict[str, Any]] = []
         for m in messages:
-            role = m.get("role")
-            if role not in ("user", "assistant", "tool"):
+            role = _service_role(m.get("role"))
+            if role is None:
                 continue
-            content = m.get("content", "")
-            if isinstance(content, list):
-                content = " ".join(
-                    str(part.get("text", "")).strip()
-                    for part in content
-                    if isinstance(part, dict) and part.get("type") == "text"
-                ).strip()
-            if not isinstance(content, str):
-                content = str(content)
-            # An assistant message may carry tool_calls with empty text —
-            # keep it (the tool result downstream references its id). The
-            # host's tool_calls are already in the service's ToolCallDTO shape
-            # (``to_openai_tool_call``); tool messages carry tool_call_id.
-            tool_calls = m.get("tool_calls") if role == "assistant" else None
+            content = _text_of(m)
+            # An assistant message may carry tool calls with empty text — keep
+            # it (the tool result downstream references its id).
+            tool_calls = [
+                {"id": call.get("id"), "type": "function", "name": call.get("name")} for call in msg.tool_calls_of(m)
+            ]
             if not content and not tool_calls:
                 continue
             entry: dict[str, Any] = {
                 "sender_id": agent_id if role in ("assistant", "tool") else (m.get("sender_id") or user_id),
                 "role": role,
-                "timestamp": m.get("timestamp") or now_ms,
+                "timestamp": _timestamp_ms(m.get("timestamp"), now_ms),
                 "content": content,
             }
             if tool_calls:
                 entry["tool_calls"] = tool_calls
-            if role == "tool" and m.get("tool_call_id"):
-                entry["tool_call_id"] = m["tool_call_id"]
+            if role == "tool" and m.get("toolCallId"):
+                entry["tool_call_id"] = m["toolCallId"]
             out.append(entry)
         return out
 
@@ -1198,19 +1092,11 @@ def make_backend(ctx: PluginContext) -> LongTermMemoryBackend:
     """Plugin entry-point factory. Called by :class:`PluginRegistry`
     after manifest activation. Sync construction only — async setup
     happens in ``LongTermMemoryBackend.start()``."""
-    from opendde_harness.config.update_memory import (
-        configure_memory_env,
-        ensure_memory_home,
-        memory_owned,
-        memory_root,
-    )
+    from opendde_harness.plugin.memory.longterm.settings import configure_memory_env, ensure_memory_home, memory_root
 
     root = memory_root()
     configure_memory_env(root)
-    # See tools.py: a root the user manages is read-only, template files
-    # included.
-    if memory_owned():
-        ensure_memory_home(root)
+    ensure_memory_home(root)
     return LongTermMemoryBackend(ctx)
 
 
