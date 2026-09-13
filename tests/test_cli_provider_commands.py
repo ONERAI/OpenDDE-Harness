@@ -463,13 +463,15 @@ def test_provider_list_on_a_fresh_config_offers_the_wizard(tmp_path, monkeypatch
     assert "ddeharness onboard" in result.output
 
 
-def test_provider_list_says_unreadable_rather_than_not_set(config_path, monkeypatch, tmp_path):
+@pytest.mark.parametrize("width", [60, 80, 120])
+def test_provider_list_says_unreadable_rather_than_not_set(config_path, monkeypatch, tmp_path, width):
     """ "Signed out" and "the file is there and unreadable" are different answers.
 
     Reporting the second as the first told someone whose store was damaged that
     they had simply never signed in, and the two are not fixed the same way.
     """
     monkeypatch.setenv("CHATGPT_TOKEN_DIR", str(tmp_path / "chatgpt"))
+    monkeypatch.setattr("opendde_harness.cli.provider_commands.console.width", width)
 
     from opendde_harness.providers.pi_service import credential_store_path
 
@@ -480,11 +482,12 @@ def test_provider_list_says_unreadable_rather_than_not_set(config_path, monkeypa
     result = CliRunner().invoke(provider_app, ["list"])
 
     assert result.exit_code == 0, result.output
-    assert "unreadable" in result.output
-    assert "move it aside" in result.output
+    text = " ".join(result.output.split())
+    assert "unreadable" in text
+    assert "move it aside" in text
     # Unwrapped: the console folds a path longer than the terminal is wide.
     assert str(path) in "".join(result.output.split()), "the file to move aside is named"
-    assert "ddeharness provider login openai-codex" in " ".join(result.output.split())
+    assert "ddeharness provider login openai-codex" in text
 
 
 def _lab(tmp_path, monkeypatch, **overrides):

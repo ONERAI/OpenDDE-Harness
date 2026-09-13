@@ -24,11 +24,12 @@ let clock: ManualClock
 let announced: { ok: boolean; text: string }[] = []
 const monitors: ProteinDesignTasks[] = []
 
-/** Let the pending filesystem reads and the promises behind them settle. */
-const settle = (ms = 5) => new Promise(resolve => setTimeout(resolve, ms))
+/** The next timer is armed only after the filesystem refresh has finished. */
+const waitForPoll = () => expect.poll(() => clock.ticks.length).toBe(1)
 
 beforeEach(async () => {
-  root = await mkdtemp(join(tmpdir(), 'opendde-tasks-'))
+  // macOS may expose the temporary directory through /tmp or /var aliases.
+  root = await realpath(await mkdtemp(join(tmpdir(), 'opendde-tasks-')))
   clock = new ManualClock(1_700_000_000_000)
   announced = []
 })
@@ -977,7 +978,7 @@ describe('polling', () => {
     expect(clock.ticks).toHaveLength(0)
 
     monitor.setVisible(true)
-    await settle()
+    await waitForPoll()
 
     expect(monitor.list()).toHaveLength(1)
     expect(clock.ticks).toHaveLength(1)
@@ -990,28 +991,29 @@ describe('polling', () => {
     const monitor = build({ refreshMs: 2000 })
 
     monitor.setVisible(true)
-    await settle()
+    await waitForPoll()
     expect(monitor.list()).toEqual([])
 
     await snapshot('late', { status: 'running' })
     clock.advance(2000)
-    await settle()
+    await waitForPoll()
 
     expect(monitor.list().map(task => task.taskId)).toEqual(['late'])
   })
 
-  it('never runs two passes at once', () => {
+  it('never runs two passes at once', async () => {
     const monitor = build()
     const first = monitor.refresh()
 
     expect(monitor.refresh()).toBe(first)
+    await first
   })
 
   it('stops the timer for a handoff and starts again with a read', async () => {
     const monitor = build({ refreshMs: 2000 })
 
     monitor.setVisible(true)
-    await settle()
+    await waitForPoll()
     expect(clock.ticks).toHaveLength(1)
 
     monitor.setPaused(true)
@@ -1019,7 +1021,7 @@ describe('polling', () => {
 
     await snapshot('during-handoff', { status: 'running' })
     monitor.setPaused(false)
-    await settle()
+    await waitForPoll()
 
     expect(monitor.list().map(task => task.taskId)).toEqual(['during-handoff'])
     expect(clock.ticks).toHaveLength(1)
@@ -1033,13 +1035,12 @@ describe('polling', () => {
       redraws += 1
     })
     monitor.setVisible(true)
-    await settle()
+    await waitForPoll()
 
     const before = redraws
 
     monitor.dispose()
     clock.advance(10_000)
-    await settle()
 
     expect(clock.ticks).toHaveLength(0)
     expect(redraws).toBe(before)
