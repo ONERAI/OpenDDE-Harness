@@ -450,46 +450,6 @@
       return '<div class="protein-empty-inline">No post-filter stage data for this run.</div>'
     }
     const errors = [postFilter.postRefoldError, postFilter.postFilterError].filter(Boolean)
-    const decisions = (postFilter.decisions || [])
-      .map(decision => {
-        const metricRows = Object.entries(decision.metrics || {})
-          .filter(([, value]) => typeof value === 'number' && Number.isFinite(value))
-          .sort(([left], [right]) => left.localeCompare(right))
-          .map(
-            ([name, value]) =>
-              `<div><dt>${escapeHtml(humanizeFieldName(name))}</dt><dd>${escapeHtml(formatNumber(value))}</dd></div>`
-          )
-          .join('')
-        const structurePanel = decision.structureArtifactPath
-          ? `<section class="protein-filter-structure-panel">
-            <header><strong>Refolded final structure</strong><span>${escapeHtml(decision.candidateId)}</span></header>
-            <div class="protein-filter-structure" data-post-filter-structure
-              data-structure-path="${escapeHtml(decision.structureArtifactPath)}"
-              data-target-chain-ids="${escapeHtml(JSON.stringify(decision.targetChainIds || []))}"
-              data-binder-chain-ids="${escapeHtml(JSON.stringify(decision.binderChainIds || []))}">
-              <div class="protein-structure-message">Structure will load when visible.</div>
-            </div>
-          </section>`
-          : `<section class="protein-filter-structure-panel">
-            <header><strong>Refolded final structure</strong><span>${escapeHtml(decision.candidateId)}</span></header>
-            <div class="protein-filter-structure protein-filter-structure-missing"><div class="protein-structure-message">No captured structure for this candidate.</div></div>
-          </section>`
-        return `
-      <article class="protein-filter-decision${decision.passFilter ? ' is-selected' : ''}" data-candidate-id="${escapeHtml(decision.candidateId)}">
-        <div class="protein-filter-decision-head">
-          <div class="protein-filter-rank">#${escapeHtml(decision.rank || '-')}</div>
-          <div class="protein-filter-decision-main">
-            <div><strong>${escapeHtml(decision.candidateId)}</strong><span>${decision.passFilter ? 'Selected' : decision.hardEligible ? 'Not selected' : 'Hard rejected'}</span></div>
-            <p>${escapeHtml(decision.rationale || 'No rationale captured.')}</p>
-            ${decision.strengths?.length ? `<small>Strengths · ${escapeHtml(decision.strengths.join('; '))}</small>` : ''}
-            ${decision.risks?.length ? `<small class="protein-filter-risk">Risks · ${escapeHtml(decision.risks.join('; '))}</small>` : ''}
-          </div>
-        </div>
-        <dl class="protein-filter-metrics"><div><dt>Objective</dt><dd>${escapeHtml(formatNumber(decision.objective))}</dd></div>${metricRows}</dl>
-        ${structurePanel}
-      </article>`
-      })
-      .join('')
     return `<div class="protein-filter-overview">
         <div class="protein-filter-summary">
           <div><span>Status</span><strong>${escapeHtml(humanizeFieldName(postFilter.status))}</strong></div>
@@ -501,7 +461,7 @@
         <div class="protein-filter-strategy"><strong>Selection criteria</strong><p>${escapeHtml(postFilter.strategySummary || '-')}</p></div>
       </div>
       ${errors.length ? `<div class="protein-filter-errors">${errors.map(error => `<p>${escapeHtml(error)}</p>`).join('')}</div>` : ''}
-      <div class="protein-filter-decisions">${decisions || '<div class="protein-empty-inline">Post-filter ran without candidate decisions.</div>'}</div>`
+      ${postFilter.decisions?.length ? '' : '<div class="protein-empty-inline">Post-filter ran without candidate decisions.</div>'}`
   }
 
   function renderProteinDesignDashboard(payload) {
@@ -1242,7 +1202,16 @@
     } else if (previousWorkspace) {
       previousWorkspace._proteinViewer?.dispose?.()
     }
-    if (workspace) candidatesDashboard.mount(workspace, payload, handlers, sameRun ? candidateViewState : null)
+    if (workspace)
+      candidatesDashboard.mount(
+        workspace,
+        payload,
+        {
+          ...handlers,
+          onResultViewChange: () => mount(rootElement, payload, handlers)
+        },
+        sameRun ? candidateViewState : null
+      )
     rootElement.querySelector('#proteinOpenTrace')?.addEventListener('click', () => {
       if (payload.run) handlers.onOpenTrace?.(payload.run)
     })

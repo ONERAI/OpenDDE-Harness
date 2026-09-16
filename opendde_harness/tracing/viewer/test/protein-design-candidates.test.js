@@ -23,10 +23,120 @@ const {
   propertyTicks,
   renderParallelCoordinates,
   renderProteinDesignDashboard,
+  resultRun,
   restoreDashboardViewState,
   selectRunId,
   shortTaskId
 } = require('../ui/protein-design-candidates')
+
+test('post-filter reuses candidate rows and refolded metrics without mutating design results', () => {
+  const original = {
+    candidateId: 'a',
+    cycle: 3,
+    sequence: 'AAA',
+    metrics: { iptm: 0.1, loss: 5 },
+    structureArtifactPath: '/old.json'
+  }
+  const run = {
+    taskId: 'run',
+    cycles: [{ cycle: 3, candidates: [original] }],
+    structures: [{ candidateId: 'a', cycle: 3, artifactPath: '/old.json' }],
+    postFilter: {
+      decisions: [
+        {
+          candidateId: 'a',
+          rank: 1,
+          passFilter: true,
+          rationale: 'Best geometry',
+          metrics: { iptm: 0.9, plddt: 0.8 },
+          structureArtifactPath: '/refold.json',
+          targetChainIds: ['A'],
+          binderChainIds: ['B']
+        },
+        {
+          candidateId: 'b',
+          rank: 2,
+          passFilter: false,
+          hardEligible: false,
+          sequence: 'BBB',
+          metrics: {},
+          structureArtifactPath: null
+        }
+      ]
+    }
+  }
+  assert.equal(resultRun(run, 'design'), run)
+  const projected = resultRun(run, 'post-filter')
+  const rows = candidateGroups(projected)
+  assert.equal(rows.length, 2)
+  assert.equal(rows[0].candidates[0].sequence, 'AAA')
+  assert.deepEqual(rows[0].candidates[0].metrics, { iptm: 0.9, plddt: 0.8 })
+  assert.equal(projected.structures[0].artifactPath, '/refold.json')
+  assert.deepEqual(projected.structures[0].binderChainIds, ['B'])
+  assert.equal(original.metrics.iptm, 0.1)
+  const html = renderProteinDesignDashboard({ run: projected })
+  assert.match(html, /protein-candidate-table/)
+  assert.match(html, /protein-inspector-panel/)
+  assert.match(html, /#1 · Selected/)
+  assert.match(html, /Best geometry/)
+  assert.match(html, /Hard rejected/)
+  assert.doesNotMatch(html, /protein-filter-structure-panel|View other sequences/)
+  assert.match(html, /value="metric:plddt">pLDDT/)
+  assert.match(html, /data-table-metrics=".*&quot;plddt&quot;:0.8/)
+})
+
+test('post-filter does not reuse design candidates when decisions are absent', () => {
+  const run = { cycles: [{ cycle: 1, candidates: [{ candidateId: 'design-only' }] }] }
+  const projected = resultRun(run, 'post-filter')
+  assert.deepEqual(candidateGroups(projected), [])
+  assert.deepEqual(projected.structures, [])
+})
+
+test('post-filter reads final contact and loss evidence without borrowing design evidence', () => {
+  const oldMetadata = {
+    gate_evidence: { cdr_total_contacts: 999, framework_total_contacts: 999 },
+    loss: { loss_components: { i_pae: 999 } }
+  }
+  const run = {
+    cycles: [
+      {
+        cycle: 1,
+        candidates: [
+          { candidateId: 'ok', metadata: oldMetadata },
+          { candidateId: 'failed', metadata: oldMetadata }
+        ]
+      }
+    ],
+    postFilter: {
+      decisions: [
+        {
+          candidateId: 'ok',
+          metrics: { iptm: 0.8, ranking_score: 0.7, loss: 1.2 },
+          metadata: {
+            gate_evidence: { cdr_total_contacts: 66, framework_total_contacts: 0 },
+            loss: { loss_components: { i_pae: 0.3 } }
+          }
+        },
+        { candidateId: 'failed', metrics: {} }
+      ]
+    }
+  }
+  const projected = resultRun(run, 'post-filter')
+  const [ok, failed] = candidateGroups(projected).map(group => group.candidates[0])
+  const value = (candidate, key) =>
+    propertyValue(
+      candidate,
+      PROPERTY_DEFINITIONS.find(item => item.key === key)
+    )
+  assert.equal(value(ok, 'contacts'), 66)
+  assert.equal(value(ok, 'frame_contacts'), 0)
+  assert.equal(value(ok, 'min_ipa'), 0.3)
+  for (const key of ['contacts', 'frame_contacts', 'min_ipa']) assert.equal(value(failed, key), null)
+  assert.equal(oldMetadata.gate_evidence.cdr_total_contacts, 999)
+  const complete = { ...projected, cycles: [{ cycle: 1, candidates: [ok] }] }
+  assert.doesNotMatch(renderProteinDesignDashboard({ run: complete }), /metrics incomplete/)
+  assert.match(renderProteinDesignDashboard({ run: projected }), /metrics incomplete/)
+})
 
 test('metric labels use canonical scientific capitalization', () => {
   assert.equal(metricLabel('cdr3_gate_passed'), 'CDR3 gate passed')
