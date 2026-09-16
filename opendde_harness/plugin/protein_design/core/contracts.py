@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections import Counter
 from collections.abc import Mapping
 from enum import StrEnum
 from typing import Any, Literal
@@ -403,6 +404,24 @@ class PostFilterAgentOutput(ContractModel):
     strategy_summary: str = Field(min_length=1)
     decisions: list[PostFilterDecision] = Field(min_length=1)
     risk_notes: list[str] = Field(default_factory=list, max_length=8)
+
+    def validate_ranking(self, candidate_ids: set[str]) -> None:
+        counts = Counter(item.candidate_id for item in self.decisions)
+        missing = sorted(candidate_ids - counts.keys())
+        unexpected = sorted(counts.keys() - candidate_ids)
+        duplicates = sorted(candidate_id for candidate_id, count in counts.items() if count > 1)
+        if missing or unexpected or duplicates:
+            raise ValueError(
+                "PostFilter Agent must rank every eligible candidate exactly once; "
+                f"missing IDs: {missing}; unexpected IDs: {unexpected}; duplicate IDs: {duplicates}. "
+                "Return the complete corrected ranking, not only the changed entries."
+            )
+        if sorted(item.rank for item in self.decisions) != list(range(1, len(candidate_ids) + 1)):
+            raise ValueError(
+                "PostFilter Agent ranks must be unique and contiguous from 1 "
+                f"through {len(candidate_ids)}; received ranks: {[item.rank for item in self.decisions]}. "
+                "Return the complete corrected ranking."
+            )
 
 
 class AnalysisResponse(ContractModel):

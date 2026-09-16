@@ -5,7 +5,7 @@ from __future__ import annotations
 import inspect
 import json
 import time
-from collections.abc import Collection
+from collections.abc import Callable, Collection
 from typing import Any, Protocol, TypeVar, cast
 
 from json_repair import repair_json
@@ -119,6 +119,7 @@ class OpenDDEHarnessStructuredSession:
         *,
         skills: Collection[SkillDocument] = (),
         tool_context: ToolContext | None = None,
+        output_validator: Callable[[T], None] | None = None,
     ) -> T:
         context = tool_context or ToolContext()
         started = time.perf_counter()
@@ -130,7 +131,7 @@ class OpenDDEHarnessStructuredSession:
         }
         self._emit_agent(profile, input_payload, context, ProgressStatus.STARTED)
         try:
-            result = await self._run_profile(profile, prompt, skills, context)
+            result = await self._run_profile(profile, prompt, skills, context, output_validator)
         except Exception as exc:
             self._emit_agent(
                 profile,
@@ -157,6 +158,7 @@ class OpenDDEHarnessStructuredSession:
         prompt: str,
         skills: Collection[SkillDocument],
         tool_context: ToolContext,
+        output_validator: Callable[[T], None] | None = None,
     ) -> T:
         schema = profile.output_schema
         messages: list[dict] = [
@@ -388,6 +390,8 @@ class OpenDDEHarnessStructuredSession:
                         )
                         continue
                 else:
+                    if output_validator is not None:
+                        output_validator(validated)
                     return validated
             except (json.JSONDecodeError, ValidationError, TypeError, ValueError) as exc:
                 attempts += 1

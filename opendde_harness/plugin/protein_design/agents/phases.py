@@ -497,9 +497,11 @@ class ProteinDesignPhases:
             ensure_ascii=False,
         )
         profile = AGENT_PROFILES[AgentRole.POST_FILTER]
+        candidate_ids = {candidate.candidate_id for candidate in candidates}
         return await self._session.run(
             profile,
             prompt,
+            output_validator=lambda output: output.validate_ranking(candidate_ids),
             skills=self._catalog.select(profile.default_skills),
             tool_context=ToolContext(
                 compute=self._compute,

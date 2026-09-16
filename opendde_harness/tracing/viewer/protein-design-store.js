@@ -269,6 +269,10 @@ function projectPostFilter(summary, readArtifact) {
         objective: finiteNumber(decision?.objective),
         sequence: typeof candidate.sequence === 'string' ? candidate.sequence : '',
         metrics,
+        metadata: {
+          gate_evidence: candidate.metadata?.gate_evidence || null,
+          loss: candidate.metadata?.loss || null
+        },
         passFilter: decision?.pass_filter === true,
         hardEligible: decision?.hard_eligible === true,
         rationale: String(decision?.rationale || ''),

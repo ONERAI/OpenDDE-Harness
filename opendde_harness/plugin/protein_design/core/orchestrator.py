@@ -1339,11 +1339,7 @@ class DesignOrchestrator:
         output = PostFilterAgentOutput.model_validate(value)
         by_id = {candidate.candidate_id: candidate for candidate in eligible}
         decisions = output.decisions
-        ids = [item.candidate_id for item in decisions]
-        if len(ids) != len(set(ids)) or set(ids) != set(by_id):
-            raise ValueError("PostFilter Agent must rank every eligible candidate exactly once")
-        if sorted(item.rank for item in decisions) != list(range(1, len(by_id) + 1)):
-            raise ValueError("PostFilter Agent ranks must be unique and contiguous from 1")
+        output.validate_ranking(set(by_id))
         ranked = sorted(decisions, key=lambda item: item.rank)
         result = [
             {

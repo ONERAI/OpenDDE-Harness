@@ -186,7 +186,11 @@ test('projects dynamic cycle and global-best metric series without conflating ca
       {
         candidate_id: 'cycle-best',
         sequence: 'ACDE',
-        metrics: { iptm: 0.81, plddt: 0.88, cdr_contact_fraction: 0.84, gate_passed: 1 }
+        metrics: { iptm: 0.81, plddt: 0.88, cdr_contact_fraction: 0.84, gate_passed: 1 },
+        metadata: {
+          gate_evidence: { cdr_total_contacts: 66, framework_total_contacts: 0 },
+          loss: { loss_components: { i_pae: 0.3 } }
+        }
       }
     ],
     decisions: [
@@ -255,6 +259,7 @@ test('projects dynamic cycle and global-best metric series without conflating ca
   assert.equal(projected.run.postFilter.decisions[0].metrics.plddt, 0.88)
   assert.equal(projected.run.postFilter.decisions[0].metrics.cdr_contact_fraction, 0.84)
   assert.equal(projected.run.postFilter.decisions[0].metrics.gate_passed, undefined)
+  assert.deepEqual(projected.run.postFilter.decisions[0].metadata, finalSelection.candidates[0].metadata)
   assert.equal(projected.run.failureCount, 1)
   const candidateNode = projected.run.tree.nodes.find(node => node.id === 'candidate:cycle-best')
   assert.equal(candidateNode.parentId, 'candidate:missing-parent')
@@ -550,5 +555,6 @@ test('post-filter failures are failed, never fallback, and obsolete scores are i
     assert.equal(Object.hasOwn(result, 'metricWeights'), false)
     assert.equal(Object.hasOwn(result.decisions[0], 'score'), false)
     assert.equal(result.decisions[0].rank, 1)
+    assert.deepEqual(result.decisions[0].metadata, { gate_evidence: null, loss: null })
   }
 })

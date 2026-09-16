@@ -1748,7 +1748,11 @@ body.app-view-protein-design .protein-design-details .protein-section { backgrou
 body.app-view-protein-design .protein-design-details .protein-activity-list { max-height: 460px; }
 body.app-view-protein-design .protein-design-details #proteinSelectedEvidence { padding: 14px; }
 body.app-view-protein-design .protein-design-results { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
-body.app-view-protein-design .protein-post-filter-results { flex: 1; min-height: 0; overflow: auto; padding: 12px; }
+body.app-view-protein-design .protein-post-filter-results { flex: 0 0 auto; max-height: 28vh; overflow: auto; padding: 12px; }
+body.app-view-protein-design .protein-post-filter-status { display: block; color: var(--text-muted); white-space: normal; }
+body.app-view-protein-design .protein-post-filter-results .protein-filter-overview { grid-template-columns: minmax(0, 1fr); }
+body.app-view-protein-design .protein-post-filter-results .protein-filter-summary { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+body.app-view-protein-design .protein-post-filter-results .protein-filter-summary > div { min-width: 0; padding: 8px; overflow-wrap: anywhere; }
 body.app-view-protein-design [hidden] { display: none !important; }
 body.app-view-protein-design .protein-metric-explorer { display: block; }
 body.app-view-protein-design .protein-metric-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); max-height: none; overflow: visible; }
@@ -1836,7 +1840,9 @@ body.app-view-protein-design :is(.protein-unified-menu, .protein-cycle-picker > 
   background: var(--theme-surface-1, white); padding: 6px; box-shadow: 0 8px 24px #24144420;
   max-height: min(360px, 55vh); overflow-y: auto; overscroll-behavior: contain;
 }
-body.app-view-protein-design .protein-unified-menu { position: fixed; inset: auto; margin: 0; z-index: 2000; }
+body.app-view-protein-design .protein-unified-menu { position: fixed; inset: auto; margin: 0; z-index: 2000; overflow-y: scroll; overflow-x: hidden; scrollbar-gutter: stable; scrollbar-width: auto; scrollbar-color: var(--border-strong) var(--theme-surface-1, white); }
+body.app-view-protein-design .protein-unified-menu::-webkit-scrollbar { width: 12px; }
+body.app-view-protein-design .protein-unified-menu::-webkit-scrollbar-thumb { background: var(--border-strong); border: 3px solid var(--theme-surface-1, white); border-radius: 8px; }
 body.app-view-protein-design :is(.protein-unified-menu, .protein-cycle-picker > div, .protein-structure-color-menu > div) button {
   display: block; width: 100%; min-height: 32px; height: auto; padding: 7px 10px;
   border: 0; border-radius: 6px; background: var(--theme-surface-1, white); text-align: left;

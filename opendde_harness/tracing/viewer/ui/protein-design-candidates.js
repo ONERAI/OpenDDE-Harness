@@ -294,6 +294,7 @@
   }
 
   function candidateTableValue(candidate, run, key) {
+    if (key === 'filter_rank') return finiteValue(candidate.postFilterDecision?.rank)
     if (key === 'cycle') return finiteValue(Number(candidate.cycle))
     if (key === 'sequence') return candidate.sequence || ''
     if (key === 'candidate_id') return candidate.candidateId || ''
@@ -306,15 +307,19 @@
 
   function candidateTableAttributes(candidate, run) {
     const values = Object.fromEntries(
-      [...new Set([...TABLE_SORT_DEFINITIONS, ...TABLE_FILTER_DEFINITIONS].map(definition => definition.key))].map(
-        key => [key, candidateTableValue(candidate, run, key)]
-      )
+      [
+        ...new Set(
+          [...TABLE_SORT_DEFINITIONS, ...TABLE_FILTER_DEFINITIONS, ...PROPERTY_DEFINITIONS].map(
+            definition => definition.key
+          )
+        )
+      ].map(key => [key, candidateTableValue(candidate, run, key)])
     )
     const attributes = Object.entries(values).map(
       ([key, value]) => `data-table-${key.replaceAll('_', '-')}="${escapeHtml(value ?? '')}"`
     )
     const searchable = [candidate.sequence, candidate.candidateId, run.target].filter(Boolean).join(' ').toLowerCase()
-    return `${attributes.join(' ')} data-table-search="${escapeHtml(searchable)}"`
+    return `${attributes.join(' ')} data-table-filter-rank="${escapeHtml(candidate.postFilterDecision?.rank ?? '')}" data-table-metrics="${escapeHtml(JSON.stringify(candidate.metrics || {}))}" data-table-search="${escapeHtml(searchable)}"`
   }
 
   function tableFilterDomain(run, definition) {
@@ -341,9 +346,16 @@
   }
 
   function renderCandidateControls(run) {
-    const options = TABLE_SORT_DEFINITIONS.map(
-      definition => `<option value="${escapeHtml(definition.key)}">${escapeHtml(definition.label)}</option>`
-    ).join('')
+    const definitions = [
+      ...(run.resultView === 'post-filter' ? [{ key: 'filter_rank', label: 'Post-filter rank' }] : []),
+      ...TABLE_SORT_DEFINITIONS,
+      ...availableProperties(run).filter(
+        definition => !['ranking_score', 'contacts', 'min_ipa'].includes(definition.key)
+      )
+    ]
+    const options = definitions
+      .map(definition => `<option value="${escapeHtml(definition.key)}">${escapeHtml(definition.label)}</option>`)
+      .join('')
     return `<div class="protein-table-controls"><label>View <select data-result-view><option value="design">Design</option><option value="post-filter">Post-filter</option></select></label><label data-design-only>Sort by <select data-candidate-sort>${options}</select></label><button type="button" data-sort-direction value="desc" title="Reverse sort order">DESC ↓</button>${renderCandidateFilters(run)}</div>`
   }
 
@@ -371,6 +383,11 @@
   }
 
   function candidateGroups(run) {
+    if (run.resultView === 'post-filter') {
+      return (run.cycles || []).flatMap(cycle =>
+        cycle.candidates.map(candidate => ({ cycle: cycle.cycle, candidates: [candidate] }))
+      )
+    }
     return (run.cycles || [])
       .map(cycle => ({
         cycle: cycle.cycle,
@@ -382,6 +399,42 @@
 
   function allCandidates(run) {
     return candidateGroups(run).flatMap(group => group.candidates)
+  }
+
+  function resultRun(run, view) {
+    if (!run || view !== 'post-filter') return run
+    const originals = new Map(allCandidates(run).map(candidate => [candidate.candidateId, candidate]))
+    const candidates = (run.postFilter?.decisions || []).map(decision => {
+      const original = originals.get(decision.candidateId)
+      return {
+        ...original,
+        ...decision,
+        cycle: original?.cycle ?? null,
+        sequence: decision.sequence || original?.sequence || '',
+        metrics: { ...decision.metrics },
+        metadata: {
+          ...original?.metadata,
+          loss: decision.metadata?.loss || null,
+          gate_evidence: decision.metadata?.gate_evidence || null
+        },
+        postFilterDecision: decision
+      }
+    })
+    return {
+      ...run,
+      resultView: view,
+      candidateCount: candidates.length,
+      cycles: candidates.map(candidate => ({ cycle: candidate.cycle, candidates: [candidate] })),
+      structures: candidates
+        .filter(candidate => candidate.structureArtifactPath)
+        .map(candidate => ({
+          candidateId: candidate.candidateId,
+          cycle: candidate.cycle,
+          artifactPath: candidate.structureArtifactPath,
+          targetChainIds: candidate.targetChainIds || [],
+          binderChainIds: candidate.binderChainIds || []
+        }))
+    }
   }
 
   function cycleLeaders(run) {
@@ -423,6 +476,19 @@
     const cdrContacts = candidateTableValue(candidate, run, 'cdr_contacts')
     const minPae = candidateTableValue(candidate, run, 'min_pae')
     const sequence = candidate.sequence || 'Sequence unavailable'
+    const decision = candidate.postFilterDecision
+    const decisionLabel = decision
+      ? `#${decision.rank || '-'} · ${decision.passFilter ? 'Selected' : decision.hardEligible ? 'Not selected' : 'Hard rejected'}`
+      : ''
+    const decisionDetail = decision
+      ? [
+          decision.rationale,
+          ...(decision.strengths || []).map(value => `Strength: ${value}`),
+          ...(decision.risks || []).map(value => `Risk: ${value}`)
+        ]
+          .filter(Boolean)
+          .join('\n')
+      : ''
     const missingProperties = PROPERTY_DEFINITIONS.filter(
       definition => propertyValue(candidate, definition) === null
     ).map(definition => definition.label)
@@ -432,7 +498,7 @@
         <span aria-hidden="true"></span>
       </label>
       <div class="protein-candidate-cycle"><span>${escapeHtml(candidate.cycle)}</span></div>
-      <div class="protein-candidate-id"><code title="${escapeHtml(candidate.candidateId)}">${escapeHtml(candidate.candidateId)}</code></div>
+      <div class="protein-candidate-id"><code title="${escapeHtml(candidate.candidateId)}">${escapeHtml(candidate.candidateId)}</code>${decision ? `<small class="protein-post-filter-status" tabindex="0" title="${escapeHtml(decisionDetail)}">${escapeHtml(decisionLabel)}</small>` : ''}</div>
       <div class="protein-candidate-target" title="${escapeHtml(run.target || 'Unknown target')}">${escapeHtml(run.target || '-')}</div>
       <div class="protein-candidate-sequence"><div class="protein-candidate-sequence-main"><span class="protein-sequence-summary" tabindex="0">${renderCandidateSequence(candidate, run)}</span><button type="button" data-copy-sequence="${escapeHtml(sequence)}" title="Copy sequence">Copy</button>${renderSequencePreview(candidate, run)}</div><small>${escapeHtml(sequence.length)} residues${isLeader ? ' · cycle leader' : ''}${missingProperties.length ? ` · <span title="Missing: ${escapeHtml(missingProperties.join(', '))}">metrics incomplete</span>` : ''}</small></div>
       <div class="protein-candidate-score"><strong>${escapeHtml(formatNumber(ranking))}</strong></div>
@@ -456,7 +522,7 @@
           .map(candidate => renderCandidateRow(candidate, selectedKeys, false, run, extraMetrics))
           .join('')
         return `<section class="protein-cycle-group" data-cycle="${escapeHtml(group.cycle)}">
-        ${renderCandidateRow(leader, selectedKeys, true, run, extraMetrics)}
+        ${renderCandidateRow(leader, selectedKeys, run.resultView !== 'post-filter', run, extraMetrics)}
         ${others.length ? `<details class="protein-cycle-more"><summary><div class="protein-cycle-more-label">View other sequences <span data-other-count>${escapeHtml(others.length)}</span></div></summary><div>${otherRows}</div></details>` : ''}
       </section>`
       })
@@ -696,8 +762,8 @@
       <header class="protein-dashboard-header">${renderOverview(run)}${renderRunPicker(runs, payload.selectedRunId || run.taskId)}</header>
       <main class="protein-candidate-workspace">
         <section class="protein-candidate-panel">
-          <header class="protein-panel-toolbar"><div><strong>Design candidates</strong><span>${escapeHtml(run.candidateCount || allCandidates(run).length)} sequences across ${escapeHtml(candidateGroups(run).length)} cycles</span></div>${renderCandidateControls(run)}</header>
-          <div class="protein-design-results">${renderCandidateTable(run, resolvedSelectedKeys)}</div><div class="protein-post-filter-results" hidden><!--post-filter-results--></div>
+          <header class="protein-panel-toolbar"><div><strong>Design candidates</strong><span>${escapeHtml(run.candidateCount || allCandidates(run).length)} sequences across ${escapeHtml(new Set(candidateGroups(run).map(group => group.cycle)).size)} cycles</span></div>${renderCandidateControls(run)}</header>
+          <div class="protein-post-filter-results" hidden><!--post-filter-results--></div><div class="protein-design-results">${renderCandidateTable(run, resolvedSelectedKeys)}</div>
         </section>
         <section class="protein-inspector-panel">
           <div class="protein-structure-pane">
@@ -1548,6 +1614,7 @@
   }
 
   function rowTableValue(row, key) {
+    if (key.startsWith('metric:')) return finiteValue(JSON.parse(row.dataset.tableMetrics || '{}')[key.slice(7)])
     const value = row.dataset[tableDatasetName(key)]
     if (['sequence', 'candidate_id', 'target'].includes(key)) return value || ''
     return value === '' || value == null ? null : Number(value)
@@ -1701,7 +1768,9 @@
   }
 
   function mount(rootElement, payload, handlers = {}, savedViewState = null) {
-    const run = payload.run
+    const sameTask = rootElement._proteinRunId === payload.run?.taskId
+    if (!sameTask) rootElement._proteinResultView = 'design'
+    const run = resultRun(payload.run, rootElement._proteinResultView)
     const viewState = savedViewState || captureDashboardViewState(rootElement)
     if (!run) {
       rootElement._proteinViewer?.dispose?.()
@@ -1735,14 +1804,19 @@
     rootElement._proteinCandidateTableState =
       sameRun && rootElement._proteinCandidateTableState
         ? rootElement._proteinCandidateTableState
-        : { sortKey: 'cycle', direction: 'desc', query: '', ranges: {} }
+        : {
+            sortKey: run.resultView === 'post-filter' ? 'filter_rank' : 'cycle',
+            direction: run.resultView === 'post-filter' ? 'asc' : 'desc',
+            query: '',
+            ranges: {}
+          }
     if (!STRUCTURE_COLOR_MODES[rootElement._proteinStructureColorMode])
       rootElement._proteinStructureColorMode = 'design'
     rootElement._proteinShowSidechains = rootElement._proteinShowSidechains === true
     if (!sameRun) rootElement._proteinResultView = 'design'
     rootElement._proteinRunId = run.taskId
     rootElement.innerHTML = renderProteinDesignDashboard(
-      payload,
+      { ...payload, run },
       rootElement._proteinSelectedKeys,
       rootElement._proteinVisiblePropertyKeys
     )
@@ -1757,19 +1831,21 @@
     const showResults = () => {
       const postFilter = resultView.value === 'post-filter'
       rootElement._proteinResultView = resultView.value
-      rootElement.querySelector('.protein-design-results').hidden = postFilter
       rootElement.querySelector('.protein-post-filter-results').hidden = !postFilter
-      rootElement
-        .querySelectorAll('[data-design-only], [data-sort-direction], .protein-candidate-filters')
-        .forEach(node => {
-          node.hidden = postFilter
-        })
       rootElement.querySelector('.protein-panel-toolbar > div > strong').textContent = postFilter
         ? 'Post-filter results'
         : 'Design candidates'
     }
     resultView.value = rootElement._proteinResultView || 'design'
-    resultView.addEventListener('change', showResults)
+    resultView.addEventListener('change', () => {
+      rootElement._proteinResultView = resultView.value
+      rootElement._proteinCandidateTableState = null
+      rootElement._proteinSelectedKeys = new Set()
+      rootElement._proteinActiveCandidateKey = null
+      rootElement._proteinDisplayedSignature = null
+      if (handlers.onResultViewChange) handlers.onResultViewChange()
+      else mount(rootElement, payload, handlers)
+    })
     showResults()
 
     rootElement.querySelectorAll('[data-run-id]').forEach(button => {
@@ -1905,7 +1981,7 @@
         .querySelector(`[data-candidate-key="${CSS.escape(rootElement._proteinActiveCandidateKey)}"]`)
         ?.classList.add('is-active')
       showCandidateStructures(rootElement, run, structureCandidates(rootElement, run, byKey))
-    }
+    } else showCandidateStructures(rootElement, run, [])
   }
 
   return {
@@ -1926,6 +2002,7 @@
     pdbAlphaCarbons,
     parallelGeometry,
     propertyValue,
+    resultRun,
     propertyTicks,
     propertyDefinitions,
     metricLabel,
